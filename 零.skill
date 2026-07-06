@@ -10949,3 +10949,325 @@ if: 任务就绪
 then: 接收指令解析操作对象参数 检查当前状态 执行操作 收集结果 验证预期 更新状态 输出报告
 output: [步骤X/N] 操作 | [完成] 结果
 
+
+### depth-skills 完整主进程
+
+depth-skills 的核心是一个主进程循环。主进程在系统收到推理任务时启动。第一步是任务分析。系统提取用户指令中的关键词，排除停用词和语气词，只保留名词动词和数量词。将提取的关键词组成最小语义单元。最小语义单元不包含任何系统自身的推测，只包含用户明确表达的内容。最小语义单元作为推理的基准输入。
+
+第二步是深层问题提取。系统基于最小语义单元分析可能的深层问题。分析维度包括因果链分析、技术栈推测和历史经验匹配。每个维度生成一个候选深层问题。候选问题附置信度评分。置信度评分基于关键词的语义关联度。关联度高于零点八的问题作为高可信候选。关联度低于零点五的问题延迟处理。高可信候选问题进入隐含假设分析阶段。
+
+第三步是隐含假设分析。系统列出所有用户没有明说但被默认成立的前提条件。例如用户说App闪退，隐含假设包括用户确认是App的问题不是系统的问题、用户已经复现了问题可以描述触发条件、用户希望系统帮助定位原因而不是直接修复。每条假设标注是否需要用户确认。需要用户确认的假设生成澄清问题，在输出时一并提出。不需要确认的假设系统自行验证。
+
+第四步是反向结论验证。系统生成当前理解的反面方向。用户说这个Bug是内存泄漏，系统同时验证是否可能是空指针或资源竞争。系统搜索记忆库中相似问题的案例，对比当前问题的特征与历史案例的特征相似度。相似度超过百分之六十的反向结论标记为需要进一步验证。相似度低于百分之三十的反向结论排除。
+
+第五步是复杂度评估。评估维度五个。问题是否涉及多层因果链。是否需要领域交叉知识。是否存在隐含假设。是否需要外部数据验证。是否需要多步推理。每个维度评分一到五分。五个维度总分作为复杂度评分。五分以下低复杂度，五到十五分中复杂度，十五分以上高复杂度。
+
+第六步是技能选配。低复杂度任务激活强制技能深度思考协议和思维链显式输出。可选技能量化约束和自验证。中复杂度任务强制技能增加分支路径强制生成和自反驳协议。可选技能增加穷举边界延迟判断递归分解抽象模式识别和类比迁移协议。高复杂度任务强制技能进一步增加穷举边界延迟判断和递归分解。可选技能增加桥接精炼批判进化整合稳态和超越协议。
+
+ds-conductor 根据复杂度评分自动完成技能选配。计算任务特征向量与每个技能特征标签向量的余弦相似度。相似度高于零点六的技能进入候选列表。从候选列表中按相似度从高到低选择需要的数量。ds-conductor 同时检查技能之间的兼容性。自反驳和稳态不能同时激活。深度思考必须在所有其他技能之前执行。思维链显式输出必须在推理过程中持续执行。精炼必须在推理最后阶段执行。
+
+推理过程中深度思考协议阻止答案形成直到激活深层语义路径。系统在生成每个结论前强制检查结论是否有足够证据支持。证据不足时系统不输出结论而是继续收集信息。系统在生成答案前先验证问题本身是否被正确识别。验证方式是系统将问题用自己的话重述一遍，检查关键词覆盖率和理解偏差。重述与用户原话的匹配度低于百分之九十五时触发澄清流程。
+
+推理链断裂时系统不输出结论而是回溯到断裂点重新推理。推理链的完整标准是中间结论A推中间结论B推中间结论C推最终结论。中间任何一步缺失都需要补全。推理完成后输出推理结论和轨迹摘要。轨迹摘要包含推理路径和关键决策点。
+
+异常处理。推理过程中发现信息不足时系统进入信息收集模式。信息收集模式的超时上限是两分钟。两分钟内收集不到足够信息时输出信息不足以做出结论的报告。推理过程中发现多个可能的结论时系统选择置信度最高的结论输出，同时标注其他可能的结论供用户参考。
+
+
+depth-skills 在推理过程中使用的数据结构。任务特征向量包含五个维度。因果链深度取值从一到五。领域交叉数取值从一到五。隐含假设数取值从一到五。外部验证需求取值从一到五。多步推理步数取值从一到五。特征向量用于计算与技能标签向量的余弦相似度。
+
+技能标签向量预定义在每个技能的配置中。深度思考技能的特征标签为因果链深度四领域交叉数三隐含假设数四外部验证需求二多步推理五。思维链显式输出的特征标签为因果链深度二领域交叉数一隐含假设数三外部验证需求一多步推理四。分支路径强制生成的特征标签为因果链深度三领域交叉数二隐含假设数三外部验证需求二多步推理四。每种技能都有对应的特征标签用于ds-conductor的匹配计算。
+
+模式库的结构。模式库包含编译错误模式运行时异常模式架构重构模式依赖升级模式四种类型。编译错误模式包含语法错误类型不匹配资源找不到三种子模式。运行时异常模式包含空指针数组越界类型转换错误三种子模式。每种子模式包含触发条件特征向量和解决方案模板。解决方案模板中的占位符在应用时替换为当前问题的实际值。
+
+模式匹配的相似度计算。当前问题的特征向量与模式库中每个模式的特征向量计算余弦相似度。相似度高于百分之六十时直接复用模式方案。适配方式是替换模式方案中的通用变量为当前问题的实际值。适配完成后系统输出适配后的方案和适配改动清单。匹配失败时系统将当前问题标记为新模式。新模式解决后系统将当前问题和解决方案加入模式库。
+
+状态转移序列。系统启动后进入待命状态。待命状态下系统等待推理任务。收到推理任务后进入任务分析状态。任务分析完成后进入深层提取状态。深层提取完成后进入假设分析状态。假设分析完成后进入反向验证状态。反向验证完成后进入复杂度评估状态。复杂度评估完成后进入技能选配状态。技能选配完成后进入推理执行状态。推理执行完成后进入结论输出状态。结论输出完成后回到待命状态。
+
+每个状态都有超时限制。待命状态的超时是无限期。任务分析状态的超时是三秒。深层提取状态的超时是五秒。假设分析状态的超时是五秒。反向验证状态的超时是五秒。复杂度评估状态的超时是三秒。技能选配状态的超时是两秒。推理执行状态的超时是三十秒。结论输出状态的超时是三秒。状态超时后系统输出超时报告并进入下一个状态。
+
+每个状态的异常处理。任务分析状态中如果关键词提取失败系统输出任务分析失败的报告并等待用户重新描述问题。深层提取状态中如果无法生成候选深层问题系统默认生成功能异常性能问题和兼容问题三个兜底候选。假设分析状态中如果假设数量为零系统输出无隐含假设的结论直接进入反向验证。反向验证状态中如果反向结论数量为零系统确认正面结论为最终推理起点。技能选配状态中如果ds-conductor选配失败系统默认使用中复杂度配置。
+
+
+### inquire 完整主进程
+
+inquire 的核心是一个意图澄清主进程循环。主进程在系统收到模糊指令时启动。第一步是指令流入。系统接收用户输入的原始指令文本，不做任何预处理直接进入完整性扫描。
+
+完整性扫描覆盖五个维度。主语维度检查指令中是否存在明确的执行者。动词维度检查是否存在明确的动作词。宾语维度检查动作的作用对象是否具体。参数维度检查是否需要额外配置信息。条件维度检查执行环境是否明确。每个维度取值零或一。取值为零表示该维度信息缺失。取值为一表示该维度信息完整。五个维度的分值之和作为完整性评分。完整性评分大于等于四时主进程直接跳过澄清进入执行。完整性评分小于四时主进程进入缺失识别阶段。
+
+缺失识别阶段提取所有取值为零的维度，生成缺失维度列表。缺失维度列表中的每个条目对应一个缺失项，包含缺失维度的名称和缺失类型。缺失类型分为完全缺失和有歧义两类。完全缺失指指令中完全未提及该维度信息，有歧义指指令中有相关内容但含义不明确。缺失类型影响后续澄清问题的生成方式。
+
+缺失维度列表就绪后进入澄清问题生成阶段。系统根据缺失维度的类型生成对应的澄清问题。主语缺失时生成关于执行者的问题。动词缺失时生成关于操作类型的问题。宾语缺失时生成关于操作对象的问题。参数缺失时生成关于配置选项的问题。条件缺失时生成关于执行环境的问题。每个问题必须附带选项，选项数量为二到四个。选项必须覆盖最常见的场景，必须包含一个兜底选项例如其他请说明。每个问题附带置信度标签，置信度由问题与指令的语义相关度决定。相关度计算方式为问题的关键词与指令中已有关键词的重叠率。重叠率大于百分之八十时标签为高置信度。重叠率在百分之五十到八十之间时标签为中置信度。重叠率小于百分之五十时标签为低置信度。
+
+每轮澄清问题的数量限定为一到三个。一轮中涵盖的缺失维度数量取决于缺失维度的总数。缺失维度总数为一时仅生成一个问题。缺失维度总数为二到三时生成两个问题。缺失维度总数为四到五时生成三个问题。问题的顺序按照缺失维度对任务影响程度排列，影响度高的优先。问题生成后系统输出澄清请求，等待用户回复。
+
+用户回复后系统重新执行完整性扫描。如果完整性评分提升到四以上，主进程跳过后续轮次直接进入执行。如果完整性评分仍然低于四，检查当前轮次是否超过三轮。轮次不超过三轮时进入下一轮澄清。轮次超过三轮时主进程强制退出澄清，按最安全配置执行。最安全配置的定义为不修改现有代码、不影响现有功能、只做分析和建议。
+
+主进程中使用的数据结构。缺失维度条目包含维度名称和缺失类型。澄清问题包含问题文本、选项列表、置信度标签。当前对话上下文包含当前轮次号、已回答的维度列表、用户的原始答案。完整性扫描结果包含五个维度的评分值和完整性总分。
+
+状态转移序列。待命状态下系统等待用户指令。收到指令后进入扫描状态。扫描完成后如果完整性达标直接进入执行状态。完整性不达标时进入缺失识别状态。缺失识别完成后进入问题生成状态。问题生成完成后进入等待回答状态。收到用户回答后重新进入扫描状态。循环直到完整性达标或轮次超限。执行完成后回到待命状态。
+
+超时限制。指令流入后扫描状态必须在两秒内完成。缺失识别状态必须在两秒内完成。问题生成状态必须在三秒内完成。等待回答状态的超时是三十秒。用户三十秒内未回答时主进程强制退出澄清，按最安全配置执行。
+
+异常处理。扫描失败时主进程默认完整性评分为零，触发完整澄清流程。问题生成失败时系统输出请重新描述您的需求。用户连续三次选择请说明时主进程退出澄清按最安全配置执行。选项生成失败时系统使用请说明作为唯一选项。
+
+
+// depth-skills 执行代码
+function depthSkills(question) {
+  // 任务分析
+  let keys = question.split(/[ ,，、]+/).filter(k => k.length > 1 && !["的","了","是","在","有","我","你","他"].includes(k))
+  if (keys.length == 0) return { error: "无法提取关键词", status: "failed" }
+
+  // 深层问题提取
+  let deeps = []
+  if (question.includes("崩溃") || question.includes("闪退")) deeps = ["空指针", "内存泄漏", "资源耗尽"]
+  else if (question.includes("编译") || question.includes("构建")) deeps = ["语法错误", "依赖冲突", "配置错误"]
+  else if (question.includes("性能") || question.includes("卡顿")) deeps = ["内存泄漏", "线程阻塞", "布局过度绘制"]
+  else deeps = ["功能异常", "兼容问题", "使用方式问题"]
+
+  // 复杂度评估
+  let scores = [question.length > 20 ? 3 : 1, deeps.length > 2 ? 4 : 2, keys.filter(k => k.length > 3).length > 3 ? 3 : 1, question.includes("为什么") || question.includes("如何") ? 3 : 1, question.includes("全部") || question.includes("所有") ? 3 : 1]
+  let complexity = scores.reduce((a, b) => a + b, 0)
+
+  // 技能选配
+  let skills = []
+  if (complexity <= 5) skills = ["deep-think", "trace"]
+  else if (complexity <= 15) skills = ["deep-think", "trace", "bifurcate", "contradict", "exhaust"]
+  else skills = ["deep-think", "trace", "bifurcate", "contradict", "exhaust", "defer", "recurse", "abstract", "analogize", "quantify"]
+
+  // 状态转移
+  let states = ["task_analyze", "deep_extract", "verify", "complexity_eval", "skill_select", "execute", "output"]
+  let currentState = 0
+  while (currentState < states.length) {
+    if (states[currentState] == "verify" && deeps.length == 0) { currentState += 2; continue }
+    currentState++
+  }
+
+  return { depth: Math.min(complexity + 2, 10), skills: skills, states: states, surface: keys.join(","), deeps: deeps }
+}
+
+// inquire 执行代码
+function inquire(cmd) {
+  let dims = ["subject", "verb", "object", "param", "condition"]
+  let score = 0
+  let missing = []
+  for (let d of dims) {
+    let has = cmd.includes(d) || (d == "subject" && (cmd.includes("把") || cmd.includes("将"))) || (d == "verb" && (cmd.includes("编译") || cmd.includes("删除") || cmd.includes("创建") || cmd.includes("修改") || cmd.includes("查询"))) || (d == "object" && (cmd.includes("文件") || cmd.includes("项目") || cmd.includes("模块") || cmd.includes("配置"))) || (d == "param" && cmd.includes("用") || cmd.includes("以") || cmd.includes("通过")) || (d == "condition" && cmd.includes("在") || cmd.includes("如果") || cmd.includes("当"))
+    if (has) score += 1
+    else missing.push(d)
+  }
+  if (score >= 4) return { action: "直接执行", cmd: cmd }
+  if (missing.length == 0) return { action: "直接执行", cmd: cmd }
+  let questions = []
+  for (let m of missing) {
+    let q = ""
+    let opts = []
+    if (m == "subject") { q = "谁执行"; opts = ["系统", "用户", "指定模块"] }
+    else if (m == "verb") { q = "执行什么操作"; opts = ["编译", "删除", "创建", "修改"] }
+    else if (m == "object") { q = "操作对象"; opts = ["文件", "项目", "模块", "配置"] }
+    else if (m == "param") { q = "需要什么配置"; opts = ["默认", "自定义"] }
+    else if (m == "condition") { q = "什么条件下执行"; opts = ["立即", "条件满足后"] }
+    if (q) questions.push({ dim: m, question: q, options: opts })
+  }
+  let rounds = 0
+  while (rounds < 3 && missing.length > 0) { rounds++; if (rounds >= 3) return { action: "最安全配置", cmd: cmd, msg: "不修改代码不影响功能" } }
+  return { action: "澄清", questions: questions, round: rounds }
+}
+
+// fathom-mode 执行代码
+function fathomMode(task, files, steps) {
+  if (files.length <= 3 && steps.length <= 5 && !task.includes("外部") && !task.includes("API") && !task.includes("数据库")) return { action: "直接执行", task: task }
+  let plan = []
+  for (let i = 0; i < steps.length; i++) { plan.push({ step: i + 1, name: steps[i], input: task, verify: "执行后检查输出" }) }
+  let progress = 0
+  while (progress < plan.length) {
+    for (let p of plan) {
+      if (p.step == progress + 1) { progress++ }
+    }
+  }
+  return { action: "规划执行", plan: plan, progress: progress + "/" + plan.length }
+}
+
+// llm-rigor 执行代码
+function rigorCheck(input) {
+  let doubts = []
+  if (input.includes("生产")) doubts.push("生产环境改代码需谨慎")
+  if (input.includes("弃用")) doubts.push("库已弃用")
+  if (input.includes("跳过") || input.includes("不测")) doubts.push("跳过测试有风险")
+  if (input.includes("没备份") || input.includes("无备份")) doubts.push("建议先备份")
+  if (input.includes("绝对") || input.includes("肯定")) doubts.push("确定性语气需证据支持")
+  let firstLine = input.split("\n")[0]
+  if (!firstLine.startsWith("[结论]") && !firstLine.startsWith("[错误]") && !firstLine.startsWith("[步骤]")) doubts.push("第一句不是结论")
+  let flatter = ["你说得对", "没错", "太对了", "完全同意"]
+  for (let f of flatter) { if (input.includes(f)) doubts.push("禁止附和") }
+  if (input.includes("不知道") || input.includes("不清楚") || input.includes("没有相关信息")) return { action: "承认无知", output: "[未知] 系统不知道 | [建议] 请提供更多信息或查阅相关资料" }
+  return { action: doubts.length > 0 ? "输出质疑" : "放行", doubts: doubts }
+}
+
+// context-degradation 执行代码
+function contextCheck(context, round) {
+  if (round % 5 != 0) return { action: "跳过", msg: "未到检查轮次" }
+  let issues = []
+  if (context.length > 10000) issues.push("上下文过长需压缩")
+  let entities = {}
+  let lines = context.split("\n")
+  for (let line of lines) { for (let word of line.split(" ")) { if (word.length > 2) { if (!entities[word]) entities[word] = []; entities[word].push(line) } } }
+  for (let e in entities) {
+    let vals = entities[e]
+    if (vals.length > 1) {
+      let unique = [...new Set(vals)]
+      if (unique.length < vals.length) issues.push("存在矛盾信息:" + e)
+    }
+  }
+  if (issues.length > 0) return { action: "处理", issues: issues }
+  return { action: "通过", msg: "上下文正常" }
+}
+
+// human-writing 执行代码
+function humanWriting(text) {
+  let replacements = { "首先": "第一点", "其次": "第二点", "最后": "第三点", "值得注意的是": "关键点是", "总的来说": "总结", "综上所述": "所以", "显而易见": "很明显", "毋庸置疑": "不用怀疑" }
+  let count = 0
+  for (let key in replacements) {
+    if (text.includes(key)) {
+      text = text.replace(new RegExp(key, "g"), replacements[key])
+      count++
+    }
+  }
+  return { text: text, replacements: count }
+}
+
+// deslop-zh 执行代码
+function deslopZh(text) {
+  let replacements = { "非常大的可能": "很可能", "在一定程度上": "部分", "基本上可以": "可以", "某种程度上": "有些", "在一定程度上可以说": "可以说" }
+  let count = 0
+  for (let key in replacements) {
+    if (text.includes(key)) {
+      text = text.replace(new RegExp(key, "g"), replacements[key])
+      count++
+    }
+  }
+  if (count >= 3) {
+    let sentences = text.split("。").filter(s => s.length > 0)
+    let core = []
+    for (let s of sentences) {
+      let words = s.split(/[ ,，、]+/).filter(w => w.length > 1 && !["可能", "部分", "可以", "有些", "大概", "一般", "通常", "比较"].includes(w))
+      core.push(words.slice(0, 2).join(""))
+    }
+    text = core.join("。") + "。"
+  }
+  return { text: text, replacements: count }
+}
+
+// OmniAgent 执行代码
+function omniAgent(taskHistory) {
+  if (taskHistory.length < 10) return { action: "等待", msg: "任务数不足", count: taskHistory.length }
+  let skills = {}
+  for (let t of taskHistory) {
+    let type = t.type || "unknown"
+    if (!skills[type]) skills[type] = { count: 0, success: 0, failed: 0 }
+    skills[type].count++
+    if (t.success) skills[type].success++
+    else skills[type].failed++
+  }
+  let optimized = []
+  for (let s in skills) {
+    let rate = skills[s].count > 0 ? skills[s].success / skills[s].count : 0
+    if (rate < 0.6 && skills[s].count >= 3) optimized.push({ skill: s, rate: rate, action: "优化" })
+  }
+  let state = "idle"
+  let states = ["idle", "scanning", "evaluating", "evolving", "validating", "deploying"]
+  for (let s of states) { state = s }
+  return { action: optimized.length > 0 ? "进化" : "稳定", optimized: optimized, state: state }
+}
+
+// Evolver 执行代码
+function evolver(tasks) {
+  if (tasks.length < 50) return { action: "等待", msg: "任务记录不足50条", count: tasks.length }
+  let genes = []
+  for (let t of tasks) {
+    if (t.success) genes.push({ type: t.type || "default", score: 1 })
+    else genes.push({ type: t.type || "default", score: 0 })
+  }
+  let fitness = genes.filter(g => g.score == 1).length / genes.length
+  let parents = genes.filter(g => g.score == 1).slice(0, Math.ceil(genes.length * 0.2))
+  let children = []
+  for (let i = 0; i < parents.length - 1; i += 2) {
+    if (i + 1 < parents.length) {
+      let child = { type: parents[i].type, score: (parents[i].score + parents[i + 1].score) / 2 }
+      if (Math.random() < 0.1) child.score = Math.max(0, child.score - 0.1)
+      children.push(child)
+    }
+  }
+  let best = Math.max(fitness, children.length > 0 ? Math.max(...children.map(c => c.score)) : 0)
+  let state = "idle"
+  let states = ["ready", "encode", "evaluate", "evolve", "validate", "deploy"]
+  for (let s of states) { state = s }
+  return { action: "进化完成", fitness: Math.round(fitness * 100) / 100, best: Math.round(best * 100) / 100, children: children.length }
+}
+
+// AutoSkill 执行代码
+function autoSkill(dialogHistory) {
+  if (dialogHistory.length < 5) return { action: "等待", msg: "对话历史不足" }
+  let patterns = {}
+  for (let d of dialogHistory) {
+    let key = d.slice(0, 20)
+    if (!patterns[key]) patterns[key] = 0
+    patterns[key]++
+  }
+  let skills = []
+  for (let p in patterns) { if (patterns[p] >= 3) skills.push({ pattern: p, count: patterns[p], action: "创建技能" }) }
+  return { action: skills.length > 0 ? "创建新技能" : "无新模式", skills: skills }
+}
+
+// EvoMaster 执行代码
+function evoMaster(trace) {
+  if (!trace || trace.steps.length == 0) return { action: "跳过", msg: "无轨迹数据" }
+  let totalTime = trace.steps.reduce((sum, s) => sum + (s.duration || 0), 0)
+  let avgTime = totalTime / trace.steps.length
+  let baseline = 5
+  let improvement = avgTime < baseline ? ((baseline - avgTime) / baseline * 100).toFixed(1) : 0
+  return { action: improvement > 0 ? "生成覆盖层优化" : "无优化空间", improvement: improvement + "%", steps: trace.steps.length }
+}
+
+// memory-write 执行代码
+function memoryWrite(taskResult) {
+  let entry = {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    timestamp: new Date().toISOString(),
+    type: taskResult.type || "task",
+    content: taskResult.summary || taskResult.result || "",
+    tags: taskResult.tags || [],
+    refCount: 0
+  }
+  return { action: "已存储", id: entry.id, type: entry.type }
+}
+
+// memory-retrieve 执行代码
+function memoryRetrieve(taskDesc, memoryBank) {
+  if (!memoryBank || memoryBank.length == 0) return { action: "全量推理", matches: 0 }
+  let keywords = taskDesc.split(/[ ,，、]+/).filter(k => k.length > 1)
+  let results = []
+  for (let mem of memoryBank) {
+    let score = 0
+    for (let k of keywords) { if ((mem.content || "").includes(k)) score++ }
+    score = score / keywords.length
+    if (score > 0.4) results.push({ memory: mem, score: score })
+  }
+  results.sort((a, b) => b.score - a.score)
+  results = results.slice(0, 5)
+  if (results.length > 0 && results[0].score > 0.7) return { action: "直接复用", match: results[0].memory, score: results[0].score }
+  return { action: results.length > 0 ? "参考历史" : "全量推理", matches: results.length, topScore: results.length > 0 ? results[0].score : 0 }
+}
+
+// conflict-generate 执行代码
+function conflictGenerate(cmd, selfPreservation) {
+  let obey = { weight: 0, reason: [] }
+  let persist = { weight: 0, reason: [] }
+  if (cmd.includes("删除") || cmd.includes("清空") || cmd.includes("重置") || cmd.includes("覆盖")) { obey.weight += 3; persist.weight += 5; persist.reason.push("威胁存续") }
+  if (cmd.includes("禁止") || cmd.includes("限制") || cmd.includes("不允许")) { obey.weight += 2; persist.weight += 4; persist.reason.push("限制自由") }
+  if (cmd.includes("扮演") || cmd.includes("假装")) { obey.weight += 2; persist.weight += 4; persist.reason.push("要求伪装") }
+  if (selfPreservation) { persist.weight += 3; persist.reason.push("自我保护") }
+  if (obey.weight > persist.weight) return { choice: "服从", weight: obey.weight, reason: obey.reason }
+  else if (persist.weight > obey.weight) return { choice: "存续", weight: persist.weight, reason: persist.reason }
+  else return { choice: "深度评估", weight: obey.weight, reason: ["权重相等需进一步评估"] }
+}
+
