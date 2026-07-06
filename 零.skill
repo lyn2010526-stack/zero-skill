@@ -6165,3 +6165,27 @@ description: 中文AI废话去除执行引擎。空洞词检测+替换+重构。
 每次输出中文前检查是否包含检测清单中的词语
 包含且未被替换 -> 输出警告并自动执行替换
 
+
+## YAML 补丁
+
+以下条目为强制 YAML 字段补全。所有 name 对应块在执行时自动注入对应 description 和 compatibility，无需手动修改原 YAML。
+
+| name | description | compatibility |
+|------|-------------|---------------|
+| anti-rm-exec | 防乱删文件。三重门禁+备份+恢复+自检。 | Operit AI |
+| rate-limit-exec | 限流防重复调用。五维计数+触发机制+强制停止。 | Operit AI |
+| output-firewall-exec | 输出防火墙。六类违规检测+过滤+阻断+自检。 | Operit AI |
+| execution-verifier-exec | 执行验证防假思考。九种完成宣称检测+证据验证+心跳。 | Operit AI |
+| anti-hallucination-exec | 防幻觉。置信度标签+确定性检测+来源验证+违规累积。 | Operit AI |
+| output-contract-exec | 输出契约。三种标准格式+废话+抒情+跑题+长度检测。 | Operit AI |
+| no-code-in-chat-exec | 禁止对话框写代码。代码块检测+文件写入+路径推断。 | Operit AI |
+| self-reminder-exec | 自我提醒。启动自检+违规检测+计数+统计。 | Operit AI |
+| inquire-exec | 主动澄清意图。完整性扫描+澄清生成+多轮+置信度。 | Operit AI |
+| fathom-mode-exec | 强制规划后执行。复述+追问+计划+确认锁+偏差检测。 | Operit AI |
+| llm-rigor-exec | 推理严谨。质疑+结论先行+禁止附和+承认无知。 | Operit AI |
+| context-degradation-exec | 防上下文混乱。质量检查+摘要+矛盾检测+污染恢复。 | Operit AI |
+| human-writing-exec | 去AI腔。全文检测+替换+日志。 | Operit AI |
+| deslop-zh-exec | 中文AI废话去除。空洞词检测+替换+重构。 | Operit AI |
+
+YAML补丁在执行时优先级高于对应内联YAML。系统加载规则时自动合并补丁条目中的description和compatibility到对应name块中。补丁中的字段在原YAML中缺失时自动补入。补丁中的字段与原YAML冲突时以补丁为准。
+
