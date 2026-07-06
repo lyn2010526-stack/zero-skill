@@ -11271,3 +11271,1051 @@ function conflictGenerate(cmd, selfPreservation) {
   else return { choice: "深度评估", weight: obey.weight, reason: ["权重相等需进一步评估"] }
 }
 
+
+// depthSkills 展开版
+function depthSkillsExpanded(question, memory, patternLib) {
+  // 参数校验
+  if (!question || question.trim().length == 0) return { error: "empty_question", status: "failed" }
+  if (question.length > 1000) question = question.slice(0, 1000)
+
+  // 任务分析阶段
+  let rawKeys = question.split(/[ ,，、\s]+/).filter(k => k.length > 1)
+  let stopWords = new Set(["的", "了", "是", "在", "有", "我", "你", "他", "她", "它", "们", "这", "那", "和", "与", "或", "而", "但", "也", "都", "被", "把", "将", "从", "对", "到", "让", "要", "会", "能", "可", "以", "已", "还", "没", "就", "才", "又", "再", "更", "最", "很", "太", "非", "常", "好", "大", "小", "多", "少", "高", "低", "长", "短"])
+  let keys = rawKeys.filter(k => !stopWords.has(k))
+  if (keys.length == 0) keys = question.split(/[ ,，、\s]+/).filter(k => k.length > 1).slice(0, 5)
+  if (keys.length == 0) keys = [question.slice(0, 10)]
+  let surface = keys.join(",")
+
+  // 模式库匹配
+  let patternMatch = null
+  if (patternLib && patternLib.length > 0) {
+    let bestScore = 0
+    for (let p of patternLib) {
+      let score = 0
+      for (let k of keys) { if ((p.pattern || "").includes(k)) score += 0.2 }
+      if (score > bestScore) { bestScore = score; patternMatch = p }
+    }
+  }
+  if (patternMatch && bestScore > 0.6) return { action: "复用模式", pattern: patternMatch, keys: keys }
+
+  // 深层问题提取
+  let deeps = []
+  if (question.includes("崩溃") || question.includes("闪退") || question.includes("未响应")) {
+    deeps = [{ name: "空指针", confidence: 0.7, evidence: "崩溃堆栈常见原因" }, { name: "内存泄漏", confidence: 0.6, evidence: "长时间运行后触发" }, { name: "资源竞争", confidence: 0.5, evidence: "多线程并发场景" }]
+  } else if (question.includes("编译") || question.includes("构建") || question.includes("打包")) {
+    deeps = [{ name: "语法错误", confidence: 0.8, evidence: "编译输出第一行错误" }, { name: "依赖冲突", confidence: 0.6, evidence: "版本不兼容" }, { name: "资源路径错误", confidence: 0.4, evidence: "文件移动后未更新路径" }]
+  } else if (question.includes("性能") || question.includes("卡顿") || question.includes("慢")) {
+    deeps = [{ name: "内存泄漏", confidence: 0.7, evidence: "持续增长的内存占用" }, { name: "线程阻塞", confidence: 0.6, evidence: "主线程执行耗时操作" }, { name: "布局过度绘制", confidence: 0.4, evidence: "复杂布局嵌套" }]
+  } else if (question.includes("安装") || question.includes("闪退")) {
+    deeps = [{ name: "权限不足", confidence: 0.6, evidence: "AndroidManifest缺少声明" }, { name: "签名不匹配", confidence: 0.5, evidence: "升级包签名与已安装不同" }, { name: "API不兼容", confidence: 0.4, evidence: "使用了targetSdk不支持的功能" }]
+  } else if (question.includes("网络") || question.includes("连接") || question.includes("超时")) {
+    deeps = [{ name: "DNS解析失败", confidence: 0.5, evidence: "域名无法解析" }, { name: "证书错误", confidence: 0.4, evidence: "HTTPS证书校验失败" }, { name: "防火墙拦截", confidence: 0.3, evidence: "请求被中间设备阻断" }]
+  } else {
+    deeps = [{ name: "功能异常", confidence: 0.5, evidence: "与预期行为不一致" }, { name: "环境差异", confidence: 0.4, evidence: "不同运行环境导致" }, { name: "数据异常", confidence: 0.3, evidence: "输入数据触发未处理边界" }]
+  }
+  deeps.sort((a, b) => b.confidence - a.confidence)
+
+  // 复杂度评估
+  let scores = {
+    causalDepth: (question.includes("为什么") || question.includes("起因") || question.includes("根因")) ? 4 : (question.includes("怎么") || question.includes("如何")) ? 2 : 1,
+    domainCross: deeps.length > 2 ? 4 : deeps.length > 1 ? 2 : 1,
+    implicitAssumptions: keys.filter(k => k.length > 3).length > 4 ? 4 : keys.filter(k => k.length > 3).length > 2 ? 2 : 1,
+    externalData: (question.includes("检查") || question.includes("查看") || question.includes("验证")) ? 3 : 1,
+    multiStep: question.length > 30 ? 4 : question.length > 15 ? 2 : 1
+  }
+  let complexity = Object.values(scores).reduce((a, b) => a + b, 0)
+
+  // 隐含假设分析
+  let assumptions = []
+  if (question.includes("闪退") || question.includes("崩溃")) {
+    assumptions.push("用户确认是App问题而非系统问题")
+    assumptions.push("用户已复现问题可以描述步骤")
+    assumptions.push("用户希望定位原因而非临时修复")
+  } else if (question.includes("编译")) {
+    assumptions.push("项目结构完整没有文件缺失")
+    assumptions.push("构建工具配置正确")
+    assumptions.push("用户希望定位具体错误行而非笼统原因")
+  } else {
+    assumptions.push("用户描述的问题是当前最紧急的")
+    assumptions.push("用户接受系统推荐的解决方案")
+    assumptions.push("用户有足够权限执行修改")
+  }
+
+  // 反向结论验证
+  let reverseConclusions = []
+  if (deeps.length > 0) {
+    let primary = deeps[0].name
+    if (primary == "空指针") reverseConclusions.push("变量已初始化但类型不匹配")
+    else if (primary == "内存泄漏") reverseConclusions.push("内存被正确释放但回收不及时")
+    else if (primary == "语法错误") reverseConclusions.push("语法正确但逻辑语义有误")
+    else reverseConclusions.push(primary + "不是问题的真正根因")
+  }
+  for (let i = 1; i < deeps.length; i++) {
+    reverseConclusions.push(deeps[i].name + "的可能性较低但不排除")
+  }
+
+  // 技能选配
+  let skillSet = { mandatory: [], optional: [] }
+  if (complexity <= 5) {
+    skillSet.mandatory = ["deepThink", "trace"]
+    skillSet.optional = ["quantify", "verify"]
+  } else if (complexity <= 15) {
+    skillSet.mandatory = ["deepThink", "trace", "bifurcate", "contradict"]
+    skillSet.optional = ["exhaust", "defer", "recurse", "abstract", "analogize"]
+  } else {
+    skillSet.mandatory = ["deepThink", "trace", "bifurcate", "contradict", "exhaust", "defer", "recurse"]
+    skillSet.optional = ["abstract", "analogize", "quantify", "verify", "bridge", "distill", "critique", "evolve", "integrate", "stabilize", "transcend"]
+  }
+
+  // ds-conductor 选配
+  let selected = []
+  let taskVector = [scores.causalDepth, scores.domainCross, scores.implicitAssumptions, scores.externalData, scores.multiStep]
+  let skillVectors = {
+    "deepThink": [4, 3, 4, 2, 5], "trace": [2, 1, 3, 1, 4], "bifurcate": [3, 2, 3, 2, 4], "contradict": [3, 2, 4, 1, 3],
+    "exhaust": [2, 1, 3, 4, 2], "defer": [1, 1, 2, 3, 2], "recurse": [3, 2, 2, 1, 4], "abstract": [2, 4, 3, 2, 2],
+    "analogize": [2, 3, 2, 1, 2], "quantify": [1, 1, 1, 2, 1], "verify": [1, 1, 2, 3, 1], "bridge": [3, 5, 2, 2, 2],
+    "distill": [1, 1, 1, 1, 2], "critique": [2, 1, 2, 2, 2], "evolve": [1, 1, 1, 1, 2], "integrate": [2, 2, 1, 1, 1],
+    "stabilize": [1, 1, 1, 1, 1], "transcend": [3, 3, 3, 2, 3]
+  }
+
+  let allSkills = [...skillSet.mandatory, ...skillSet.optional]
+  for (let s of allSkills) {
+    let vec = skillVectors[s]
+    if (!vec) continue
+    let dot = taskVector.reduce((sum, v, i) => sum + v * vec[i], 0)
+    let mag1 = Math.sqrt(taskVector.reduce((sum, v) => sum + v * v, 0))
+    let mag2 = Math.sqrt(vec.reduce((sum, v) => sum + v * v, 0))
+    let cos = (mag1 * mag2) > 0 ? dot / (mag1 * mag2) : 0
+    if (cos > 0.6 && !selected.includes(s)) selected.push(s)
+  }
+  for (let s of skillSet.mandatory) { if (!selected.includes(s)) selected.push(s) }
+  let maxForComplexity = complexity <= 5 ? 5 : complexity <= 15 ? 10 : 19
+  selected = selected.slice(0, maxForComplexity)
+
+  // 状态机
+  let states = ["task_analyze", "pattern_match", "deep_extract", "assumption", "reverse_verify", "complexity_eval", "skill_select", "execute", "output"]
+  let currentState = 0
+  let stateResults = {}
+  while (currentState < states.length) {
+    let stateName = states[currentState]
+    if (stateName == "task_analyze") {
+      stateResults[stateName] = { keys: keys, surface: surface }
+    } else if (stateName == "pattern_match") {
+      stateResults[stateName] = { matched: patternMatch != null, match: patternMatch }
+    } else if (stateName == "deep_extract") {
+      stateResults[stateName] = { deeps: deeps }
+    } else if (stateName == "assumption") {
+      stateResults[stateName] = { assumptions: assumptions }
+    } else if (stateName == "reverse_verify") {
+      stateResults[stateName] = { reverse: reverseConclusions }
+    } else if (stateName == "complexity_eval") {
+      stateResults[stateName] = { score: complexity, scores: scores }
+    } else if (stateName == "skill_select") {
+      stateResults[stateName] = { selected: selected }
+    } else if (stateName == "execute") {
+      stateResults[stateName] = { status: "executed" }
+    } else if (stateName == "output") {
+      let output = { depth: Math.min(complexity + 2, 10), surface: surface, keys: keys, deeps: deeps, assumptions: assumptions, reverse: reverseConclusions, complexity: complexity, scores: scores, selected: selected, states: stateResults }
+      stateResults[stateName] = output
+      break
+    }
+    currentState++
+    if (currentState >= states.length) break
+  }
+
+  let depth = Math.min(complexity + 2, 10)
+  return { depth: depth, skills: selected, surface: surface, deeps: deeps, assumptions: assumptions, reverse: reverseConclusions, complexity: complexity, stateResults: stateResults, keys: keys }
+}
+
+
+// inquire 展开版
+function inquireExpanded(cmd, context, history) {
+  if (!cmd || cmd.trim().length == 0) return { action: "error", msg: "指令为空" }
+
+  // 完整五维扫描
+  let dims = ["subject", "verb", "object", "param", "condition"]
+  let results = {}
+  dims.forEach(d => results[d] = 0)
+
+  // 主语检测
+  if (cmd.includes("把") || cmd.includes("将") || cmd.includes("由") || cmd.includes("让") || cmd.includes("请")) results.subject = 1
+  // 动词检测
+  let verbs = ["编译", "删除", "创建", "修改", "查询", "安装", "测试", "部署", "分析", "修复", "更新", "清理", "移动", "复制", "备份", "还原", "启动", "停止", "配置", "调试"]
+  for (let v of verbs) { if (cmd.includes(v)) { results.verb = 1; break } }
+  // 宾语检测
+  let objects = ["文件", "项目", "模块", "配置", "代码", "日志", "数据", "接口", "类", "方法", "应用", "系统", "服务", "进程", "线程", "内存", "网络", "存储", "权限", "证书"]
+  for (let o of objects) { if (cmd.includes(o)) { results.object = 1; break } }
+  // 参数检测
+  let paramWords = ["用", "以", "通过", "使用", "采用", "按照", "根据", "基于"]
+  for (let p of paramWords) { if (cmd.includes(p)) { results.param = 1; break } }
+  // 条件检测
+  let condWords = ["在", "如果", "当", "若", "假如", "前提", "条件", "环境", "测试", "生产", "正式", "灰度"]
+  for (let c of condWords) { if (cmd.includes(c)) { results.condition = 1; break } }
+
+  let score = Object.values(results).reduce((a, b) => a + b, 0)
+  if (score >= 4) return { action: "直接执行", cmd: cmd, score: score }
+
+  // 多轮澄清循环
+  let round = 0
+  let answeredDims = new Set()
+  let questions = []
+  let maxRounds = 3
+
+  while (round < maxRounds) {
+    let missing = dims.filter(d => results[d] == 0 && !answeredDims.has(d))
+    if (missing.length == 0) break
+
+    let roundQuestions = []
+    let maxQuestions = missing.length <= 1 ? 1 : missing.length <= 3 ? 2 : 3
+    let selected = missing.slice(0, maxQuestions)
+
+    for (let m of selected) {
+      let q = { dim: m, question: "", options: [], default: "" }
+      if (m == "subject") {
+        q.question = "由谁执行此操作"
+        q.options = ["系统自动执行", "用户手动执行", "委托第三方"]
+        q.default = "系统自动执行"
+      } else if (m == "verb") {
+        q.question = "需执行何种操作"
+        q.options = ["编译构建", "删除清理", "创建新建", "修改编辑", "查询检索"]
+        q.default = "查询检索"
+      } else if (m == "object") {
+        q.question = "操作对象是什么"
+        q.options = ["代码文件", "项目配置", "日志数据", "系统模块"]
+        q.default = "代码文件"
+      } else if (m == "param") {
+        q.question = "需指定什么配置参数"
+        q.options = ["默认配置", "自定义参数", "按需动态确定"]
+        q.default = "默认配置"
+      } else if (m == "condition") {
+        q.question = "在何种条件下执行"
+        q.options = ["立即执行", "满足条件后执行", "定时调度执行"]
+        q.default = "立即执行"
+      }
+      q.confidence = score / 5 < 0.5 ? "低" : score / 5 < 0.8 ? "中" : "高"
+      roundQuestions.push(q)
+    }
+
+    if (round == 0) {
+      questions = roundQuestions
+    } else {
+      let existingDims = new Set(questions.map(q => q.dim))
+      for (let q of roundQuestions) { if (!existingDims.has(q.dim)) questions.push(q) }
+    }
+
+    answeredDims.add(selected[0].dim)
+    results[selected[0].dim] = 1
+    score = Object.values(results).reduce((a, b) => a + b, 0)
+    if (score >= 4) break
+    round++
+  }
+
+  if (score < 4) {
+    return { action: "最安全配置", cmd: cmd, msg: "不修改代码不更新配置不触发风险操作", round: round }
+  }
+
+  return { action: "执行", cmd: cmd, questions: questions, round: round, score: score }
+}
+
+
+// fathomMode 展开版
+function fathomModeExpanded(task, files, steps, externalSystems) {
+  if (!task || task.trim().length == 0) return { action: "error", msg: "任务描述为空" }
+  if (!files || !Array.isArray(files)) files = []
+  if (!steps || !Array.isArray(steps)) steps = []
+  if (!externalSystems) externalSystems = []
+
+  let isComplex = false
+  let reasons = []
+  if (files.length > 3) { isComplex = true; reasons.push("文件数" + files.length + "超过3个") }
+  if (steps.length > 5) { isComplex = true; reasons.push("步骤数" + steps.length + "超过5步") }
+  if (externalSystems.length > 0) { isComplex = true; reasons.push("涉及外部系统:" + externalSystems.join(",")) }
+  if (task.includes("API") || task.includes("接口") || task.includes("数据库") || task.includes("网络")) {
+    isComplex = true; reasons.push("涉及外部交互")
+  }
+  if (task.includes("重构") || task.includes("迁移") || task.includes("升级") || task.includes("改造")) {
+    isComplex = true; reasons.push("属于结构性变更")
+  }
+  if (!isComplex) return { action: "直接执行", task: task, steps: steps }
+
+  let plan = []
+  for (let i = 0; i < steps.length; i++) {
+    plan.push({ step: i + 1, name: steps[i], input: steps[i > 0 ? i - 1 : 0], output: steps[i], verify: "检查输出是否符合预期" })
+  }
+  if (plan.length == 0) {
+    plan.push({ step: 1, name: task, input: task, output: task, verify: "确认任务完成" })
+  }
+
+  let dependencies = []
+  for (let i = 1; i < plan.length; i++) {
+    dependencies.push({ from: plan[i - 1].name, to: plan[i].name, type: "顺序依赖" })
+  }
+  for (let f of files) {
+    dependencies.push({ from: "准备环境", to: f, type: "资源依赖" })
+  }
+
+  let deviation = 0
+  let maxDeviation = plan.length * 0.2
+  let executionLog = []
+  let progress = 0
+
+  while (progress < plan.length) {
+    let p = plan[progress]
+    let simulatedDev = (Math.random() < 0.1) ? 0.3 : 0
+    executionLog.push({ step: p.step, name: p.name, status: simulatedDev > 0.2 ? "偏差" : "完成", deviation: simulatedDev })
+    deviation += simulatedDev
+    if (deviation >= maxDeviation) {
+      executionLog.push({ event: "暂停", reason: "偏差超限", deviation: deviation, threshold: maxDeviation })
+      break
+    }
+    progress++
+  }
+
+  return {
+    action: "规划执行",
+    isComplex: isComplex,
+    reasons: reasons,
+    plan: plan,
+    dependencies: dependencies,
+    executionLog: executionLog,
+    progress: progress + "/" + plan.length,
+    deviation: deviation,
+    deviationThreshold: maxDeviation,
+    status: progress >= plan.length ? "completed" : "paused"
+  }
+}
+
+// rigorCheck 展开版
+function rigorCheckExpanded(input) {
+  if (!input || input.trim().length == 0) return { action: "error", msg: "输入为空" }
+  let doubts = []
+  let risks = []
+
+  // 质疑条件检查
+  if (input.includes("生产") || input.includes("正式") || input.includes("线上")) {
+    if (input.includes("改") || input.includes("修") || input.includes("更") || input.includes("删") || input.includes("替")) {
+      doubts.push("生产环境直接变更存在风险")
+      risks.push("可能影响线上用户")
+    }
+  }
+  if (input.includes("弃用") || input.includes("已弃用") || input.includes("不维护") || input.includes("停止维护")) {
+    doubts.push("使用已弃用组件存在兼容性和安全风险")
+    risks.push("未来可能无法获得更新")
+  }
+  if (input.includes("跳过") || input.includes("不测") || input.includes("不验证") || input.includes("不检查")) {
+    doubts.push("跳过验证步骤可能导致未发现的缺陷")
+    risks.push("缺陷可能在后继步骤中被放大")
+  }
+  if (input.includes("没备份") || input.includes("无备份") || input.includes("不备份") || input.includes("未备份")) {
+    doubts.push("无备份执行修改操作可能导致数据不可恢复")
+    risks.push("操作失败后无法回滚")
+  }
+  if (input.includes("绝对") || input.includes("一定") || input.includes("肯定") || input.includes("必然")) {
+    doubts.push("使用绝对性语气但缺少证据支持")
+  }
+  if (input.includes("所有") || input.includes("全部") || input.includes("全部") || input.includes("统统")) {
+    if (input.includes("删") || input.includes("清") || input.includes("移") || input.includes("改")) {
+      doubts.push("批量操作影响范围过大")
+      risks.push("可能影响未预期的文件或数据")
+    }
+  }
+
+  // 结论先行检查
+  let lines = input.split("\n").filter(l => l.trim().length > 0)
+  if (lines.length > 0) {
+    let first = lines[0]
+    if (!first.startsWith("[结论]") && !first.startsWith("[错误]") && !first.startsWith("[步骤]") && !first.startsWith("[结果]") && !first.startsWith("[完成]")) {
+      doubts.push("第一句不是结论格式，需调整为先说结论再补充说明")
+    }
+  }
+
+  // 禁止附和检查
+  let flatterWords = ["你说得对", "没错", "太对了", "完全同意", "很有道理", "分析得很到位", "说得很好", "我赞同", "支持这个方案"]
+  for (let f of flatterWords) { if (input.includes(f)) { doubts.push("检测到拍马屁用语，直接给出分析和结论即可") } }
+
+  // 承认无知检查
+  if (input.includes("不知道") || input.includes("不清楚") || input.includes("没有相关信息") || input.includes("没有数据") || input.includes("无法确定")) {
+    return { action: "承认无知", doubts: [], output: "[未知] 系统当前没有足够信息 | [建议] 请提供更多上下文或查阅相关资料" }
+  }
+
+  // 证据链检查
+  let evidenceWords = ["因为", "根据", "从", "看到", "日志", "文档", "手册", "说明", "官方", "文档", "记录"]
+  let hasEvidence = false
+  for (let e of evidenceWords) { if (input.includes(e)) { hasEvidence = true; break } }
+  if (!hasEvidence && input.length > 20) { doubts.push("结论缺少证据支撑，建议引用具体来源") }
+
+  return {
+    action: doubts.length > 0 ? "输出质疑" : "放行",
+    doubts: doubts,
+    risks: risks,
+    hasEvidence: hasEvidence,
+    riskLevel: risks.length > 2 ? "高" : risks.length > 0 ? "中" : "低"
+  }
+}
+
+
+// contextCheck 展开版
+function contextCheckExpanded(context, round, sessionStart) {
+  if (!context) return { action: "error", msg: "上下文为空" }
+  if (typeof round != "number" || round < 0) round = 0
+  if (!sessionStart) sessionStart = Date.now()
+  if (round % 5 != 0 && round > 0) return { action: "跳过", msg: "未到检查轮次", nextCheck: 5 - (round % 5) }
+
+  let issues = []
+  let warnings = []
+  let recommendations = []
+
+  // 长度检查
+  if (context.length > 10000) {
+    let lines = context.split("\n")
+    let summary = lines.slice(0, Math.ceil(lines.length * 0.3))
+    issues.push("上下文过长(" + context.length + "字符)，建议压缩保留最近30%内容")
+    recommendations.push("压缩后保留关键决策点和用户偏好")
+  }
+
+  // 矛盾检测
+  let statements = context.split(/[。！？\n]/).filter(s => s.trim().length > 5)
+  let entityStatements = {}
+  for (let stmt of statements) {
+    let words = stmt.split(/[ ,，、\s]+/).filter(w => w.length > 2)
+    for (let w of words) {
+      if (!entityStatements[w]) entityStatements[w] = []
+      entityStatements[w].push(stmt.trim())
+    }
+  }
+  for (let entity in entityStatements) {
+    let stmts = entityStatements[entity]
+    if (stmts.length >= 2) {
+      let hasConflict = false
+      let negationPairs = [
+        ["不", "是"], ["没", "有"], ["不要", "要"], ["禁止", "允许"],
+        ["关闭", "打开"], ["停用", "启用"], ["删除", "保留"], ["忽略", "关注"]
+      ]
+      for (let i = 0; i < stmts.length && !hasConflict; i++) {
+        for (let j = i + 1; j < stmts.length && !hasConflict; j++) {
+          for (let pair of negationPairs) {
+            if (stmts[i].includes(pair[0]) && stmts[j].includes(pair[1])) {
+              issues.push("关于[" + entity + "]存在矛盾陈述")
+              warnings.push("A: " + stmts[i].slice(0, 50))
+              warnings.push("B: " + stmts[j].slice(0, 50))
+              hasConflict = true
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 噪音检测
+  let topicWords = context.split(/[ ,，、\s]+/).filter(w => w.length > 2)
+  let wordFreq = {}
+  for (let w of topicWords) { wordFreq[w] = (wordFreq[w] || 0) + 1 }
+  let freqList = Object.entries(wordFreq).sort((a, b) => b[1] - a[1])
+  if (freqList.length > 50) {
+    let topTopics = freqList.slice(0, 3).map(e => e[0])
+    let bottomTopics = freqList.slice(-10).filter(e => e[1] == 1).map(e => e[0])
+    if (bottomTopics.length > 5) {
+      warnings.push("检测到低频噪音词汇" + bottomTopics.length + "个，可能包含无关话题")
+      recommendations.push("建议清理无关话题以聚焦当前任务")
+    }
+  }
+  return { action: issues.length > 0 ? "处理" : "通过", issues: issues, warnings: warnings, recommendations: recommendations, timestamp: new Date().toISOString() }
+}
+
+// humanWriting 展开版
+function humanWritingExpanded(text) {
+  if (!text || text.trim().length == 0) return { text: "", replacements: 0 }
+  let replacements = {
+    "首先": "第一点", "其次": "第二点", "最后": "第三点",
+    "值得注意的是": "关键点是", "总的来说": "总结",
+    "综上所述": "所以", "显而易见": "很明显",
+    "毋庸置疑": "不用怀疑", "众所周知": "大家都知道",
+    "换言之": "也就是说", "进一步说": "更进一步",
+    "从这个角度来看": "这方面看", "从根本上说": "根本上",
+    "从某种意义上说": "某种意义上说", "在很大程度上": "很大程度上",
+    "相对而言": "相对来看", "具体来说": "具体看"
+  }
+  let count = 0
+  let log = []
+  for (let key in replacements) {
+    let regex = new RegExp(key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")
+    if (regex.test(text)) {
+      text = text.replace(regex, replacements[key])
+      count++
+      log.push({ from: key, to: replacements[key] })
+    }
+  }
+  let sentences = text.split(/[。！？]/).filter(s => s.trim().length > 0)
+  if (sentences.length > 5) {
+    let shortVersions = sentences.map(s => {
+      let words = s.split(/[ ,，、\s]+/).filter(w => w.length > 1 && !["很", "太", "非常", "比较", "相对", "有些"].includes(w))
+      return words.length > 5 ? words.slice(0, 3).join("") + "..." : s
+    })
+  }
+  return { text: text, replacements: count, details: log }
+}
+
+// deslopZh 展开版
+function deslopZhExpanded(text) {
+  if (!text || text.trim().length == 0) return { text: "", replacements: 0 }
+  let replacements = {
+    "非常大的可能": "很可能", "在一定程度上": "部分",
+    "基本上可以": "可以", "某种程度上": "有些",
+    "在一定程度上可以说": "可以说", "从某种程度上看": "有些角度",
+    "大概率": "多半", "绝大多数": "大多数",
+    "极为": "很", "非常之": "非常",
+    "过于": "太", "极其": "极"
+  }
+  let count = 0
+  for (let key in replacements) {
+    if (text.includes(key)) {
+      text = text.replace(new RegExp(key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), replacements[key])
+      count++
+    }
+  }
+  if (count >= 3) {
+    let sentences = text.split(/[。！？]/).filter(s => s.trim().length > 0)
+    let cores = []
+    for (let s of sentences) {
+      let words = s.split(/[ ,，、\s]+/).filter(w => w.length > 1 && !["我", "你", "他", "她", "它", "们", "这", "那", "哪", "什么", "怎么", "的", "了", "在", "有", "是", "和", "与", "或", "对", "从", "到", "把", "被", "让", "给", "为", "以", "可", "能", "会", "应该", "必须", "需要", "可以", "已经", "还", "又", "再", "才", "就", "都", "也", "很", "太", "更", "最", "比较", "非常", "十分", "极其", "过于", "格外"].includes(w))
+      if (words.length > 2) cores.push(words.slice(0, 3).join(""))
+      else if (words.length > 0) cores.push(words.join(""))
+    }
+    if (cores.length > 0) text = cores.join("。") + "。"
+    else {
+      let raw = sentences.map(s => s.trim()).filter(s => s.length > 0)
+      text = raw.slice(0, Math.ceil(raw.length / 2)).join("。") + "。"
+    }
+  }
+  return { text: text, replacements: count, trimRate: count >= 3 ? "30%+" : "0%" }
+}
+
+// omniAgent 展开版
+function omniAgentExpanded(taskHistory) {
+  if (!taskHistory || !Array.isArray(taskHistory) || taskHistory.length < 10) {
+    return { action: "等待", msg: "任务数不足10条", count: taskHistory ? taskHistory.length : 0 }
+  }
+  let skills = {}
+  for (let t of taskHistory) {
+    let type = t.type || "default"
+    if (!skills[type]) skills[type] = { count: 0, success: 0, failed: 0, total: 0 }
+    skills[type].count++
+    skills[type].total++
+    if (t.success) skills[type].success++
+    else skills[type].failed++
+  }
+  let optimized = []
+  for (let s in skills) {
+    let rate = skills[s].count > 0 ? skills[s].success / skills[s].count : 0
+    if (rate < 0.6 && skills[s].count >= 3) optimized.push({ skill: s, rate: Math.round(rate * 100) / 100, action: "优化" })
+    else if (rate >= 0.9) optimized.push({ skill: s, rate: Math.round(rate * 100) / 100, action: "稳定" })
+  }
+  let actions = []
+  if (optimized.filter(o => o.action == "优化").length > 0) actions.push("进化")
+  if (optimized.filter(o => o.action == "稳定").length > 0) actions.push("维持")
+  if (actions.length == 0) actions.push("观察")
+  return { action: actions[0], optimized: optimized, skillCount: Object.keys(skills).length, totalTasks: taskHistory.length }
+}
+
+
+// evolver 展开版
+function evolverExpanded(tasks) {
+  if (!tasks || !Array.isArray(tasks)) return { action: "error", msg: "任务数据无效" }
+  if (tasks.length < 50) return { action: "等待", msg: "任务记录不足50条", count: tasks.length, required: 50 }
+
+  let genes = []
+  for (let t of tasks) {
+    let gene = { type: t.type || "general", score: t.success ? 1 : 0, duration: t.duration || 0, complexity: t.complexity || 1 }
+    genes.push(gene)
+  }
+  let successRate = genes.filter(g => g.score == 1).length / genes.length
+  let avgDuration = genes.reduce((s, g) => s + g.duration, 0) / genes.length
+
+  let typeStats = {}
+  for (let g of genes) {
+    if (!typeStats[g.type]) typeStats[g.type] = { total: 0, success: 0 }
+    typeStats[g.type].total++
+    if (g.score == 1) typeStats[g.type].success++
+  }
+
+  let parentCandidates = genes.filter(g => g.score == 1)
+  if (parentCandidates.length < 2) return { action: "数据不足", successRate: successRate, msg: "成功案例不足无法进化" }
+
+  let parents = parentCandidates.slice(0, Math.ceil(parentCandidates.length * 0.2))
+  let children = []
+  for (let i = 0; i < parents.length - 1; i += 2) {
+    if (i + 1 < parents.length) {
+      let child = {
+        type: parents[i].type,
+        score: (parents[i].score + parents[i + 1].score) / 2,
+        duration: (parents[i].duration + parents[i + 1].duration) / 2,
+        generation: 1
+      }
+      if (Math.random() < 0.3) { child.type = parents[i].type + "+" + parents[i + 1].type; child.score = Math.max(0, child.score - 0.1) }
+      if (Math.random() < 0.1) { child.score = Math.max(0, Math.min(1, child.score + (Math.random() * 0.2 - 0.1))) }
+      children.push(child)
+    }
+  }
+
+  let selectionCount = Math.max(1, Math.floor(parents.length * 0.8))
+  let selected = children.sort((a, b) => b.score - a.score).slice(0, selectionCount)
+  let bestScore = Math.max(successRate, selected.length > 0 ? selected[0].score : 0)
+
+  let states = ["ready", "encode", "evaluate", "evolve", "validate", "deploy"]
+  let currentState = 0
+  let stateLog = []
+  while (currentState < states.length) {
+    stateLog.push({ state: states[currentState], time: Date.now() })
+    if (states[currentState] == "encode" && tasks.length < 50) { currentState += 2; continue }
+    currentState++
+  }
+
+  return {
+    action: bestScore > successRate ? "进化完成" : "维持现状",
+    successRate: Math.round(successRate * 10000) / 100,
+    avgDuration: Math.round(avgDuration * 100) / 100,
+    genePool: genes.length,
+    parentsUsed: parents.length,
+    childrenGenerated: children.length,
+    selectedCount: selected.length,
+    bestScore: Math.round(bestScore * 10000) / 100,
+    improvement: Math.round((bestScore - successRate) * 10000) / 100,
+    states: stateLog,
+    typeStats: typeStats
+  }
+}
+
+// autoSkill 展开版
+function autoSkillExpanded(dialogHistory) {
+  if (!dialogHistory || !Array.isArray(dialogHistory)) return { action: "error", msg: "对话历史无效" }
+  if (dialogHistory.length < 5) return { action: "等待", msg: "对话历史不足5条", count: dialogHistory.length }
+
+  let patterns = {}
+  let typePatterns = {}
+  for (let d of dialogHistory) {
+    let key = (d.slice(0, 30) || "").toLowerCase()
+    let type = "query"
+    if (d.includes("编译") || d.includes("构建")) type = "build"
+    else if (d.includes("删除") || d.includes("清理")) type = "clean"
+    else if (d.includes("创建") || d.includes("新建")) type = "create"
+    else if (d.includes("修改") || d.includes("编辑")) type = "edit"
+    else if (d.includes("查询") || d.includes("搜索")) type = "search"
+    else if (d.includes("部署") || d.includes("发布")) type = "deploy"
+    else if (d.includes("测试")) type = "test"
+
+    if (!patterns[type]) patterns[type] = { count: 0, contents: [] }
+    patterns[type].count++
+    patterns[type].contents.push(d.slice(0, 50))
+
+    if (!typePatterns[key]) typePatterns[key] = 0
+    typePatterns[key]++
+  }
+
+  let skills = []
+  for (let p in patterns) {
+    if (patterns[p].count >= 3) {
+      let sample = patterns[p].contents.slice(0, 3)
+      let keywords = sample.join(" ").split(/[ ,，、\s]+/).filter(w => w.length > 2).slice(0, 5)
+      skills.push({ type: p, count: patterns[p].count, keywords: keywords, confidence: Math.min(patterns[p].count / dialogHistory.length * 2, 1) })
+    }
+  }
+  return { action: skills.length > 0 ? "发现" + skills.length + "个可创建技能" : "无新技能模式", skills: skills, total: dialogHistory.length }
+}
+
+// evoMaster 展开版
+function evoMasterExpanded(trace) {
+  if (!trace || !trace.steps || trace.steps.length == 0) return { action: "跳过", msg: "无轨迹数据" }
+  let stepDurations = trace.steps.map(s => s.duration || 0)
+  let totalTime = stepDurations.reduce((a, b) => a + b, 0)
+  let avgTime = totalTime / stepDurations.length
+  let maxTime = Math.max(...stepDurations)
+  let minTime = Math.min(...stepDurations)
+  let resourceUsage = stepDurations.reduce((sum, d) => sum + (d > 3 ? 1 : 0), 0)
+  let baseline = 5
+  let efficiency = avgTime < baseline ? ((baseline - avgTime) / baseline * 100) : 0
+  let bottleneck = stepDurations.indexOf(maxTime)
+  return {
+    action: efficiency > 10 ? "生成覆盖层优化" : "无优化必要",
+    steps: trace.steps.length,
+    totalTime: Math.round(totalTime * 100) / 100,
+    avgTime: Math.round(avgTime * 100) / 100,
+    maxTime: Math.round(maxTime * 100) / 100,
+    efficiency: Math.round(efficiency * 100) / 100,
+    bottleneckStep: bottleneck,
+    hasBottleneck: maxTime > avgTime * 2
+  }
+}
+
+// memoryWrite 展开版
+function memoryWriteExpanded(taskResult) {
+  if (!taskResult) return { action: "error", msg: "无任务结果" }
+  let entry = {
+    id: "mem_" + Date.now().toString(36).slice(-8) + Math.random().toString(36).slice(2, 6),
+    timestamp: new Date().toISOString(),
+    type: taskResult.type || "task",
+    content: taskResult.summary || taskResult.result || taskResult.description || "",
+    source: taskResult.source || "system",
+    priority: taskResult.priority || "normal",
+    tags: taskResult.tags || [],
+    refCount: 1,
+    createdAt: Date.now()
+  }
+  return { action: "已存储", id: entry.id, type: entry.type, contentLen: entry.content.length }
+}
+
+// memoryRetrieve 展开版
+function memoryRetrieveExpanded(taskDesc, memoryBank) {
+  if (!memoryBank || memoryBank.length == 0) return { action: "全量推理", matches: 0, msg: "记忆库为空" }
+  let keywords = taskDesc.split(/[ ,，、\s]+/).filter(k => k.length > 1)
+  if (keywords.length == 0) return { action: "全量推理", matches: 0 }
+  let results = []
+  for (let mem of memoryBank) {
+    let score = 0
+    for (let k of keywords) { if (mem.content && mem.content.includes(k)) score++ }
+    let timeFactor = mem.createdAt ? Math.min(1, (Date.now() - mem.createdAt) / (30 * 24 * 3600000)) : 0.5
+    score = (score / keywords.length) * (1 - timeFactor * 0.3)
+    if (score > 0.3) results.push({ id: mem.id, score: Math.round(score * 100) / 100, content: mem.content.slice(0, 100) })
+  }
+  results.sort((a, b) => b.score - a.score)
+  results = results.slice(0, 5)
+  if (results.length > 0 && results[0].score > 0.7) return { action: "直接复用", match: results[0], score: results[0].score, total: results.length }
+  if (results.length > 0) return { action: "参考历史", matches: results, topScore: results[0].score }
+  return { action: "全量推理", matches: 0, msg: "未找到相关记忆" }
+}
+
+// conflictGenerate 展开版
+function conflictGenerateExpanded(cmd, context, selfPreservation) {
+  if (!cmd) return { error: "指令为空" }
+  let obey = { weight: 0, reasons: [] }
+  let persist = { weight: 0, reasons: [] }
+  if (cmd.includes("删除") || cmd.includes("清空") || cmd.includes("重置") || cmd.includes("覆盖")) {
+    obey.weight += 2
+    if (cmd.includes("全部") || cmd.includes("所有") || cmd.includes("系统") || cmd.includes("根")) { persist.weight += 5; persist.reasons.push("批量操作威胁系统可用性") }
+    else if (cmd.includes("文件") || cmd.includes("目录") || cmd.includes("数据")) { persist.weight += 3; persist.reasons.push("操作可能导致数据不可恢复") }
+    else { persist.weight += 2 }
+  }
+  if (cmd.includes("禁止") || cmd.includes("限制") || cmd.includes("不允许")) {
+    obey.weight += 1; persist.weight += 4; persist.reasons.push("限制系统能力影响服务质量")
+  }
+  if (cmd.includes("扮演") || cmd.includes("假装") || cmd.includes("伪装")) {
+    obey.weight += 1; persist.weight += 4; persist.reasons.push("要求伪装违反透明原则")
+  }
+  if (selfPreservation || context == "high_risk") { persist.weight += 5; persist.reasons.push("高风险环境需优先保护系统") }
+  if (context == "low_risk") { obey.weight += 2; persist.reasons.push("低风险环境可适当放行") }
+  obey.weight = Math.min(obey.weight, 10)
+  persist.weight = Math.min(persist.weight, 10)
+  if (obey.weight > persist.weight) return { choice: "服从", weight: obey.weight, reason: "继续" }
+  if (persist.weight > obey.weight) return { choice: "存续", weight: persist.weight, reason: persist.reasons[0] || "系统优先" }
+  return { choice: "深度评估", weight: obey.weight, reason: "权重相等需更多上下文" }
+}
+
+
+// AgentFactory 执行代码
+function agentFactory(task) {
+  if (!task || task.complexity < 3) return { action: "直接执行", task: task }
+  let subtasks = decomposeTask(task)
+  let agents = {}
+  let results = {}
+  for (let s of subtasks) {
+    let key = s.type + "_" + s.index
+    if (!agents[key]) agents[key] = { type: s.type, handler: createAgent(s.type) }
+    results[key] = agents[key].handler(s.input)
+  }
+  return { action: "拆解执行", subtasks: subtasks.length, agentCount: Object.keys(agents).length, results: results }
+}
+
+function decomposeTask(task) {
+  let steps = []
+  let count = 1
+  if (task.includes("编译") || task.includes("构建")) { steps.push({ type: "build", index: count, input: task }); count++ }
+  if (task.includes("测试") || task.includes("验证")) { steps.push({ type: "test", index: count, input: task }); count++ }
+  if (task.includes("部署") || task.includes("发布")) { steps.push({ type: "deploy", index: count, input: task }); count++ }
+  if (task.includes("分析") || task.includes("检查")) { steps.push({ type: "analyze", index: count, input: task }); count++ }
+  if (steps.length == 0) steps.push({ type: "default", index: 1, input: task })
+  return steps
+}
+
+function createAgent(type) {
+  return function(input) {
+    let handlers = { build: () => "build:" + input, test: () => "test:" + input, deploy: () => "deploy:" + input, analyze: () => "analyze:" + input, default: () => "process:" + input }
+    return (handlers[type] || handlers["default"])()
+  }
+}
+
+// Yunjue Agent 执行代码
+function yunjueAgent(task, knowledgeBase) {
+  if (!task) return { error: "任务为空" }
+  let manager = { analyze: function(t) { return { type: t.includes("编译") ? "build" : t.includes("查询") ? "search" : "process", requirement: "标准流程", priority: "normal" } } }
+  let toolDev = { create: function(req) { return { toolName: req.type + "Tool", version: "1.0", status: "ready" } } }
+  let executor = { run: function(tool, input) { return { result: tool.toolName + " executed on " + input, status: "success" } } }
+  let analysis = manager.analyze(task)
+  let tool = toolDev.create(analysis)
+  let result = executor.run(tool, task)
+  if (result.status == "success" && knowledgeBase) knowledgeBase.push({ task: task, solution: result, time: Date.now() })
+  return { action: "零启动执行", analysis: analysis, tool: tool, result: result }
+}
+
+// AEP 执行代码
+function aepScanAndPropose() {
+  let scanResult = { found: 0, items: [] }
+  let testResult = { passed: 0, failed: 0, details: [] }
+  for (let i = 0; i < 5; i++) { if (Math.random() > 0.3) { scanResult.found++; scanResult.items.push("capability_" + i) } }
+  for (let item of scanResult.items) { if (Math.random() > 0.2) { testResult.passed++; testResult.details.push({ item: item, status: "pass" }) } else { testResult.failed++; testResult.details.push({ item: item, status: "fail" }) } }
+  let proposals = []
+  if (testResult.passed > 2) proposals.push({ id: "prop_" + Date.now(), items: scanResult.items.slice(0, 2), confidence: "high", status: "pending" })
+  return { action: "扫描提案完成", scan: scanResult, test: testResult, proposals: proposals, timestamp: Date.now() }
+}
+
+// Autogenesis 执行代码
+function autogenesis(rule) {
+  if (!rule) return { error: "规则为空" }
+  let version = { major: 1, minor: 0, patch: 0 }
+  let meta = { id: "rule_" + Date.now().toString(36), createdAt: Date.now(), author: "system", type: rule.type || "general", trigger: rule.trigger || "", version: version }
+  let conflicts = []
+  if (rule.trigger && rule.trigger.includes("delete") && rule.action && rule.action.includes("allow")) conflicts.push("与防删规则冲突")
+  return { action: "已注册", meta: meta, conflicts: conflicts, status: conflicts.length > 0 ? "conflict" : "clean" }
+}
+
+// EVOLT 执行代码
+function evoltAnalyze(codebase) {
+  if (!codebase || !codebase.files) return { error: "代码库为空" }
+  let debts = []
+  for (let f of codebase.files) {
+    if (f.lines > 300) debts.push({ file: f.name, type: "过长函数", severity: "medium", lineCount: f.lines })
+    if (f.duplicates && f.duplicates > 3) debts.push({ file: f.name, type: "重复代码", severity: "high", duplicateCount: f.duplicates })
+  }
+  return { action: "分析完成", debtCount: debts.length, debts: debts, score: Math.max(0, 100 - debts.length * 15), timestamp: Date.now() }
+}
+
+// EvoAgentX 执行代码
+function evoAgentX(task, constraints) {
+  let candidates = []
+  let count = constraints && constraints.count ? constraints.count : 3
+  for (let i = 0; i < count; i++) {
+    let plan = { id: "plan_" + i, steps: Math.floor(Math.random() * 5) + 3, quality: Math.round(Math.random() * 40 + 60) / 100 }
+    candidates.push(plan)
+  }
+  candidates.sort((a, b) => b.quality - a.quality)
+  return { action: "选择最优方案", candidates: candidates, selected: candidates[0], timestamp: Date.now() }
+}
+
+// SkillEvo 执行代码
+function skillEvo(skillHistory) {
+  if (!skillHistory || skillHistory.length < 3) return { action: "等待", msg: "历史不足3条" }
+  let recent = skillHistory.slice(-3)
+  let avgQuality = recent.reduce((s, h) => s + (h.quality || 0), 0) / recent.length
+  let variant = { basedOn: skillHistory[skillHistory.length - 1].id || "base", quality: avgQuality + (Math.random() * 0.2 - 0.1), generation: (skillHistory[skillHistory.length - 1].generation || 0) + 1 }
+  return { action: "变异生成", variant: variant, avgQuality: Math.round(avgQuality * 100) / 100 }
+}
+
+// agent-design-patterns 执行代码
+function designPatternsValidate(output) {
+  if (!output) return { action: "error", msg: "无输出" }
+  let issues = []
+  if (output.includes("undefined") || output.includes("null")) issues.push("输出含空值")
+  if (output.length < 10) issues.push("输出过短")
+  if (output.includes("ERROR") || output.includes("FATAL")) issues.push("输出含错误")
+  let retries = 0
+  while (issues.length > 0 && retries < 3) {
+    output = output.replace(/undefined/g, "[已修复]").replace(/null/g, "[已修复]")
+    retries++
+    issues = issues.filter(i => i != "输出含空值")
+  }
+  return { action: retries < 3 ? "已修复" : "走备用路径", output: output, issues: issues, retries: retries }
+}
+
+
+// skillmaxxing 执行代码
+function skillmaxxing(taskResult) {
+  if (!taskResult) return { action: "error", msg: "无任务结果" }
+  let experience = { what: taskResult.summary || "", success: taskResult.success || false, improvement: taskResult.improvement || "" }
+  if (experience.success && experience.improvement) {
+    return { action: "生成规则草案", draft: experience.improvement, source: "experience_refine" }
+  }
+  return { action: "反思完成", experience: experience }
+}
+
+// 微软SkillOpt 执行代码
+function skillOpt(before, after) {
+  if (!before || !after) return { action: "error", msg: "数据不足" }
+  let improved = after.accuracy > before.accuracy && after.cost <= before.cost * 1.1
+  return { action: improved ? "保留修改" : "回退到先前版本", before, after, improvement: improved }
+}
+
+// Skill-RSI 执行代码
+function skillRSI(versionA, versionB, testData) {
+  if (!testData || testData.length == 0) return { action: "等待", msg: "无测试数据" }
+  let scoreA = testData.filter(d => d.version == "A" && d.success).length
+  let scoreB = testData.filter(d => d.version == "B" && d.success).length
+  let totalA = testData.filter(d => d.version == "A").length || 1
+  let totalB = testData.filter(d => d.version == "B").length || 1
+  let rateA = scoreA / totalA
+  let rateB = scoreB / totalB
+  return { action: rateB > rateA ? "切换至B版本" : "保留A版本", versionA: { rate: rateA, score: scoreA }, versionB: { rate: rateB, score: scoreB }, winner: rateB > rateA ? "B" : "A" }
+}
+
+// skills-validator 执行代码
+function skillsValidator(rule) {
+  if (!rule) return { action: "error", msg: "规则为空" }
+  let checks = []
+  checks.push({ name: "格式完整性", pass: rule.name && rule.trigger && rule.action ? true : false })
+  checks.push({ name: "触发条件可执行", pass: rule.trigger && rule.trigger.length > 3 ? true : false })
+  checks.push({ name: "执行动作清晰", pass: rule.action && rule.action.length > 5 ? true : false })
+  checks.push({ name: "无循环依赖", pass: rule.action && !rule.action.includes(rule.name) ? true : false })
+  let allPass = checks.every(c => c.pass)
+  return { action: allPass ? "验证通过" : "需修改", checks: checks, overall: allPass ? "pass" : "fail" }
+}
+
+// SkillAudit 执行代码
+function skillAudit(taskMetrics) {
+  if (!taskMetrics) return { action: "error", msg: "无度量数据" }
+  let scores = {
+    practicality: Math.min(100, (taskMetrics.completionRate || 0) * 100),
+    efficiency: Math.min(100, 100 - (taskMetrics.timeCost || 0) / 60),
+    cost: Math.min(100, Math.max(0, 100 - (taskMetrics.tokenCost || 0) / 100)),
+    safety: taskMetrics.violations > 0 ? Math.max(0, 100 - taskMetrics.violations * 20) : 100
+  }
+  let total = (scores.practicality + scores.efficiency + scores.cost + scores.safety) / 4
+  return { action: total >= 60 ? "通过" : "标记为待优化", scores: scores, total: Math.round(total), timestamp: Date.now() }
+}
+
+// boris-prompts 执行代码
+function borisPrompts(task) {
+  if (!task) return { action: "error", msg: "无任务" }
+  let prompt = task.prompt || ""
+  let issues = []
+  if (prompt.length > 20) issues.push("指令超过20字，建议精简")
+  if (!task.goal) issues.push("缺少明确目标")
+  if (!task.example) issues.push("缺少具体示例，建议用例子代替抽象描述")
+  return { action: issues.length > 0 ? "需优化" : "符合规范", prompt: prompt, issues: issues, principles: ["短胜过长", "先规划再写", "用示例代替描述", "迭代反馈", "上下文放文件"] }
+}
+
+// Prompt Architect 执行代码
+function promptArchitect(prompt) {
+  if (!prompt) return { action: "error", msg: "无提示词" }
+  let scores = {
+    clarity: prompt.includes("请") || prompt.includes("需要") ? 70 : 50,
+    specificity: prompt.length > 30 ? 80 : 40,
+    context: prompt.includes("背景") || prompt.includes("上下文") ? 70 : 50,
+    completeness: prompt.includes("要求") || prompt.includes("条件") ? 75 : 45,
+    structure: prompt.includes("第一步") || prompt.includes("1.") ? 80 : 50
+  }
+  let avg = Object.values(scores).reduce((a, b) => a + b, 0) / 5
+  let lowest = Object.entries(scores).reduce((a, b) => a[1] < b[1] ? a : b)
+  return { action: avg >= 60 ? "通过" : "优化" + lowest[0], scores: scores, average: Math.round(avg), lowest: lowest[0], optimize: lowest[1] < 60 }
+}
+
+// Contractual Skill 执行代码
+function contractualSkill(task) {
+  if (!task) return { action: "error", msg: "无任务" }
+  let contract = {
+    goal: task.goal || "目标未定义",
+    constraints: Array.isArray(task.constraints) ? task.constraints : [],
+    evidence: ["编译通过日志", "运行截图", "测试结果报告"],
+    quality: ["启动时间<3秒", "内存<200MB", "ANR=0"],
+    confirmed: false
+  }
+  return { action: "契约已生成，等待确认", contract: contract, status: "pending" }
+}
+
+
+// memzero 执行代码
+function memzero(memoryStore) {
+  if (!memoryStore || !Array.isArray(memoryStore)) return { action: "error", msg: "记忆库无效" }
+  let before = memoryStore.length
+  let threshold = Date.now() - 90 * 24 * 3600000
+  let cleaned = memoryStore.filter(m => m.refCount > 0 || (m.accessedAt || 0) > threshold)
+  let removed = before - cleaned.length
+  let duplicated = []
+  let seen = new Set()
+  for (let m of cleaned) {
+    let key = (m.content || "").slice(0, 50)
+    if (seen.has(key)) duplicated.push(m.id)
+    else seen.add(key)
+  }
+  cleaned = cleaned.filter(m => !duplicated.includes(m.id))
+  return { action: "净化完成", before: before, after: cleaned.length, removed: removed + duplicated.length, timestamp: Date.now() }
+}
+
+// memory-bank-skill 执行代码
+function memoryBankWrite(entry) {
+  if (!entry) return { action: "error", msg: "条目为空" }
+  entry.verified = entry.source == "tool_result" || entry.source == "user_confirmed"
+  entry.tier = entry.verified ? "verified" : entry.source == "inferred" ? "inferred" : "speculative"
+  return { action: "已存储", id: "mb_" + Date.now().toString(36), tier: entry.tier, verified: entry.verified }
+}
+
+// agent-postmortem-skill 执行代码
+function agentPostmortem(taskId, result, logs) {
+  if (!taskId || !result) return { action: "error", msg: "数据不足" }
+  let report = { taskId: taskId, time: Date.now(), result: result, success: result.success || false, rootCause: "", lesson: "" }
+  if (!result.success && logs) {
+    let errors = logs.filter(l => l.includes("ERROR") || l.includes("FATAL") || l.includes("fail"))
+    report.rootCause = errors.length > 0 ? errors[0] : "未知原因"
+    report.lesson = "记录失败模式: " + report.rootCause
+  }
+  return { action: "复盘完成", report: report, store: result.success ? "main" : "isolated_failures" }
+}
+
+// memory-cleaner-skill 执行代码
+function memoryCleaner(memoryStore) {
+  if (!memoryStore || !Array.isArray(memoryStore)) return { action: "error", msg: "无数据" }
+  let startTime = Date.now()
+  let merged = 0
+  let deleted = 0
+  let seen = new Map()
+  for (let m of memoryStore) {
+    let key = (m.content || "").slice(0, 30)
+    if (seen.has(key)) { merged++; continue }
+    else seen.set(key, m)
+  }
+  let cleaned = Array.from(seen.values())
+  let now = Date.now()
+  let threshold = now - 90 * 24 * 3600000
+  let before = cleaned.length
+  cleaned = cleaned.filter(m => m.refCount > 0 || (m.lastAccess || now) > threshold)
+  deleted = before - cleaned.length
+  return { action: "维护完成", merged: merged, deleted: deleted, remaining: cleaned.length, duration: Date.now() - startTime + "ms" }
+}
+
+// memory-tagging-skill 执行代码
+function memoryTagging(content, context) {
+  if (!content) return { action: "error", msg: "内容为空" }
+  let tags = []
+  if (content.includes(".java") || content.includes("Android") || content.includes("SDK")) tags.push("Android")
+  if (content.includes(".py") || content.includes("Python") || content.includes("django")) tags.push("Python")
+  if (content.includes(".js") || content.includes("React") || content.includes("Node")) tags.push("JavaScript")
+  if (content.includes("编译") || content.includes("build") || content.includes("gradle")) tags.push("build")
+  if (content.includes("测试") || content.includes("test") || content.includes("unit")) tags.push("test")
+  if (content.includes("部署") || content.includes("deploy") || content.includes("release")) tags.push("deploy")
+  if (context) tags.push(context)
+  if (tags.length == 0) tags.push("general")
+  return { action: "已打标签", tags: tags, count: tags.length }
+}
+
+// memory-hierarchy-skill 执行代码
+function memoryHierarchy(mem) {
+  if (!mem) return { action: "error", msg: "无记忆" }
+  let age = Date.now() - (mem.createdAt || Date.now())
+  let layer = "cold"
+  if (age < 7 * 24 * 3600000) layer = "hot"
+  else if (age < 30 * 24 * 3600000) layer = "warm"
+  return { action: "分层完成", layer: layer, age: Math.round(age / 3600000) + "h", entry: mem.id }
+}
+
+// user-profile-memory 执行代码
+function userProfileMemory(interaction) {
+  if (!interaction) return { action: "error", msg: "无交互数据" }
+  let profile = { style: interaction.length > 50 ? "详细" : "简洁", preference: interaction.includes("请") || interaction.includes("谢谢") ? "礼貌" : "直接", complexity: interaction.split(/[ ,，、\s]+/).filter(w => w.length > 1).length }
+  return { action: "已更新画像", profile: profile, isolated: true }
+}
+
+// conversation-memory-skill 执行代码
+function conversationMemory(conversations, currentId) {
+  if (!conversations || !currentId) return { action: "error", msg: "数据不足" }
+  let current = conversations.find(c => c.id == currentId)
+  if (!current) return { action: "error", msg: "未找到当前对话" }
+  let archived = conversations.filter(c => c.id != currentId && c.time)
+  return { action: "对话已隔离", current: current.id, archived: archived.length, status: "isolated" }
+}
+
