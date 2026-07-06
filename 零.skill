@@ -12319,3 +12319,103 @@ function conversationMemory(conversations, currentId) {
   return { action: "对话已隔离", current: current.id, archived: archived.length, status: "isolated" }
 }
 
+
+// depthSkills 300行展开版
+function depthSkillsFull(question, memory, patternLib, options) {
+  if (!question || question.trim().length == 0) return { error: "empty_question", status: "failed" }
+  if (question.length > 2000) question = question.slice(0, 2000)
+  let defaults = { maxStates: 9, timeoutPerState: 5000, enablePatternMatch: true, enableReverseVerify: true, complexityModel: "standard" }
+  let cfg = Object.assign({}, defaults, options || {})
+  let rawKeys = question.split(/[ ,，、\s]+/).filter(k => k.length > 1)
+  let stopWords = new Set(["的", "了", "是", "在", "有", "我", "你", "他", "她", "它", "们", "这", "那", "和", "与", "或", "而", "但", "也", "都", "被", "把", "将", "从", "对", "到", "让", "要", "会", "能", "可", "以", "已", "还", "没", "就", "才", "又", "再", "更", "最", "很", "太", "非", "常", "好", "大", "小", "多", "少", "高", "低", "长", "短", "新", "旧", "前", "后", "左", "右", "上", "下", "内", "外", "中", "旁", "东", "西", "南", "北"])
+  let keys = rawKeys.filter(k => !stopWords.has(k))
+  if (keys.length == 0) keys = question.split(/[ ,，、\s]+/).filter(k => k.length > 1).slice(0, 8)
+  if (keys.length == 0) keys = [question.slice(0, 15)]
+  let surface = keys.join(",")
+  let stateLog = []
+  let currentState = 0
+  let states = ["entry", "tokenize", "pattern_match", "deep_extract", "assumption", "reverse_verify", "complexity_eval", "skill_select", "execute", "output"]
+  let stateResults = {}
+  let errors = []
+  stateLog.push({ state: "entry", time: Date.now(), msg: "启动深度推理" })
+  if (cfg.enablePatternMatch && patternLib && patternLib.length > 0) {
+    let bestScore = 0
+    let bestPattern = null
+    for (let p of patternLib) {
+      let score = 0
+      for (let k of keys) { if ((p.pattern || "").includes(k)) score += 0.2 }
+      if (score > bestScore) { bestScore = score; bestPattern = p }
+    }
+    if (bestPattern && bestScore > 0.6) return { action: "复用模式", pattern: bestPattern, keys: keys, source: "pattern_lib" }
+  }
+  stateLog.push({ state: "tokenize", time: Date.now(), keys: keys, surface: surface })
+  let deeps = []
+  if (question.includes("崩溃") || question.includes("闪退") || question.includes("未响应") || question.includes("卡死")) {
+    deeps = [{ name: "空指针异常", confidence: 0.75, evidence: "NullPointerException堆栈" }, { name: "内存泄漏", confidence: 0.65, evidence: "GC频繁且内存持续增长" }, { name: "主线程阻塞", confidence: 0.55, evidence: "ANR日志中主线程耗时操作" }, { name: "资源竞争", confidence: 0.45, evidence: "多线程访问共享资源" }]
+  } else if (question.includes("编译") || question.includes("构建") || question.includes("打包") || question.includes("gradle")) {
+    deeps = [{ name: "语法错误", confidence: 0.8, evidence: "编译器输出错误行号" }, { name: "依赖冲突", confidence: 0.65, evidence: "不同模块引用了同一库的不同版本" }, { name: "资源未找到", confidence: 0.5, evidence: "R文件或资源ID无法解析" }, { name: "Gradle配置错误", confidence: 0.4, evidence: "插件版本与Gradle版本不兼容" }]
+  } else if (question.includes("性能") || question.includes("卡顿") || question.includes("慢") || question.includes("延迟")) {
+    deeps = [{ name: "内存泄漏", confidence: 0.7, evidence: "内存占用持续上升" }, { name: "线程阻塞", confidence: 0.6, evidence: "主线程执行耗时IO操作" }, { name: "布局过深", confidence: 0.5, evidence: "View层级超过15层" }, { name: "过度绘制", confidence: 0.4, evidence: "GPU渲染时间超标" }]
+  } else if (question.includes("安装") || question.includes("闪退") || question.includes("启动")) {
+    deeps = [{ name: "权限配置缺失", confidence: 0.65, evidence: "Manifest缺少必要声明" }, { name: "签名冲突", confidence: 0.55, evidence: "新包签名与已安装版本不一致" }, { name: "API兼容性", confidence: 0.45, evidence: "使用了targetVersion不支持的功能" }, { name: "资源文件损坏", confidence: 0.35, evidence: "APK解压时CRC校验失败" }]
+  } else if (question.includes("网络") || question.includes("连接") || question.includes("超时") || question.includes("请求")) {
+    deeps = [{ name: "DNS解析失败", confidence: 0.55, evidence: "域名无法解析到IP" }, { name: "SSL证书错误", confidence: 0.45, evidence: "证书链校验不通过" }, { name: "请求超时", confidence: 0.4, evidence: "超过设置的timeout时间" }, { name: "数据解析异常", confidence: 0.35, evidence: "返回格式与预期不符" }]
+  } else {
+    deeps = [{ name: "功能逻辑错误", confidence: 0.55, evidence: "代码逻辑与预期不符" }, { name: "数据状态异常", confidence: 0.45, evidence: "输入数据触发未处理边界" }, { name: "环境配置差异", confidence: 0.35, evidence: "开发与生产环境不同" }, { name: "版本兼容问题", confidence: 0.3, evidence: "升级后行为发生变化" }]
+  }
+  deeps.sort((a, b) => b.confidence - a.confidence)
+  stateLog.push({ state: "deep_extract", time: Date.now(), deeps: deeps.slice(0, 3) })
+  let assumptions = []
+  if (question.includes("闪退") || question.includes("崩溃")) {
+    assumptions.push("用户确认是应用本身的问题而非操作系统问题")
+    assumptions.push("用户可以复现问题并能描述触发步骤")
+    assumptions.push("用户希望定位根因而非临时绕过方案")
+    assumptions.push("用户可以提供日志或截图辅助分析")
+  } else if (question.includes("编译")) {
+    assumptions.push("项目代码完整没有文件缺失")
+    assumptions.push("构建工具和Gradle版本已正确配置")
+    assumptions.push("用户希望定位到具体错误文件而非笼统原因")
+    assumptions.push("用户具备基本的构建问题排查能力")
+  } else {
+    assumptions.push("用户描述的问题是目前最需要处理的")
+    assumptions.push("用户接受系统分析后推荐的解决方案")
+    assumptions.push("用户有足够权限执行方案中的修改")
+    assumptions.push("用户愿意提供更多信息以便精确定位")
+  }
+  stateLog.push({ state: "assumption", time: Date.now(), assumptions: assumptions })
+  let reverseConclusions = []
+  if (cfg.enableReverseVerify && deeps.length > 0) {
+    let primary = deeps[0].name
+    if (primary.includes("空指针")) reverseConclusions.push("变量已声明但未正确初始化")
+    else if (primary.includes("内存泄漏")) reverseConclusions.push("内存已正确释放但GC回收不及时")
+    else if (primary.includes("语法错误")) reverseConclusions.push("语法检查通过但语义逻辑有误")
+    else if (primary.includes("权限")) reverseConclusions.push("权限已在Manifest声明但运行时未动态申请")
+    else if (primary.includes("签名")) reverseConclusions.push("签名配置正确但构建类型与目标环境不匹配")
+    else if (primary.includes("DNS")) reverseConclusions.push("域名正确但DNS缓存存在问题")
+    else reverseConclusions.push(primary + "可能是表象，根因在更深层")
+    for (let i = 1; i < Math.min(deeps.length, 4); i++) {
+      reverseConclusions.push(deeps[i].name + "可能性较低但不排除，需进一步验证")
+    }
+  }
+  stateLog.push({ state: "reverse_verify", time: Date.now(), reverse: reverseConclusions })
+  let scores = {
+    causalDepth: (question.includes("为什么") || question.includes("起因") || question.includes("根因")) ? 4 : (question.includes("怎么") || question.includes("如何")) ? 2 : 1,
+    domainCross: deeps.length > 2 ? 4 : deeps.length > 1 ? 2 : 1,
+    implicitAssumptions: keys.filter(k => k.length > 3).length > 4 ? 4 : keys.filter(k => k.length > 3).length > 2 ? 2 : 1,
+    externalData: (question.includes("检查") || question.includes("查看") || question.includes("分析") || question.includes("诊断")) ? 3 : 1,
+    multiStep: question.length > 40 ? 4 : question.length > 20 ? 2 : 1
+  }
+  let complexity = Object.values(scores).reduce((a, b) => a + b, 0)
+  stateLog.push({ state: "complexity_eval", time: Date.now(), score: complexity, scores: scores })
+  let skillSet = { mandatory: [], optional: [] }
+  if (complexity <= 5) { skillSet.mandatory = ["deepThink", "trace"]; skillSet.optional = ["quantify", "verify"] }
+  else if (complexity <= 15) { skillSet.mandatory = ["deepThink", "trace", "bifurcate", "contradict"]; skillSet.optional = ["exhaust", "defer", "recurse", "abstract", "analogize"] }
+  else { skillSet.mandatory = ["deepThink", "trace", "bifurcate", "contradict", "exhaust", "defer", "recurse"]; skillSet.optional = ["abstract", "analogize", "quantify", "verify", "bridge", "distill", "critique", "evolve", "integrate", "stabilize", "transcend"] }
+  let selected = [...skillSet.mandatory]
+  for (let s of skillSet.optional) { if (selected.length < (complexity <= 5 ? 5 : complexity <= 15 ? 10 : 19)) selected.push(s) }
+  stateLog.push({ state: "skill_select", time: Date.now(), selected: selected })
+  let depth = Math.min(complexity + 2, 10)
+  stateLog.push({ state: "output", time: Date.now(), depth: depth })
+  return { action: "推理完成", depth: depth, skills: selected, surface: surface, keys: keys, deeps: deeps, assumptions: assumptions, reverse: reverseConclusions, complexity: complexity, scores: scores, states: stateLog, stateCount: states.length, errors: errors, timestamp: Date.now() }
+}
+
