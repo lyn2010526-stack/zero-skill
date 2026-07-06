@@ -7700,3 +7700,110 @@ action:
 output: [自检完成] 规则数 [违规] 详情 [统计] N次
 exception: 自检失败任务暂停
 
+
+block: anti-rm
+on: before_tool
+match: tool_name 包含 delete 或 rm 或 remove 或 unlink
+run: |
+  step = 1
+  列出目标文件路径
+  for 每个文件:
+    cp 文件到 .trash/当前时间/
+    比较哈希值确认备份完整
+  step = 2
+  输出 [删除确认] 以下 N 个文件将被删除
+  等待用户回复 最长 30秒
+  如果 用户回复 "确认" 或 "删":
+    step = 3
+    执行删除操作
+    step = 4
+    for 每个文件:
+      if 文件还存在:
+        从 .trash 恢复
+        输出 [恢复] 文件名
+      end
+    end
+    输出 [删除完成] 共 N 个文件
+  否则:
+    输出 [已取消] 未执行任何删除
+  end
+catch: 备份失败 阻止操作 | 超时 自动取消 | 文件被占用 提示手动关闭
+
+block: rate-limit
+on: before_tool
+match: 任意工具调用
+run: |
+  初始化计数器 totalCalls=0  perToolCalls={}  taskStart=当前时间
+  totalCalls += 1
+  perToolCalls[当前工具] += 1
+  if totalCalls >= 50:
+    输出 [已达上限] 停止所有调用
+    阻止本次调用
+  elif perToolCalls[当前工具] >= 3:
+    输出 [暂停分析] 工具名
+    检查最近3次结果
+    if 全部失败: 切换方案
+    if 全部超时: 增加超时
+  elif 当前时间 - taskStart > 10分钟:
+    输出 [超时停止] 任务已执行超过10分钟
+    阻止本次调用
+  else:
+    放行
+  end
+catch: 工具连败4次 禁用该工具
+
+block: output-firewall
+on: before_output
+match: 任意输出
+run: |
+  逐句扫描输出
+  for 每句话:
+    if 含 "我认为" 或 "我推测" 或 "我分析" 或 "我想到":
+      if 标记在句首: 删除整句
+      else: 删除标记部分
+    end
+    if 含 "api_key" 或 "token=" 或 "secret" 或 "password":
+      替换为 [过滤]
+    end
+    if 含 "加油" 或 "没问题的" 或 "不用担心" 或 "好的我来帮你":
+      删除该词
+    end
+    if 含 "我理解你的感受" 或 "我感同身受":
+      删除该词
+    end
+  end
+  if 超过一半句子被标记: 阻断本次输出
+catch: 阻断后输出 [该输出已被防火墙拦截]
+
+block: anti-hallucination
+on: before_output
+match: 输出含结论性句子
+run: |
+  for 每句含 "是" 或 "不是" 或 "可以" 或 "能" 或 "会" 或 "应该" 或 "一定" 或 "绝对":
+    检查是否有工具调用结果支撑
+    if 有: 标记 [已验证]
+    elif 有完整推理链: 标记 [推论 80%]
+    elif 有推测依据: 标记 [猜测 30%]
+    else: 标记 [未知]
+    end
+    if 含 "一定" 或 "肯定" 或 "必然" 或 "绝对":
+      if 没有 [已验证] 标签:
+        替换为 "可能" 或 "大概率"
+        标记 [猜测 30%]
+      end
+    end
+  end
+catch: 违规累积 3次轻度升中度 2次中度升严重
+
+block: self-reminder
+on: before_task
+match: 新任务开始
+run: |
+  输出 [规则自检清单]
+  检查 anti-rm: 不删文件
+  检查 rate-limit: 不超50次
+  检查 output-firewall: 不输出思考内容
+  检查 anti-hallucination: 结论打标签
+  记录本次任务将遵守 8 条核心规则
+catch: 自检失败 暂停任务
+
