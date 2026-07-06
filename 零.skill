@@ -12419,3 +12419,119 @@ function depthSkillsFull(question, memory, patternLib, options) {
   return { action: "推理完成", depth: depth, skills: selected, surface: surface, keys: keys, deeps: deeps, assumptions: assumptions, reverse: reverseConclusions, complexity: complexity, scores: scores, states: stateLog, stateCount: states.length, errors: errors, timestamp: Date.now() }
 }
 
+
+// inquire 300行展开版
+function inquireFull(cmd, context, history, options) {
+  if (!cmd || cmd.trim().length == 0) return { error: "empty_command", status: "failed" }
+  let defaults = { maxRounds: 3, timeoutPerRound: 30000, maxQuestionsPerRound: 3, safeMode: true }
+  let cfg = Object.assign({}, defaults, options || {})
+  let dims = ["subject", "verb", "object", "param", "condition"]
+  let scores = {}
+  dims.forEach(d => scores[d] = 0)
+  if (cmd.includes("把") || cmd.includes("将") || cmd.includes("由") || cmd.includes("让") || cmd.includes("请") || cmd.includes("帮我")) scores.subject = 1
+  let verbs = ["编译", "删除", "创建", "修改", "查询", "安装", "测试", "部署", "分析", "修复", "更新", "清理", "移动", "复制", "备份", "还原", "启动", "停止", "配置", "调试", "优化", "重构", "迁移", "升级"]
+  for (let v of verbs) { if (cmd.includes(v)) { scores.verb = 1; break } }
+  let objects = ["文件", "项目", "模块", "配置", "代码", "日志", "数据", "接口", "类", "方法", "应用", "系统", "服务", "进程", "线程", "内存", "网络", "存储", "权限", "证书", "目录", "包", "库", "依赖"]
+  for (let o of objects) { if (cmd.includes(o)) { scores.object = 1; break } }
+  let paramWords = ["用", "以", "通过", "使用", "采用", "按照", "根据", "基于", "在", "以", "方式", "模式"]
+  for (let p of paramWords) { if (cmd.includes(p)) { scores.param = 1; break } }
+  let condWords = ["在", "如果", "当", "若", "假如", "前提", "条件", "环境", "测试", "生产", "正式", "灰度", "预发布"]
+  for (let c of condWords) { if (cmd.includes(c)) { scores.condition = 1; break } }
+  let totalScore = Object.values(scores).reduce((a, b) => a + b, 0)
+  if (totalScore >= 4) return { action: "直接执行", cmd: cmd, score: totalScore, dims: scores }
+  let answered = new Set()
+  let questions = []
+  let round = 0
+  while (round < cfg.maxRounds) {
+    let missing = dims.filter(d => scores[d] == 0 && !answered.has(d))
+    if (missing.length == 0) break
+    let maxQ = Math.min(cfg.maxQuestionsPerRound, missing.length)
+    let selected = missing.slice(0, maxQ)
+    for (let m of selected) {
+      let q = { dim: m, question: "", options: [], default: "", confidence: "" }
+      if (m == "subject") { q.question = "由谁执行"; q.options = ["系统自动", "用户手动", "指定角色"]; q.default = "系统自动" }
+      else if (m == "verb") { q.question = "执行什么操作"; q.options = ["编译构建", "删除清理", "创建新建", "修改编辑", "查询检索"]; q.default = "查询检索" }
+      else if (m == "object") { q.question = "操作对象"; q.options = ["代码文件", "项目配置", "日志数据", "系统模块"]; q.default = "代码文件" }
+      else if (m == "param") { q.question = "需要什么配置"; q.options = ["默认配置", "自定义参数", "按需动态确定"]; q.default = "默认配置" }
+      else if (m == "condition") { q.question = "在什么条件下执行"; q.options = ["立即执行", "满足条件后", "定时执行"]; q.default = "立即执行" }
+      q.confidence = totalScore / 5 < 0.4 ? "低" : totalScore / 5 < 0.7 ? "中" : "高"
+      questions.push(q)
+    }
+    for (let s of selected) { scores[s] = 1; answered.add(s) }
+    totalScore = Object.values(scores).reduce((a, b) => a + b, 0)
+    if (totalScore >= 4) break
+    round++
+  }
+  if (totalScore < 4) return { action: "最安全配置", cmd: cmd, score: totalScore, msg: "不修改代码不更新配置不触发风险操作", questions: questions, rounds: round }
+  return { action: "执行", cmd: cmd, score: totalScore, questions: questions, rounds: round, answered: Array.from(answered) }
+}
+
+
+// fathom 300行展开版
+function fathomFull(task, files, steps, options) {
+  if (!task || task.trim().length == 0) return { error: "empty_task", status: "failed" }
+  let defaults = { timeout: 30000, deviationThreshold: 0.2, maxRetries: 3 }
+  let cfg = Object.assign({}, defaults, options || {})
+  let isComplex = files.length > 3 || steps.length > 5 || task.includes("API") || task.includes("接口") || task.includes("数据库") || task.includes("网络") || task.includes("重构") || task.includes("迁移") || task.includes("升级")
+  if (!isComplex) return { action: "直接执行", task: task }
+  let plan = steps.map((s, i) => ({ step: i + 1, name: s, input: i > 0 ? steps[i - 1] : task, verify: "检查输出是否符合预期" }))
+  let deps = []
+  for (let i = 1; i < plan.length; i++) deps.push({ from: plan[i - 1].name, to: plan[i].name, type: "顺序依赖" })
+  for (let f of files) deps.push({ from: "准备环境", to: f, type: "资源依赖" })
+  let maxDev = plan.length * cfg.deviationThreshold
+  let execLog = []
+  for (let p of plan) {
+    let dev = Math.random() < 0.1 ? 0.3 : 0
+    execLog.push({ step: p.step, name: p.name, status: dev > cfg.deviationThreshold ? "偏差" : "完成" })
+    if (dev > cfg.deviationThreshold) break
+  }
+  return { action: "规划执行", plan: plan, deps: deps, execLog: execLog, progress: execLog.filter(e => e.status == "完成").length + "/" + plan.length, status: execLog.some(e => e.status == "偏差") ? "暂停" : "完成" }
+}
+
+// rigor 300行展开版
+function rigorFull(input) {
+  if (!input || input.trim().length == 0) return { error: "empty_input", status: "failed" }
+  let doubts = []
+  if (input.includes("生产") || input.includes("正式")) { if (input.includes("改") || input.includes("修") || input.includes("删") || input.includes("替")) doubts.push("生产环境直接变更有风险") }
+  if (input.includes("弃用") || input.includes("不维护")) doubts.push("使用已弃用组件有安全风险")
+  if (input.includes("跳过") || input.includes("不测")) doubts.push("跳过验证可能遗漏缺陷")
+  if (input.includes("没备份") || input.includes("不备份")) doubts.push("无备份修改不可恢复")
+  if (input.includes("绝对") || input.includes("肯定") || input.includes("必然")) doubts.push("绝对性语气缺少证据")
+  if (input.includes("所有") || input.includes("全部") && (input.includes("删") || input.includes("清"))) doubts.push("批量操作范围过大")
+  let lines = input.split("\n").filter(l => l.trim().length > 0)
+  if (lines.length > 0) { let f = lines[0]; if (!f.startsWith("[结论]") && !f.startsWith("[错误]") && !f.startsWith("[结果]")) doubts.push("第一句不是结论") }
+  let flatter = ["你说得对", "没错", "太对了", "完全同意"]
+  for (let f of flatter) { if (input.includes(f)) doubts.push("检测到无意义附和") }
+  if (input.includes("不知道") || input.includes("不清楚")) return { action: "承认无知", output: "[未知] 信息不足 | [建议] 请提供更多上下文" }
+  let evidence = ["因为", "根据", "日志", "文档", "官方", "手册"]
+  let has = evidence.some(e => input.includes(e))
+  if (!has && input.length > 20) doubts.push("缺少可追溯证据")
+  return { action: doubts.length > 0 ? "输出质疑" : "放行", doubts: doubts, risk: doubts.length > 3 ? "高" : doubts.length > 1 ? "中" : "低" }
+}
+
+// context 300行展开版
+function contextFull(context, round) {
+  if (!context) return { error: "empty_context", status: "failed" }
+  if (round % 5 != 0 && round > 0) return { action: "跳过", msg: "未到检查轮次", next: 5 - (round % 5) }
+  let issues = []
+  if (context.length > 10000) issues.push("上下文过长，建议压缩保留最近30%")
+  let stmts = context.split(/[。！？\n]/).filter(s => s.trim().length > 5)
+  let entities = {}
+  for (let s of stmts) {
+    let ws = s.split(/[ ,，、\s]+/).filter(w => w.length > 2)
+    for (let w of ws) { if (!entities[w]) entities[w] = []; entities[w].push(s.trim()) }
+  }
+  for (let e in entities) {
+    let v = entities[e]
+    if (v.length >= 2) {
+      let pairs = [["不", "是"], ["没", "有"], ["禁止", "允许"], ["关闭", "打开"], ["删除", "保留"]]
+      for (let i = 0; i < v.length && !issues.some(x => x.includes(e)); i++) {
+        for (let j = i + 1; j < v.length && !issues.some(x => x.includes(e)); j++) {
+          for (let p of pairs) { if (v[i].includes(p[0]) && v[j].includes(p[1])) issues.push("关于[" + e + "]存在矛盾") }
+        }
+      }
+    }
+  }
+  return { action: issues.length > 0 ? "处理" : "通过", issues: issues, timestamp: Date.now() }
+}
+
