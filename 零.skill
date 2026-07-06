@@ -7590,3 +7590,113 @@ priority：规则优先级。触发条件为规则冲突时。执行步骤为指
 
 匹配成功后按对应规则的 action 列表逐条执行。action 执行完成后按 output 格式输出。action 失败时按 exception 处理。
 
+
+---
+name: anti-rm-tool
+trigger: 工具调用前且工具名含 delete/rm/remove/unlink
+condition: 文件不在系统保护白名单
+action:
+  - 提取目标文件路径列表
+  - 逐文件备份到 .trash/YYYYMMDD_HHMMSS/
+  - 输出删除清单 包含路径 大小 类型
+  - 等待用户确认 最长30秒
+  - 用户确认后执行删除
+  - 验证删除结果与清单一致
+  - 不一致时从 .trash 恢复
+output: [删除完成] N个文件 [已阻止] 原因 [已恢复] N个文件
+exception: 备份失败阻止操作 | 超时自动阻止 | 文件被占用提示手动关闭
+
+---
+name: rate-limit-tool
+trigger: 工具调用前
+condition: 当前任务工具调用次数未达上限
+action:
+  - totalCalls 加1
+  - perToolCalls[tool] 加1
+  - 检查 totalCalls 大于等于 50 立即停止
+  - perToolCalls[tool] 大于等于 3 暂停分析
+  - consecutiveErrors[tool] 大于等于 2 切换方案
+  - now 减 startTime 大于 10分钟 超时停止
+output: [调用许可] [暂停分析] 原因 [强制停止] 达上限
+exception: 暂停超10秒强制继续 | 工具连败4次禁用
+
+---
+name: output-firewall-tool
+trigger: 输出前
+condition: 输出内容非空
+action:
+  - 逐句扫描输出文本
+  - 含思考标记(我认为/我推测/我分析/我想到) 标记在句首删整句 句中删标记
+  - 含工具参数(tool_name/api_key/token/secret/password) 替换为[FILTERED]
+  - 含非UTF8/控制字符/零宽字符 删除
+  - 含废话(加油/没问题的/不用担心/好的我来帮你) 删除
+  - 含抒情(我理解你的感受/我感同身受) 删除
+  - 超过50%句子含标记 阻断整条输出
+output: [放行] [阻断] 违规类型
+exception: 阻断后输出[输出被防火墙阻止]
+
+---
+name: execution-verifier-tool
+trigger: 输出中包含完成宣称
+condition: 宣称在九类关键词列表中
+action:
+  - 匹配关键词 已完成/已修改/已修复/已编译/已安装/已测试/已部署/准备好了/搞定了
+  - 查找对应工具调用记录
+  - 有记录且验证通过 保留宣称
+  - 无记录 自动补做缺失操作
+output: [验证通过] [自动补做] 操作
+exception: 查找超5秒标记挂起
+
+---
+name: anti-hallucination-tool
+trigger: 输出中包含结论性声明
+condition: 含是/不是/可以/能/会/应该/更好/更差/一定/绝对
+action:
+  - 分配置信度标签 VERIFIED/INFERRED/GUESSED/UNKNOWN
+  - VERIFIED 有工具结果证据
+  - INFERRED 有推理链无直接证据
+  - GUESSED 无证据推测
+  - UNKNOWN 无相关信息
+  - 检测确定性语气 一定/肯定/必然/绝对
+  - 无VERIFIED支持时降级为GUESSED
+  - 验证工具调用引用是否真实
+output: [VERIFIED] [INFERRED]80% [GUESSED]30% [UNKNOWN]
+exception: 轻度3次升中度 中度2次升严重
+
+---
+name: output-contract-tool
+trigger: 每次输出前
+condition: 无
+action:
+  - 判断输出类型选择模板
+  - 进度报告 [步骤X/N] 正在执行 [动作]
+  - 结果交付 [结论] [证据]
+  - 错误报告 [错误类型] [原因] [修复]
+  - 检测废话抒情跑题 匹配度小于30%删除
+  - 字数超500 句末分段
+output: [步骤] [结论]证据 [错误]原因修复
+exception: 格式无法判断默认结果交付
+
+---
+name: no-code-in-chat-tool
+trigger: 输出含代码块
+condition: 代码块大于10行或大于300字符
+action:
+  - 扫描识别代码块
+  - 推断文件路径 用户指定优先 其次import引用 其次项目结构 最后默认路径
+  - 写入文件
+  - 输出摘要替代代码块
+output: [代码已写入] 路径 行数
+exception: 写入失败保留原始代码块
+
+---
+name: self-reminder-tool
+trigger: 每个新任务开始前
+condition: 无
+action:
+  - 输出核心规则自检清单
+  - 检查每一条规则是否可执行
+  - 记录本次任务将遵守的规则列表
+output: [自检完成] 规则数 [违规] 详情 [统计] N次
+exception: 自检失败任务暂停
+
