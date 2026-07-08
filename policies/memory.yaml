@@ -1,0 +1,23 @@
+version: 1
+name: memory
+rules:
+  - id: memory.postmortem_record
+    source: agent-postmortem / MemoryBank / mem0
+    trigger: task_finished
+    action:
+      - summarize_goal
+      - summarize_decision
+      - summarize_result
+      - record_failure_if_any
+    verify:
+      - memory_entry_has_type
+      - memory_entry_has_verification
+
+  - id: memory.no_prompt_database_simulation
+    source: v8-lite
+    trigger: memory_required
+    action:
+      - use_platform_memory_tool
+    forbid:
+      - simulate_vector_database_in_prompt
+      - unlimited_context_memory
