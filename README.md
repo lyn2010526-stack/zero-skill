@@ -11,8 +11,9 @@
 - 防降智模块：理解锁、降智检测、救命指令
 - 意图澄清：三层漏斗扫描、模糊词检测、多轮澄清
 - 50 个开源项目能力基因融合（10 个真实项目 + 40 个设计理念）
-- 自动化闭环、全量自检、策略调度
-- Python 引擎：验证、文件保护、策略执行、输出防火墙
+- 10 个工作流：senior-developer / software-architect / code-reviewer / sre / devops / minimal-change / systematic-debug / context-engineering / error-recovery / verification-checklist
+- AI 编程最佳实践：任务分解、上下文工程、错误恢复、质量门禁
+- Python 引擎：28 个模块，含 attention / chain_of_thought / reflection / semantic_cache / agent_runtime / tool_registry / prompt_engine / state_manager / tracer / audit / rate_limiter / output_checker 等
 
 ## 安装
 
@@ -21,21 +22,18 @@
 ## 文件结构
 
 ```
-零.skill                      主 Skill 文件（1709行，零重复，每条规则只出现一次）
-skills/zero-apex.skill         主 Skill 副本
-engine/zero_agent/             Python 引擎（1002行）
-  ├── kernel.py                核心内核
-  ├── verifier.py              验证器
-  ├── evidence.py              结构化证据
-  ├── file_guard.py            文件安全守卫（16种检测+快照恢复）
-  ├── policy_engine.py         策略引擎（apply执行+冲突解决）
-  └── ...                      其他模块
-policies/                      策略定义 YAML（7个）
-genes/                         能力基因库
-references/                    50个研究卡（10个真实+40个概念设计）
-rules/                         8个规则拆分
-tests/                         测试用例
-scripts/test_engine.py         测试运行器（33个测试）
+零.skill                主 Skill 文件（6106行）
+engine/zero_agent/      Python 引擎（28个模块，3159行）
+policies/               策略定义 YAML
+genes/                  能力基因库
+references/             50个研究卡
+rules/                  8个规则拆分
+tests/                  测试用例
+scripts/test_engine.py  测试运行器
+examples/               使用示例
+docs/                   文档
+core/                   核心层
+legacy/                 历史设计文档
 ```
 
 ## 测试
@@ -45,16 +43,17 @@ python3 scripts/test_engine.py
 # === Results: 33 passed, 0 failed ===
 ```
 
-## 50 个开源项目
+## 融合的顶级项目
 
-| 类型 | 数量 | 说明 |
-|------|------|------|
-| 真实开源项目 | 10 | 有 GitHub 仓库，可验证 |
-| 设计理念 | 40 | 非真实仓库，机制被抽象为执行规则 |
-
-真实项目：mem0、SkillMaxxing、depth-skills、JetBrains/skills、Anthropic Skills、awesome-ai-agent-skills、VoltAgent/awesome-agent-skills 等。
-
-详细信息见 `references/` 目录。
+| 项目 | Star | 融合内容 |
+|------|------|----------|
+| agency-agents | 129k | 6个工作流 |
+| LangChain | 141k | tools/prompts/tracers/caches/rate_limiters |
+| AutoGen | 59.6k | runtime/multi-agent/state/message |
+| mem0 | 25k+ | 语义缓存/记忆检索 |
+| depth-skills | -- | 16个认知架构技能 |
+| JetBrains/skills | -- | 127个验证技能库 |
+| Anthropic Skills | -- | 官方技能标准 |
 
 ## 许可
 
