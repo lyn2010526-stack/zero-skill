@@ -1,0 +1,89 @@
+version: 1
+genes:
+  - id: gene.planning.stage_workflow
+    source_projects: [OmniAgent, fathom-mode, Prompt Architect]
+    target_layer: Planner
+    capability: 分阶段规划复杂任务并绑定验证方式
+    trigger: complex_task_received
+    actions: [restate_goal, identify_constraints, create_steps, define_verification, define_rollback]
+    verification: plan_has_goal_and_verification
+    engine_module: engine/zero_agent/planner.py
+    tests: [tests/test_planner.py]
+    skill_summary: 复杂任务先规划，简单任务直接执行。
+
+  - id: gene.rule_candidate.safe_evolution
+    source_projects: [Evolver, AutoSkill, Skill-RSI, AEP]
+    target_layer: RuleCandidate
+    capability: 从成功或失败复盘中生成候选规则，但不直接改主规则
+    trigger: reusable_pattern_found
+    actions: [generate_candidate, test_candidate, require_user_confirmation]
+    verification: candidate_has_source_test_and_status
+    engine_module: engine/zero_agent/rule_candidate.py
+    tests: [tests/test_rule_candidate.py]
+    skill_summary: 自进化只生成候选规则，必须测试和确认后合入。
+
+  - id: gene.evidence.no_false_completion
+    source_projects: [SkillAudit, skills-validator, llm-rigor]
+    target_layer: Evidence
+    capability: 阻止无证据完成宣称
+    trigger: before_final_answer
+    actions: [scan_completion_claim, require_evidence, downgrade_claim]
+    verification: claim_has_tool_or_file_evidence
+    engine_module: engine/zero_agent/verifier.py
+    tests: [tests/test_verifier.py]
+    skill_summary: 没有工具证据，不允许说完成、修复、编译或测试通过。
+
+  - id: gene.file_safety.confirm_delete
+    source_projects: [anti-rm, agent-design-patterns]
+    target_layer: FileSafety
+    capability: 源码删除前列清单、备份、确认、验证
+    trigger: delete_or_overwrite_source_file
+    actions: [classify_file_risk, list_targets, backup, ask_confirmation, verify_after_action]
+    verification: user_confirmed_for_high_risk_delete
+    engine_module: engine/zero_agent/file_guard.py
+    tests: [tests/test_file_guard.py]
+    skill_summary: 保护源码和重要配置，不误伤正常开发命令。
+
+  - id: gene.tool_guard.stop_loop
+    source_projects: [EVOLT, ToolGuard patterns, rate-limit]
+    target_layer: ToolGuard
+    capability: 连续失败停止重试并切换方案
+    trigger: repeated_tool_failure
+    actions: [count_failures, stop_retry, switch_strategy, report_reason]
+    verification: same_error_three_times_stops
+    engine_module: engine/zero_agent/tool_guard.py
+    tests: [tests/test_tool_guard.py]
+    skill_summary: 防止工具无限循环和 API 额度耗尽。
+
+  - id: gene.memory.postmortem
+    source_projects: [mem0, MemoryBank, agent-postmortem-skill, Memento-Skills]
+    target_layer: Memory
+    capability: 记录任务经验、失败原因和验证等级
+    trigger: task_finished
+    actions: [summarize_goal, summarize_decision, summarize_result, record_failure]
+    verification: memory_entry_has_type_and_verification
+    engine_module: engine/zero_agent/memory.py
+    tests: [tests/test_memory.py]
+    skill_summary: 记忆是外部接口和结构化复盘，不在 Prompt 中伪造数据库。
+
+  - id: gene.output.clean_human
+    source_projects: [human-writing, deslop-zh, output-contract]
+    target_layer: Output
+    capability: 输出简洁、人话、可执行
+    trigger: before_final_answer
+    actions: [remove_noise, keep_evidence, keep_next_action]
+    verification: output_has_result_or_next_action
+    engine_module: engine/zero_agent/output_firewall.py
+    tests: [tests/test_output_firewall.py]
+    skill_summary: 不堆状态卡，不写意识叙事，直接交付。
+
+  - id: gene.intent.clarify_minimal
+    source_projects: [inquire Skill, Contractual Skill]
+    target_layer: Intent
+    capability: 模糊需求最多问三个关键问题
+    trigger: ambiguous_task_received
+    actions: [extract_goal, find_missing_slots, ask_closed_questions]
+    verification: clarification_questions_lte_3
+    engine_module: engine/zero_agent/planner.py
+    tests: [tests/test_planner.py]
+    skill_summary: 不懂就问，但不为了形式反复问。

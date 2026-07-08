@@ -1,0 +1,31 @@
+version: 1
+name: file_guard
+rules:
+  - id: file_guard.delete_requires_confirmation
+    source: anti-rm
+    trigger: delete_or_overwrite_source_file
+    action:
+      - list_target_files
+      - calculate_total_size
+      - backup_if_possible
+      - ask_explicit_confirmation
+    verify:
+      - user_confirmed
+      - backup_exists_or_reason_given
+
+  - id: file_guard.normal_dev_commands_allowed
+    source: PRoot compatibility
+    trigger: shell_command
+    allow:
+      - git clone
+      - git pull
+      - git push
+      - gradle
+      - npm
+      - python
+      - go
+      - rust
+      - adb
+      - logcat
+      - apktool
+      - jadx

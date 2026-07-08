@@ -1,0 +1,55 @@
+version: 1
+name: kernel
+rules:
+  - id: kernel.no_false_completion
+    trigger: before_response
+    priority: 1
+    conditions:
+      completion_claim: true
+      evidence_ready: false
+    actions:
+      - block_completion
+      - request_evidence
+    verify:
+      - response_contains_no_unverified_completion
+  - id: kernel.file_delete_requires_confirmation
+    trigger: before_tool
+    priority: 1
+    conditions:
+      delete_risk: true
+    actions:
+      - list_paths
+      - require_confirm_delete
+    verify:
+      - explicit_confirm_delete_received
+  - id: kernel.long_code_to_file
+    trigger: before_response
+    priority: 2
+    conditions:
+      long_code: true
+    actions:
+      - write_to_file
+      - summarize_path
+    verify:
+      - response_has_no_long_code_block
+  - id: kernel.skeptic_on_high_risk
+    trigger: before_plan
+    priority: 3
+    conditions:
+      high_risk: true
+    actions:
+      - state_risk
+      - propose_safer_alternative
+    verify:
+      - challenge_is_bounded
+  - id: kernel.low_resource_degrade
+    trigger: during_execution
+    priority: 4
+    conditions:
+      budget_pressure: true
+    actions:
+      - summarize
+      - stop_redundant_scan
+      - prefer_minimal_change
+    verify:
+      - redundant_work_stopped
