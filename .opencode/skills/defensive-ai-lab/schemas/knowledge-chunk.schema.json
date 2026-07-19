@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/defensive-ai-lab/knowledge-chunk.schema.json",
+  "title": "Curated Knowledge Chunk",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "chunk_id", "trust_tier", "source_class", "content_sha256", "review_status", "provenance"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "chunk_id": { "type": "string", "pattern": "^CH-[A-Z0-9-]{6,64}$" },
+    "trust_tier": { "enum": ["T0", "T1", "T2", "T3", "T4"] },
+    "source_class": { "enum": ["local_test", "source_code", "project_tool", "user_artifact", "model_output", "curated"] },
+    "case_origin": { "type": ["string", "null"], "format": "uuid" },
+    "artifact_hash": { "type": ["string", "null"], "pattern": "^sha256:[a-f0-9]{64}$" },
+    "locator": { "type": "string", "maxLength": 1000 },
+    "language": { "type": "string" },
+    "framework": { "type": "string" },
+    "defensive_control": { "type": "string" },
+    "content_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "review_status": { "enum": ["reviewed", "pending", "rejected", "quarantined"] },
+    "reviewed_at": { "type": ["string", "null"], "format": "date-time" },
+    "expires_at": { "type": ["string", "null"], "format": "date-time" },
+    "provenance": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "confidence": { "enum": ["high", "medium", "low"] }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "trust_tier": { "const": "T0" } } },
+      "then": { "properties": { "review_status": { "const": "reviewed" } } }
+    },
+    {
+      "if": { "properties": { "review_status": { "const": "reviewed" } } },
+      "then": { "required": ["reviewed_at", "expires_at"] }
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/defensive-ai-lab/evidence.schema.json",
+  "title": "Evidence Item",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["evidence_id", "case_id", "source_type", "provenance", "locator", "sha256", "observed_at", "redacted"],
+  "properties": {
+    "evidence_id": { "type": "string", "pattern": "^EV-[A-Z0-9-]{6,64}$" },
+    "case_id": { "type": "string", "format": "uuid" },
+    "source_type": { "enum": ["local_test", "source_code", "project_tool", "user_artifact"] },
+    "provenance": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "locator": { "type": "string", "minLength": 1, "maxLength": 1000 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "observed_at": { "type": "string", "format": "date-time" },
+    "redacted": { "type": "boolean" },
+    "summary": { "type": "string", "maxLength": 2000 },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "exit_code": { "type": "integer" }
+      }
+    }
+  }
+}

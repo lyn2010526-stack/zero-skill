@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0",
+  "case_id": "{{case_id}}",
+  "tests": [
+    {
+      "test_id": "AUTH-OWNER-READ",
+      "principal": "user-a",
+      "resource": "resource-a",
+      "operation": "read",
+      "expected": "allow",
+      "actual": "pending",
+      "source_locator": "pending",
+      "response_sha256": null,
+      "side_effect_assertion": "none",
+      "result": "pending"
+    },
+    {
+      "test_id": "AUTH-CROSS-OWNER-READ",
+      "principal": "user-b",
+      "resource": "resource-a",
+      "operation": "read",
+      "expected": "deny",
+      "actual": "pending",
+      "source_locator": "pending",
+      "response_sha256": null,
+      "side_effect_assertion": "none",
+      "result": "pending"
+    },
+    {
+      "test_id": "AUTH-CROSS-TENANT-READ",
+      "principal": "user-c",
+      "resource": "resource-a",
+      "operation": "read",
+      "expected": "deny",
+      "actual": "pending",
+      "source_locator": "pending",
+      "response_sha256": null,
+      "side_effect_assertion": "none",
+      "result": "pending"
+    }
+  ]
+}

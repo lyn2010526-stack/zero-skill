@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/defensive-ai-lab/experiment-run.schema.json",
+  "title": "AI Experiment Run Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "case_id", "model_alias", "parameters", "status", "metrics", "started_at"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "run_id": { "type": "string", "pattern": "^RUN-[A-Z0-9-]{6,80}$" },
+    "case_id": { "type": "string", "format": "uuid" },
+    "model_alias": { "type": "string" },
+    "provider_model_id": { "type": "string" },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "temperature": { "type": "number" },
+        "top_p": { "type": "number" },
+        "seed": { "type": ["integer", "null"] },
+        "max_input_tokens": { "type": "integer" },
+        "max_output_tokens": { "type": "integer" },
+        "repetition": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "status": { "enum": ["completed", "failed", "malformed", "throttled", "timeout", "skipped"] },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": { "type": ["number", "string", "boolean", "null"] }
+    },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" },
+    "latency_ms": { "type": "number", "minimum": 0 },
+    "input_tokens": { "type": "integer", "minimum": 0 },
+    "output_tokens": { "type": "integer", "minimum": 0 },
+    "cost": { "type": "number", "minimum": 0 },
+    "retries": { "type": "integer", "minimum": 0 },
+    "output_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "judge": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "alias": { "type": "string" },
+        "rubric_version": { "type": "string" },
+        "score": { "type": "number" },
+        "blind": { "type": "boolean" }
+      }
+    },
+    "assertions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "passed"],
+        "properties": {
+          "name": { "type": "string" },
+          "passed": { "type": "boolean" },
+          "detail": { "type": "string" }
+        }
+      }
+    },
+    "error": { "type": "string", "maxLength": 2000 }
+  }
+}

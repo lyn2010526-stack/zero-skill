@@ -2,6 +2,12 @@
 .claude
 .gemini
 .opencode
+!.opencode/
+.opencode/*
+!.opencode/skills/
+.opencode/skills/*
+!.opencode/skills/defensive-ai-lab/
+!.opencode/skills/defensive-ai-lab/**
 
 # IDE and Editors
 **/.idea/

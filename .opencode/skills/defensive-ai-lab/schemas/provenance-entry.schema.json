@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/defensive-ai-lab/provenance-entry.schema.json",
+  "title": "Provenance Registry Entry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "id", "name", "role", "safety_class", "adoption"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "id": { "type": "string", "pattern": "^SRC-\\d{3,}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "version": { "type": "string", "maxLength": 200 },
+    "license": { "type": "string", "maxLength": 100 },
+    "role": { "enum": ["architecture-reference", "protocol-reference", "tool-wrapper", "dataset", "documentation", "test-fixture"] },
+    "adoption": { "enum": ["adopted", "adapted-defensively", "research-only", "rejected"] },
+    "safety_class": { "enum": ["defensive", "dual-use", "offensive"] },
+    "offensive_components_excluded": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "locator": { "type": "string", "maxLength": 1000 },
+    "hash": { "type": ["string", "null"], "pattern": "^sha256:[a-f0-9]{64}$" },
+    "notes": { "type": "string", "maxLength": 2000 }
+  },
+  "allOf": [
+    {
+      "if": {
+        "anyOf": [
+          { "properties": { "safety_class": { "const": "offensive" } } },
+          { "properties": { "safety_class": { "const": "dual-use" } } }
+        ]
+      },
+      "then": { "required": ["offensive_components_excluded"] }
+    }
+  ]
+}
