@@ -1670,10 +1670,243 @@ const ZeroApex = (function () {
         // Memory config
         ConfigRegistry.register("memory.root", "zero_apex");
         ConfigRegistry.register("memory.cache_size", 64);
+
+        // Audit config (#8)
+        ConfigRegistry.register("audit.enabled", true);
+        ConfigRegistry.register("audit.log_path", ".zero_apex/audit_log.jsonl");
     }
 
     // Bootstrap config at module load
     bootstrapConfig();
+
+    // ======================================================================
+    // §21b AuditLogger — append-only JSONL audit log (audit #8)
+    // Every tool call writes a line: timestamp/tool/task_id/trigger/duration/result
+    // ======================================================================
+    function AuditLogger(deps) {
+        deps = deps || {};
+        var Files = deps.Files;
+        var logPath = ConfigRegistry.get("audit.log_path", ".zero_apex/audit_log.jsonl");
+        var enabled = ConfigRegistry.get("audit.enabled", true);
+        var buffer = [];
+        var flushSize = 10;
+
+        function append(entry) {
+            if (!enabled) return;
+            var line = {
+                ts: new Date().toISOString(),
+                tool: entry.tool,
+                task_id: entry.task_id || null,
+                trigger: entry.trigger || null,
+                duration_ms: entry.duration_ms || 0,
+                result_code: entry.result_code || null,
+                result_summary: entry.result_summary || null,
+            };
+            buffer.push(line);
+            if (buffer.length >= flushSize) {
+                flush();
+            }
+        }
+
+        function flush() {
+            if (!enabled || buffer.length === 0) return;
+            if (!Files || typeof Files.write !== "function") {
+                // No Files available; keep in memory (graceful degrade)
+                return;
+            }
+            var payload = buffer.map(function (l) { return JSON.stringify(l); }).join("\n") + "\n";
+            buffer = [];
+            try {
+                // Append-mode: read existing, concat, write back.
+                // QuickJS sandbox has no append API, so read-merge-write.
+                var existing = "";
+                try {
+                    var r = Files.read(logPath);
+                    if (r && r.content) existing = r.content;
+                } catch (e) {}
+                Files.write(logPath, existing + payload);
+            } catch (e) {
+                // Silently drop on IO error; audit must not crash engine
+            }
+        }
+
+        function snapshot() {
+            return buffer.slice();
+        }
+
+        function clear() {
+            buffer = [];
+        }
+
+        function setEnabled(v) { enabled = !!v; }
+        function isEnabled() { return enabled; }
+
+        return { append: append, flush: flush, snapshot: snapshot, clear: clear, setEnabled: setEnabled, isEnabled: isEnabled };
+    }
+
+    // ======================================================================
+    // §21c BlockEnforcer — hard block subsequent tools after preflight BLOCK
+    // (audit #5). When preflight returns allowed=false, enforce_block
+    // registers a block on that task_id; subsequent tool calls for the same
+    // task_id are rejected by the engine layer, not by the model's choice.
+    // ======================================================================
+    function BlockEnforcer() {
+        var blockedTasks = {};   // task_id -> { reason, ts, expires }
+        var defaultTtlMs = 5 * 60 * 1000;  // 5 min
+
+        function block(taskId, reason) {
+            if (!taskId) return;
+            blockedTasks[taskId] = {
+                reason: reason || "preflight BLOCK",
+                ts: Date.now(),
+                expires: Date.now() + defaultTtlMs,
+            };
+        }
+
+        function isBlocked(taskId) {
+            if (!taskId) return false;
+            var entry = blockedTasks[taskId];
+            if (!entry) return false;
+            if (Date.now() > entry.expires) {
+                delete blockedTasks[taskId];
+                return false;
+            }
+            return true;
+        }
+
+        function unblock(taskId) {
+            if (taskId && blockedTasks[taskId]) delete blockedTasks[taskId];
+        }
+
+        function clear() {
+            blockedTasks = {};
+        }
+
+        function snapshot() {
+            var out = [];
+            for (var k in blockedTasks) {
+                if (blockedTasks.hasOwnProperty(k)) {
+                    out.push({ task_id: k, reason: blockedTasks[k].reason, ts: blockedTasks[k].ts });
+                }
+            }
+            return out;
+        }
+
+        return {
+            block: block,
+            isBlocked: isBlocked,
+            unblock: unblock,
+            clear: clear,
+            snapshot: snapshot,
+        };
+    }
+
+    // ======================================================================
+    // §21d ManifestLoader — read manifest.json and curtail by env (audit #7)
+    // ======================================================================
+    function ManifestLoader(deps) {
+        deps = deps || {};
+        var Files = deps.Files;
+        var manifestCache = null;
+
+        function load() {
+            if (manifestCache) return manifestCache;
+            if (!Files || typeof Files.read !== "function") {
+                return getBuiltinManifest();
+            }
+            try {
+                var r = Files.read("manifest.json");
+                if (r && r.content) {
+                    manifestCache = JSON.parse(r.content);
+                    return manifestCache;
+                }
+            } catch (e) {
+                // File missing or corrupt: fall back to builtin
+            }
+            manifestCache = getBuiltinManifest();
+            return manifestCache;
+        }
+
+        // Builtin minimal manifest for graceful degradation (audit #7)
+        function getBuiltinManifest() {
+            return {
+                tools: [
+                    { name: "preflight", min_permission: "none", requires: [] },
+                    { name: "file_guard", min_permission: "none", requires: [] },
+                    { name: "hallucination_guard", min_permission: "none", requires: [] },
+                    { name: "evidence_check", min_permission: "none", requires: [] },
+                    { name: "self_monitor", min_permission: "none", requires: [] },
+                    { name: "output_firewall", min_permission: "none", requires: [] },
+                    { name: "search_opensource", min_permission: "network", requires: ["Network"] },
+                    { name: "remember", min_permission: "basic", requires: ["Tools.Memory"] },
+                    { name: "recall", min_permission: "basic", requires: ["Tools.Memory"] },
+                    { name: "snapshot_file", min_permission: "basic", requires: ["Files"] },
+                    { name: "restore_file", min_permission: "basic", requires: ["Files"] },
+                ],
+                references: [],
+                env_requirements: {
+                    permission_levels: {
+                        none: { tools_disabled: ["Files", "Network", "Tools.Memory"] },
+                        basic: { tools_disabled: ["Network", "Tools.Memory"] },
+                        network: { tools_disabled: ["Tools.Memory"] },
+                        shell: { tools_disabled: [] },
+                        shizuku: { tools_disabled: [] },
+                        root: { tools_disabled: [] },
+                    }
+                }
+            };
+        }
+
+        // Determine current env permission level from available deps
+        function detectLevel(deps) {
+            deps = deps || {};
+            var hasFiles = !!deps.Files;
+            var hasNetwork = !!deps.Network;
+            var hasMemory = !!(deps.Tools && deps.Tools.Memory);
+            if (!hasFiles && !hasNetwork && !hasMemory) return "none";
+            if (hasFiles && !hasNetwork && !hasMemory) return "basic";
+            if (hasFiles && hasNetwork && !hasMemory) return "network";
+            return "shell";  // all deps available
+        }
+
+        // Curtail: return list of tool names allowed in current env
+        function curtail(deps) {
+            var m = load();
+            var level = detectLevel(deps);
+            var levelOrder = ["none", "basic", "network", "shell", "shizuku", "root"];
+            var levelIdx = levelOrder.indexOf(level);
+            var allowed = [];
+            var disabled = [];
+
+            for (var i = 0; i < m.tools.length; i++) {
+                var t = m.tools[i];
+                var tIdx = levelOrder.indexOf(t.min_permission || "none");
+                if (tIdx <= levelIdx) {
+                    // Check requires
+                    var reqs = t.requires || [];
+                    var reqMet = true;
+                    for (var j = 0; j < reqs.length; j++) {
+                        var req = reqs[j];
+                        if (req === "Files" && !deps.Files) reqMet = false;
+                        if (req === "Network" && !deps.Network) reqMet = false;
+                        if (req === "Tools.Memory" && !(deps.Tools && deps.Tools.Memory)) reqMet = false;
+                    }
+                    if (reqMet) allowed.push(t.name);
+                    else disabled.push({ name: t.name, reason: "requires " + reqs.join(",") });
+                } else {
+                    disabled.push({ name: t.name, reason: "min_permission " + t.min_permission + " > current " + level });
+                }
+            }
+            return { level: level, allowed: allowed, disabled: disabled };
+        }
+
+        function isToolAllowed(toolName, deps) {
+            var c = curtail(deps);
+            return c.allowed.indexOf(toolName) >= 0;
+        }
+
+        return { load: load, detectLevel: detectLevel, curtail: curtail, isToolAllowed: isToolAllowed };
+    }
 
     // ======================================================================
     // §22 Module factory — instantiate modules with injected dependencies
@@ -1685,9 +1918,51 @@ const ZeroApex = (function () {
         var Memory = new MemoryModule({ Tools: deps.Tools });
         var Snapshot = new SnapshotModule({ Files: deps.Files });
         var ledger = new TaskLedger(deps);
+        var audit = new AuditLogger({ Files: deps.Files });
+        var enforcer = new BlockEnforcer();
+        var manifest = new ManifestLoader({ Files: deps.Files });
 
         function preflight(goal, command, evidence, filesRead) {
-            return preflightGate({ ledger: ledger }, goal, command, evidence, filesRead);
+            var result = preflightGate({ ledger: ledger }, goal, command, evidence, filesRead);
+            // #5: if preflight blocks, register hard block on task_id
+            if (!result.allowed && result.task_id) {
+                enforcer.block(result.task_id, result.state + ": " + (result.reasons || []).join("; "));
+            }
+            // #8: audit preflight call
+            audit.append({
+                tool: "preflight",
+                task_id: result.task_id,
+                trigger: goal,
+                duration_ms: 0,
+                result_code: result.allowed ? "ALLOW" : "BLOCK",
+                result_summary: result.state,
+            });
+            return result;
+        }
+
+        // #5: check block before any tool execution
+        function checkBlock(taskId) {
+            if (enforcer.isBlocked(taskId)) {
+                return {
+                    success: false,
+                    code: ErrorCode.GUARD_BLOCK,
+                    error: "任务 " + taskId + " 已被 preflight 硬阻断，后续工具调用被拒绝",
+                    blocked_by: "enforce_block",
+                };
+            }
+            return null;
+        }
+
+        // #7: check tool allowed by env curtail
+        function checkToolAllowed(toolName) {
+            if (!manifest.isToolAllowed(toolName, deps)) {
+                return {
+                    success: false,
+                    code: ErrorCode.DEPENDENCY_MISSING,
+                    error: "工具 " + toolName + " 在当前环境权限下不可用",
+                };
+            }
+            return null;
         }
 
         return {
@@ -1701,6 +1976,11 @@ const ZeroApex = (function () {
             Snapshot: Snapshot,
             preflight: preflight,
             ledger: ledger,
+            audit: audit,
+            enforcer: enforcer,
+            manifest: manifest,
+            checkBlock: checkBlock,
+            checkToolAllowed: checkToolAllowed,
             // Infrastructure exposed for testing / extension
             _infra: {
                 ConfigRegistry: ConfigRegistry,
@@ -1714,6 +1994,9 @@ const ZeroApex = (function () {
                 TaskLedger: TaskLedger,
                 ResultEnvelope: { ok: ok, fail: fail, legacy: legacy },
                 ErrorCode: ErrorCode,
+                AuditLogger: AuditLogger,
+                BlockEnforcer: BlockEnforcer,
+                ManifestLoader: ManifestLoader,
             },
         };
     }
@@ -1731,6 +2014,14 @@ const ZeroApex = (function () {
         Network: ambient("Network"),
         Tools: ambient("Tools"),
     });
+    var defaultDeps = {
+        Files: ambient("Files"),
+        Network: ambient("Network"),
+        Tools: ambient("Tools"),
+    };
+    var defaultEnforcer = defaultInstance.enforcer;
+    var defaultAudit = defaultInstance.audit;
+    var defaultManifest = defaultInstance.manifest;
 
     return {
         // Re-export modules for direct internal access (backward compat)
@@ -1826,18 +2117,120 @@ async function restore_file(params) {
     return await ZeroApex.Snapshot.restore(params.path, params.snapshot_name);
 }
 
-// Unified wrapper: catch exceptions and complete (audit #2, #8)
-async function wrapToolExecution(func, params) {
+// #5: enforce_block — model-callable check for hard block status
+async function enforce_block(params) {
+    var taskId = params.task_id;
+    if (!taskId) {
+        return {
+            success: false,
+            code: "E1002_MISSING_REQUIRED",
+            error: "task_id 为必填",
+        };
+    }
+    // Use default instance enforcer
+    var blocked = defaultEnforcer.isBlocked(taskId);
+    return {
+        success: true,
+        code: "OK",
+        task_id: taskId,
+        is_blocked: blocked,
+        action: blocked ? "BLOCK: 该任务已被 preflight 硬阻断，禁止执行后续工具调用" : "PASS",
+    };
+}
+
+// #8: audit_log — query recent audit entries
+async function audit_log(params) {
+    var limit = params.limit || 20;
+    var snap = defaultAudit.snapshot();
+    if (snap.length > limit) snap = snap.slice(snap.length - limit);
+    return {
+        success: true,
+        code: "OK",
+        count: snap.length,
+        entries: snap,
+    };
+}
+
+// Unified wrapper: catch exceptions, complete, audit, enforce block (#2, #5, #8)
+async function wrapToolExecution(func, params, toolName) {
+    var startTs = Date.now();
+    var p = params || {};
+    var taskId = p.task_id || null;
     try {
-        var result = await func(params || {});
+        // #5: enforce block — if task is blocked, refuse
+        if (taskId && defaultEnforcer.isBlocked(taskId)) {
+            var blockResult = {
+                success: false,
+                code: "E4001_GUARD_BLOCK",
+                error: "任务 " + taskId + " 已被 preflight 硬阻断，后续工具调用被拒绝",
+                blocked_by: "enforce_block",
+            };
+            defaultAudit.append({
+                tool: toolName || "unknown",
+                task_id: taskId,
+                trigger: "blocked",
+                duration_ms: Date.now() - startTs,
+                result_code: "E4001_GUARD_BLOCK",
+                result_summary: "enforce_block rejected",
+            });
+            defaultAudit.flush();
+            complete(blockResult);
+            return;
+        }
+        // #7: env curtail — check tool allowed in current env
+        if (toolName && defaultManifest && !defaultManifest.isToolAllowed(toolName, defaultDeps)) {
+            var curtResult = {
+                success: false,
+                code: "E5002_DEPENDENCY_MISSING",
+                error: "工具 " + toolName + " 在当前环境权限下不可用（被 manifest 裁剪）",
+            };
+            defaultAudit.append({
+                tool: toolName,
+                task_id: taskId,
+                trigger: "curtailed",
+                duration_ms: Date.now() - startTs,
+                result_code: "E5002_DEPENDENCY_MISSING",
+                result_summary: "env curtail rejected",
+            });
+            defaultAudit.flush();
+            complete(curtResult);
+            return;
+        }
+        var result = await func(p);
+        // #8: audit successful call
+        defaultAudit.append({
+            tool: toolName || "unknown",
+            task_id: taskId,
+            trigger: p.trigger || null,
+            duration_ms: Date.now() - startTs,
+            result_code: (result && result.code) || (result && result.success ? "OK" : "UNKNOWN"),
+            result_summary: result ? (result.error || result.state || (result.success ? "success" : "fail")).slice(0, 120) : null,
+        });
+        defaultAudit.flush();
         complete(result);
     } catch (error) {
-        complete({
+        var errResult = {
             success: false,
             code: "E5001_INTERNAL_ERROR",
             error: "工具执行异常: " + (error && error.message ? error.message : String(error)),
+        };
+        defaultAudit.append({
+            tool: toolName || "unknown",
+            task_id: taskId,
+            trigger: "exception",
+            duration_ms: Date.now() - startTs,
+            result_code: "E5001_INTERNAL_ERROR",
+            result_summary: safeStr(error),
         });
+        defaultAudit.flush();
+        complete(errResult);
     }
+}
+
+function safeStr(e) {
+    if (!e) return "";
+    if (e.message) return String(e.message).slice(0, 120);
+    return String(e).slice(0, 120);
 }
 
 // Self-test entry: pure logic layer only, verifies engine runs.
@@ -1968,17 +2361,19 @@ function TaskLedger_test() {
     return first.goal === "high" && ledger.pendingCount() === 1;
 }
 
-exports.preflight = function (params) { return wrapToolExecution(preflight, params); };
-exports.file_guard = function (params) { return wrapToolExecution(file_guard, params); };
-exports.hallucination_guard = function (params) { return wrapToolExecution(hallucination_guard, params); };
-exports.evidence_check = function (params) { return wrapToolExecution(evidence_check, params); };
-exports.self_monitor = function (params) { return wrapToolExecution(self_monitor, params); };
-exports.output_firewall = function (params) { return wrapToolExecution(output_firewall, params); };
-exports.search_opensource = function (params) { return wrapToolExecution(search_opensource, params); };
-exports.remember = function (params) { return wrapToolExecution(remember, params); };
-exports.recall = function (params) { return wrapToolExecution(recall, params); };
-exports.snapshot_file = function (params) { return wrapToolExecution(snapshot_file, params); };
-exports.restore_file = function (params) { return wrapToolExecution(restore_file, params); };
+exports.preflight = function (params) { return wrapToolExecution(preflight, params, "preflight"); };
+exports.file_guard = function (params) { return wrapToolExecution(file_guard, params, "file_guard"); };
+exports.hallucination_guard = function (params) { return wrapToolExecution(hallucination_guard, params, "hallucination_guard"); };
+exports.evidence_check = function (params) { return wrapToolExecution(evidence_check, params, "evidence_check"); };
+exports.self_monitor = function (params) { return wrapToolExecution(self_monitor, params, "self_monitor"); };
+exports.output_firewall = function (params) { return wrapToolExecution(output_firewall, params, "output_firewall"); };
+exports.search_opensource = function (params) { return wrapToolExecution(search_opensource, params, "search_opensource"); };
+exports.remember = function (params) { return wrapToolExecution(remember, params, "remember"); };
+exports.recall = function (params) { return wrapToolExecution(recall, params, "recall"); };
+exports.snapshot_file = function (params) { return wrapToolExecution(snapshot_file, params, "snapshot_file"); };
+exports.restore_file = function (params) { return wrapToolExecution(restore_file, params, "restore_file"); };
+exports.enforce_block = function (params) { return wrapToolExecution(enforce_block, params, "enforce_block"); };
+exports.audit_log = function (params) { return wrapToolExecution(audit_log, params, "audit_log"); };
 exports.main = main;
 exports.create = ZeroApex.create;
 exports._infra = ZeroApex._infra;

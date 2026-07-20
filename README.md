@@ -19,27 +19,33 @@
 
 ```
 零.skill (元信息层 + 路由)
+ ├── manifest.json (机器可读清单，框架自动索引)
  ├── references/*.md (资源层，按场景按需加载)
- └── engine/zero_apex.js (指令层，QuickJS 沙箱可执行)
-      ├── ConfigRegistry      统一配置中心
-      ├── PathUtils            跨平台路径工具
-      ├── RetryPolicy          指数退避重试
-      ├── ConcurrencyLimiter   并发限流
-      ├── FileLock             路径互斥锁
-      ├── LRUCache             有界缓存
-      ├── TemplateStore        模板外部化
-      ├── OutputChunker        大输出分块
-      ├── TaskLedger           优先级任务队列
-      ├── ResultEnvelope       统一返回体
-      ├── ErrorCode            错误码枚举
-      ├── FileGuard            防删代码层
-      ├── Hallucination        防幻觉层
-      ├── Evidence             证据验证层
-      ├── SelfMonitor          自我意识层
-      ├── OutputFirewall       输出防火墙
-      ├── OpenSource           GitHub API 搜索
-      ├── Memory               Operit 持久化记忆
-      └── Snapshot             .trash 备份/恢复
+ ├── engine/zero_apex.js (指令层，QuickJS 沙箱可执行)
+ │    ├── ConfigRegistry      统一配置中心
+ │    ├── PathUtils            跨平台路径工具
+ │    ├── RetryPolicy          指数退避重试
+ │    ├── ConcurrencyLimiter   并发限流
+ │    ├── FileLock             路径互斥锁
+ │    ├── LRUCache             有界缓存
+ │    ├── TemplateStore        模板外部化
+ │    ├── OutputChunker        大输出分块
+ │    ├── TaskLedger           优先级任务队列
+ │    ├── ResultEnvelope       统一返回体
+ │    ├── ErrorCode            错误码枚举
+ │    ├── AuditLogger          触发日志 (#8)
+ │    ├── BlockEnforcer        硬阻断拦截器 (#5)
+ │    ├── ManifestLoader       环境裁剪 (#7)
+ │    ├── FileGuard            防删代码层
+ │    ├── Hallucination        防幻觉层
+ │    ├── Evidence             证据验证层
+ │    ├── SelfMonitor          自我意识层
+ │    ├── OutputFirewall       输出防火墙
+ │    ├── OpenSource           GitHub API 搜索
+ │    ├── Memory               Operit 持久化记忆
+ │    └── Snapshot             .trash 备份/恢复
+ └── scripts/evolve.js (自动进化闭环 #6)
+      提取失败经验 → 聚类 → 生成新 reference → 测试 → 备份 → 合并
 ```
 
 ## 八个能力层
@@ -63,7 +69,7 @@ operit_editor:debug_install_js_package
 
 详见 `references/operit_capabilities.md` 中的权限分级和能力探测流程。
 
-## 工具列表（11 个）
+## 工具列表（13 个）
 
 | 工具 | 层 | 用途 |
 |------|-----|------|
@@ -78,15 +84,17 @@ operit_editor:debug_install_js_package
 | `recall` | 记忆 | 检索历史经验 |
 | `snapshot_file` | 快照 | 备份到 .trash |
 | `restore_file` | 快照 | 从 .trash 恢复 |
+| `enforce_block` | 强制拦截 | preflight BLOCK 后硬阻断后续工具调用 |
+| `audit_log` | 调试 | 查看最近的工具调用审计记录 |
 
 ## 测试
 
 ```
-node tests/test_zero_apex.js     # 引擎 + DI 集成 + 守卫层
-node tests/test_skill_activation.js  # skill 层行为约束
+node tests/test_zero_apex.js        # 引擎 + DI 集成 + 守卫层
+node tests/test_skill_activation.js # skill 层行为约束 + 强制拦截 + 环境裁剪 + 审计日志 + 进化闭环
 ```
 
-当前测试覆盖：内置自测 19 项 + DI 集成 40+ 断言 + 守卫层 15+ 断言 + skill 层行为约束。
+当前测试覆盖：内置自测 19 项 + DI 集成 40+ 断言 + 守卫层 15+ 断言 + skill 层 113 断言。
 
 ## Skill 结构
 

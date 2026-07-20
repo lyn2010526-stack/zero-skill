@@ -180,3 +180,4 @@
 *.lz
 *.lzma
 *.iso
+.zero_apex/
