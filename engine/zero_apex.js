@@ -133,6 +133,36 @@
 //
 // Runtime: Operit Sandbox (QuickJS). No require(). Single self-contained module.
 // External hooks injected at call time: Network, Files, Tools, complete.
+//
+// ---------------------------------------------------------------------------
+// Module navigation (single-file by QuickJS constraint; sections delimited):
+//   §0  ErrorCodes & ResultEnvelope      (lines ~120-180)
+//   §1  ConfigRegistry                  (lines ~185-230)
+//   §2  PathUtils                       (lines ~235-290)
+//   §3  RetryPolicy + sleep              (lines ~295-330)
+//   §4  ConcurrencyLimiter              (lines ~335-370)
+//   §5  FileLock                        (lines ~375-410)
+//   §6  LRUCache                        (lines ~415-450)
+//   §7  TemplateStore                  (lines ~455-485)
+//   §8  OutputChunker                   (lines ~490-525)
+//   §9  TaskLedger                      (lines ~530-580)
+//   §10 nowStamp + safeString           (lines ~585-605)
+//   §11 FileGuard                       (lines ~610-705)
+//   §12 Hallucination                   (lines ~710-820)
+//   §13 EvidenceModule                  (lines ~825-940)
+//   §14 SelfMonitor                     (lines ~945-1015)
+//   §15 OutputFirewall                  (lines ~1020-1095)
+//   §16 OpenSourceModule                (lines ~1100-1190)
+//   §17 MemoryModule                   (lines ~1195-1290)
+//   §18 SnapshotModule                 (lines ~1295-1410)
+//   §19 preflightGate                  (lines ~1415-1485)
+//   §20 bootstrapConfig                (lines ~1490-1575)
+//   §21 create() factory                (lines ~1580-1625)
+//   §22 Tool export layer              (lines ~1630-1700)
+//   §23 Self-test (main)               (lines ~1705-1954)
+//
+// Each section is independently readable. references/*.md documents each §11-§19
+// module's behavior contract for skill-layer routing.
 // ==========================================================================
 
 const ZeroApex = (function () {
