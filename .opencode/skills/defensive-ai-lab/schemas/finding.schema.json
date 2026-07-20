@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/defensive-ai-lab/finding.schema.json",
+  "title": "Defensive Finding",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["finding_id", "title", "state", "severity", "claim", "evidence_ids", "remediation", "limitations"],
+  "properties": {
+    "finding_id": { "type": "string", "pattern": "^F-[A-Z0-9-]{4,64}$" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "state": { "enum": ["confirmed", "supported", "unverified", "rejected"] },
+    "severity": { "enum": ["critical", "high", "medium", "low", "informational"] },
+    "claim": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "evidence_ids": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^EV-[A-Z0-9-]{6,64}$" },
+      "uniqueItems": true
+    },
+    "conflicting_evidence_ids": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^EV-[A-Z0-9-]{6,64}$" },
+      "uniqueItems": true
+    },
+    "remediation": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "validation": { "type": "string", "maxLength": 4000 },
+    "limitations": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "state": { "const": "confirmed" } } },
+      "then": { "properties": { "evidence_ids": { "minItems": 1 } } }
+    }
+  ]
+}

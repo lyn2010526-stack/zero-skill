@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/defensive-ai-lab/test-result-import.schema.json",
+  "title": "Normalized Test Result Import",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "case_id", "source_type", "framework", "imported_at", "results"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "case_id": { "type": "string", "format": "uuid" },
+    "source_type": { "const": "user_artifact" },
+    "framework": { "enum": ["pytest", "unittest", "junit", "vitest", "jest", "go-test", "generic"] },
+    "imported_at": { "type": "string", "format": "date-time" },
+    "input_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["test_id", "name", "status"],
+        "properties": {
+          "test_id": { "type": "string" },
+          "name": { "type": "string", "maxLength": 500 },
+          "status": { "enum": ["passed", "failed", "skipped", "error", "flaky"] },
+          "duration_ms": { "type": "number", "minimum": 0 },
+          "failure": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "message_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+              "locator": { "type": "string", "maxLength": 1000 }
+            }
+          },
+          "locator": { "type": "string", "maxLength": 1000 }
+        }
+      }
+    }
+  }
+}

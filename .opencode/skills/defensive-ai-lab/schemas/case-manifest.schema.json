@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/defensive-ai-lab/case-manifest.schema.json",
+  "title": "Defensive AI Lab Case Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "case_id", "workflow", "created_at", "scope", "limits", "requested_outputs"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "case_id": { "type": "string", "format": "uuid" },
+    "workflow": {
+      "enum": ["ai_experiment", "local_security_review", "authorization_regression", "evidence_report", "mixed"]
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "workspace_fingerprint": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed_sources", "excluded_operations"],
+      "properties": {
+        "allowed_sources": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true },
+        "excluded_operations": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "network", "concurrency", "timeout_seconds"],
+      "properties": {
+        "profile": { "enum": ["low", "standard", "custom"] },
+        "network": { "enum": ["disabled", "loopback-only"] },
+        "concurrency": { "type": "integer", "minimum": 1, "maximum": 4 },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 1800 }
+      }
+    },
+    "requested_outputs": {
+      "type": "array",
+      "items": { "enum": ["markdown", "json", "patch", "tests"] },
+      "minItems": 1,
+      "uniqueItems": true
+    }
+  }
+}

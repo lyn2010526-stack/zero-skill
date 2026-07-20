@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/defensive-ai-lab/case-report.schema.json",
+  "title": "Defensive AI Lab Case Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "case_id", "generated_at", "scope", "methods", "evidence", "findings", "limitations", "validation"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "case_id": { "type": "string", "format": "uuid" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "scope": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "exclusions": { "type": "array", "items": { "type": "string" } },
+    "methods": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "evidence": {
+      "type": "array",
+      "items": { "$ref": "evidence.schema.json" }
+    },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "finding.schema.json" }
+    },
+    "conflicts": { "type": "array", "items": { "type": "string" } },
+    "limitations": { "type": "array", "items": { "type": "string" } },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commands", "passed"],
+      "properties": {
+        "commands": { "type": "array", "items": { "type": "string" } },
+        "passed": { "type": "boolean" },
+        "notes": { "type": "string" }
+      }
+    },
+    "ai_experiment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hypothesis": { "type": "string" },
+        "prompt_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "dataset_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "run_count": { "type": "integer", "minimum": 0 },
+        "metrics": { "type": "object", "additionalProperties": { "type": ["number", "string", "boolean", "null"] } }
+      }
+    }
+  }
+}
