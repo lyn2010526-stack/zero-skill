@@ -157,9 +157,15 @@
 //   §18 SnapshotModule                 (lines ~1295-1410)
 //   §19 preflightGate                  (lines ~1415-1485)
 //   §20 bootstrapConfig                (lines ~1490-1575)
-//   §21 create() factory                (lines ~1580-1625)
-//   §22 Tool export layer              (lines ~1630-1700)
-//   §23 Self-test (main)               (lines ~1705-1954)
+//   §21b AuditLogger                   (lines ~1689)
+//   §21c BlockEnforcer                 (lines ~1754)
+//   §21d ManifestLoader                (lines ~1811)
+//   §21e ShellGuard (D+E)              (lines ~1918)  [2.3.0]
+//   §21f SandboxProfile (B)            (lines ~2094)  [2.3.0]
+//   §21g PermissionRules (C)           (lines ~2227)  [2.3.0]
+//   §21h HookRegistry (A, four-phase)  (lines ~2387)  [2.3.0]
+//   §22 create() factory + tool layer  (lines ~2587)
+//   §23 Self-test (main)               (lines ~2905)
 //
 // Each section is independently readable. references/*.md documents each §11-§19
 // module's behavior contract for skill-layer routing.
@@ -1909,6 +1915,675 @@ const ZeroApex = (function () {
     }
 
     // ======================================================================
+    // §21e ShellGuard — command segment parser + read-only allowlist +
+    // dangerous command escalation (borrowed from Grok grok-build)
+    // Splits chained commands on && || ; | and newlines, then peels a fixed
+    // set of process wrappers (timeout, nice, ionice, chrt, stdbuf, env) and
+    // env-var prefixes before matching each segment.
+    // ======================================================================
+    var ShellGuard = (function () {
+        var READ_ONLY_CMDS = [
+            "ls", "cat", "pwd", "date", "whoami", "hostname", "uptime", "ps",
+            "head", "tail", "wc", "sort", "uniq", "tr", "cut",
+            "grep", "rg",
+            "git status", "git branch", "git log", "git diff", "git ls-files", "git show", "git rev-parse",
+            "kubectl get", "kubectl logs", "kubectl describe",
+            "cargo check"
+        ];
+        var DANGEROUS_CMDS = [
+            "rm", "rmdir", "unlink", "shred",
+            "chmod", "chown", "chgrp", "chattr",
+            "pkill", "kill", "killall",
+            "git push",
+            "shutdown", "reboot", "poweroff", "init",
+            "mkfs", "fdisk", "parted",
+            "mount", "umount",
+            "iptables", "ip6tables", "nft", "ufw", "firewall-cmd",
+            "useradd", "userdel", "usermod", "passwd", "visudo", "chroot",
+            "sudo", "su"
+        ];
+        var WRAPPERS = ["timeout", "nice", "ionice", "chrt", "stdbuf", "env"];
+        var UNSAFE_TOKENS = ["$(", "`", "&", ">", "<"];
+
+        function splitChain(cmd) {
+            var s = safeString(cmd);
+            if (!s) return [];
+            return s.split(/&&|\|\||;|\||\n/);
+        }
+
+        function peelWrapper(segment) {
+            var s = String(segment || "").trim();
+            while (s) {
+                var matched = false;
+                var first = (s.split(/\s+/)[0] || "");
+                if (WRAPPERS.indexOf(first) >= 0) {
+                    var rest = s.slice(first.length).trim();
+                    if (first === "env") {
+                        var m = rest.match(/^([A-Z_][A-Z0-9_]*=\S+)\s+([\s\S]+)$/);
+                        if (m) { s = m[2].trim(); matched = true; }
+                        else { s = rest; matched = true; }
+                    } else if (first === "timeout") {
+                        var m2 = rest.match(/^(\S+)\s+([\s\S]+)$/);
+                        if (m2) { s = m2[2].trim(); matched = true; }
+                        else { s = rest; matched = true; }
+                    } else {
+                        // nice/ionice/chrt/stdbuf: peel all leading option/numeric args
+                        // until we hit a token that looks like a command name.
+                        var cur = rest;
+                        while (cur) {
+                            var optMatch = cur.match(/^(-\S+|\d+(?:\.\d+)?)[\s]+([\s\S]+)$/);
+                            if (optMatch) { cur = optMatch[2].trim(); }
+                            else { break; }
+                        }
+                        s = cur || rest;
+                        matched = true;
+                    }
+                }
+                var envPrefix = s.match(/^([A-Z_][A-Z0-9_]*=\S+)\s+([\s\S]+)$/);
+                if (envPrefix) { s = envPrefix[2].trim(); matched = true; }
+                if (!matched) break;
+            }
+            return s.trim();
+        }
+
+        function primaryCommand(segment) {
+            var s = peelWrapper(segment);
+            if (!s) return "";
+            var parts = s.split(/\s+/);
+            return parts[0] || "";
+        }
+
+        function isReadOnly(segment) {
+            var s = peelWrapper(segment);
+            if (!s) return false;
+            for (var i = 0; i < READ_ONLY_CMDS.length; i++) {
+                var pat = READ_ONLY_CMDS[i];
+                if (s === pat || s.indexOf(pat + " ") === 0) return true;
+            }
+            return false;
+        }
+
+        function isDangerous(segment) {
+            var s = peelWrapper(segment);
+            if (!s) return false;
+            var first = (s.split(/\s+/)[0] || "");
+            if (DANGEROUS_CMDS.indexOf(first) >= 0) return true;
+            for (var i = 0; i < DANGEROUS_CMDS.length; i++) {
+                var pat = DANGEROUS_CMDS[i];
+                if (pat.indexOf(" ") >= 0 && (s === pat || s.indexOf(pat + " ") === 0)) return true;
+            }
+            return false;
+        }
+
+        function hasUnsafeTokens(cmd) {
+            var s = safeString(cmd);
+            if (!s) return null;
+            // $( ... ) command substitution
+            if (s.indexOf("$(") >= 0) return "$(";
+            // backtick substitution
+            if (s.indexOf("`") >= 0) return "`";
+            // single & (background) but not && (logical and)
+            var ampMatch = s.match(/(^|[^&])&([^&]|$)/);
+            if (ampMatch) return "&";
+            // > or < redirection (but not >> << here-doc which are still redirections)
+            if (/[<>]/.test(s) && !/^<{2,}\s/.test(s.trim())) {
+                // Distinguish git log --oneline > file (redirection) from < in html
+                // Treat any standalone > or < (not part of && ||) as redirection
+                if (s.match(/(^|[^<>])[<>]([^<>]|$)/)) return /[<>]/.source === "<" ? "<" : ">";
+            }
+            return null;
+        }
+
+        function analyze(cmd) {
+            var segments = splitChain(cmd);
+            var unsafeToken = hasUnsafeTokens(cmd);
+            var allReadOnly = segments.length > 0;
+            var dangerousHits = [];
+            var nonReadOnlySegments = [];
+
+            for (var i = 0; i < segments.length; i++) {
+                var seg = segments[i].trim();
+                if (!seg) continue;
+                if (isDangerous(seg)) {
+                    dangerousHits.push({ segment: seg, primary: primaryCommand(seg) });
+                }
+                if (!isReadOnly(seg)) {
+                    allReadOnly = false;
+                    nonReadOnlySegments.push(seg);
+                }
+            }
+
+            var verdict = "ALLOW";
+            var reasons = [];
+            if (dangerousHits.length > 0) {
+                verdict = "ASK";
+                for (var d = 0; d < dangerousHits.length; d++) {
+                    reasons.push("危险命令: " + dangerousHits[d].primary + " [" + dangerousHits[d].segment + "]");
+                }
+            }
+            if (unsafeToken) {
+                verdict = "ASK";
+                reasons.push("含不可检查的 shell 构造: " + unsafeToken);
+            }
+
+            return {
+                verdict: verdict,
+                segments_count: segments.length,
+                all_read_only: allReadOnly,
+                dangerous_hits: dangerousHits,
+                non_read_only_segments: nonReadOnlySegments,
+                unsafe_token: unsafeToken,
+                reasons: reasons,
+            };
+        }
+
+        return {
+            READ_ONLY_CMDS: READ_ONLY_CMDS,
+            DANGEROUS_CMDS: DANGEROUS_CMDS,
+            splitChain: splitChain,
+            peelWrapper: peelWrapper,
+            primaryCommand: primaryCommand,
+            isReadOnly: isReadOnly,
+            isDangerous: isDangerous,
+            hasUnsafeTokens: hasUnsafeTokens,
+            analyze: analyze,
+        };
+    })();
+
+    // ======================================================================
+    // §21f SandboxProfile — path/command restrictions by profile
+    // (borrowed from Grok grok-build sandbox). Default workspace: only
+    // .zero_apex/ + .trash/ writable; deny /proc /sys /dev /etc/shadow etc.
+    // Profiles: workspace | read-only | strict.
+    // ======================================================================
+    function SandboxProfile(deps) {
+        deps = deps || {};
+        var manifest = deps.manifest || null;
+
+        function getProfileConfig(profileName) {
+            var m = manifest ? manifest.load() : null;
+            if (!m || !m.sandbox || !m.sandbox.profiles) return null;
+            return m.sandbox.profiles[profileName] || null;
+        }
+
+        function getDefaultProfile() {
+            var m = manifest ? manifest.load() : null;
+            if (m && m.sandbox && m.sandbox.default_profile) {
+                return m.sandbox.default_profile;
+            }
+            return "workspace";
+        }
+
+        function matchGlob(pattern, path) {
+            if (pattern === "*") return true;
+            if (!pattern || !path) return false;
+            var p = String(pattern);
+            var s = String(path);
+            var re = "^";
+            var i = 0;
+            while (i < p.length) {
+                var c = p.charAt(i);
+                if (c === "*") {
+                    if (p.charAt(i + 1) === "*") {
+                        re += "[\\s\\S]*";
+                        i += 2;
+                        if (p.charAt(i) === "/") i += 1;
+                    } else {
+                        re += "[^/]*";
+                        i += 1;
+                    }
+                } else if (c === "?") {
+                    re += "[^/]";
+                    i += 1;
+                } else if (/[.+^${}()|[\]\\]/.test(c)) {
+                    re += "\\" + c;
+                    i += 1;
+                } else {
+                    re += c;
+                    i += 1;
+                }
+            }
+            re += "$";
+            try { return new RegExp(re).test(s); } catch (e) { return false; }
+        }
+
+        function checkPath(path, action, profileName) {
+            var profile = getProfileConfig(profileName || getDefaultProfile());
+            if (!profile) return { allowed: true, verdict: "ALLOW", reason: "no profile config" };
+            var p = safeString(path);
+            if (!p) return { allowed: false, verdict: "DENY", reason: "empty path" };
+
+            var denyList = profile.deny_paths || [];
+            for (var i = 0; i < denyList.length; i++) {
+                if (matchGlob(denyList[i], p)) {
+                    return { allowed: false, verdict: "DENY", reason: "denied by pattern: " + denyList[i], matched_pattern: denyList[i] };
+                }
+            }
+
+            if (action === "write" || action === "edit") {
+                var writable = profile.writable_paths || [];
+                var matchedWritable = null;
+                for (var j = 0; j < writable.length; j++) {
+                    if (matchGlob(writable[j], p)) { matchedWritable = writable[j]; break; }
+                }
+                if (writable.length === 0) {
+                    return { allowed: false, verdict: "DENY", reason: "profile " + (profileName || getDefaultProfile()) + " forbids all writes" };
+                }
+                if (!matchedWritable) {
+                    return { allowed: false, verdict: "DENY", reason: "path not in writable_paths: " + p };
+                }
+            }
+            return { allowed: true, verdict: "ALLOW", matched_profile: profileName || getDefaultProfile() };
+        }
+
+        function checkCommand(cmd, profileName) {
+            var profile = getProfileConfig(profileName || getDefaultProfile());
+            if (!profile) return { allowed: true, verdict: "ALLOW", reason: "no profile config" };
+            var execs = profile.executable_commands || [];
+            if (execs.length === 0 && (profileName || getDefaultProfile()) === "read-only") {
+                var sg = ShellGuard.analyze(cmd);
+                if (sg.verdict === "ALLOW" && sg.all_read_only) {
+                    return { allowed: true, verdict: "ALLOW", reason: "read-only command" };
+                }
+                return { allowed: false, verdict: "DENY", reason: "read-only profile forbids non-readonly: " + sg.non_read_only_segments.join(",") };
+            }
+            if (execs.length === 0 || execs.indexOf("*") >= 0) {
+                return { allowed: true, verdict: "ALLOW", reason: "wildcard exec" };
+            }
+            var segments = ShellGuard.splitChain(cmd);
+            for (var i = 0; i < segments.length; i++) {
+                var seg = ShellGuard.peelWrapper(segments[i]);
+                if (!seg) continue;
+                var matched = false;
+                for (var j = 0; j < execs.length; j++) {
+                    if (seg === execs[j] || seg.indexOf(execs[j] + " ") === 0) { matched = true; break; }
+                }
+                if (!matched) {
+                    return { allowed: false, verdict: "DENY", reason: "segment not in executable_commands: " + seg };
+                }
+            }
+            return { allowed: true, verdict: "ALLOW" };
+        }
+
+        function check(params) {
+            params = params || {};
+            var profileName = params.profile || getDefaultProfile();
+            if (params.command) return checkCommand(params.command, profileName);
+            if (params.path) return checkPath(params.path, params.action || "write", profileName);
+            return { allowed: false, verdict: "DENY", reason: "no path or command provided" };
+        }
+
+        return {
+            check: check,
+            checkPath: checkPath,
+            checkCommand: checkCommand,
+            getDefaultProfile: getDefaultProfile,
+            getProfileConfig: getProfileConfig,
+            matchGlob: matchGlob,
+        };
+    }
+
+    // ======================================================================
+    // §21g PermissionRules — deny > ask > allow evaluation with glob
+    // matching (borrowed from Grok grok-build permission system).
+    // default mode: unmatched calls fall through to preflight existing logic.
+    // dontAsk mode: unmatched calls without allow are denied.
+    // bypassPermissions mode: auto-approve (deny/hook still apply).
+    // ======================================================================
+    function PermissionRules(deps) {
+        deps = deps || {};
+        var manifest = deps.manifest || null;
+
+        function getRules() {
+            var m = manifest ? manifest.load() : null;
+            if (!m || !m.permission || !m.permission.rules) return [];
+            return m.permission.rules;
+        }
+
+        function getDefaultMode() {
+            var m = manifest ? manifest.load() : null;
+            if (m && m.permission && m.permission.default_mode) {
+                return m.permission.default_mode;
+            }
+            return "default";
+        }
+
+        function matchTool(ruleTool, callTool) {
+            if (!ruleTool || ruleTool === "*") return true;
+            if (!callTool) return false;
+            return ruleTool.toLowerCase() === callTool.toLowerCase();
+        }
+
+        function matchPattern(pattern, value) {
+            if (!pattern || !value) return false;
+            if (pattern === "*") return true;
+            var p = String(pattern);
+            var s = String(value);
+            if (p.indexOf("Bash(") === 0 && p.charAt(p.length - 1) === ")") {
+                var inner = p.slice(5, -1);
+                if (inner.indexOf(":*") === inner.length - 2) {
+                    inner = inner.slice(0, -2);
+                    return s === inner || s.indexOf(inner) === 0;
+                }
+                if (inner.indexOf("*") >= 0 || inner.indexOf("?") >= 0) {
+                    // Bash mode: * matches any characters including slashes
+                    return globMatch(inner, s, true);
+                }
+                return s === inner || s.indexOf(inner) === 0;
+            }
+            if (p.indexOf("Read(") === 0 || p.indexOf("Edit(") === 0 || p.indexOf("Grep(") === 0) {
+                var inner2 = p.slice(p.indexOf("(") + 1, -1);
+                return globMatch(inner2, s, false);
+            }
+            if (p.indexOf("WebFetch(domain:") === 0) {
+                var domain = p.slice("WebFetch(domain:".length, -1);
+                return s.indexOf(domain) >= 0 || s.indexOf(domain.replace(/^www\./, "")) >= 0;
+            }
+            return globMatch(p, s, false);
+        }
+
+        function globMatch(pattern, str, starCrossSlash) {
+            if (pattern === "*") return true;
+            var p = String(pattern);
+            var s = String(str);
+            var re = "^";
+            var i = 0;
+            while (i < p.length) {
+                var c = p.charAt(i);
+                if (c === "*") {
+                    if (p.charAt(i + 1) === "*") {
+                        re += "[\\s\\S]*";
+                        i += 2;
+                        if (p.charAt(i) === "/") i += 1;
+                    } else {
+                        re += starCrossSlash ? "[\\s\\S]*" : "[^/]*";
+                        i += 1;
+                    }
+                } else if (c === "?") {
+                    re += "[^/]";
+                    i += 1;
+                } else if (/[.+^${}()|[\]\\]/.test(c)) {
+                    re += "\\" + c;
+                    i += 1;
+                } else {
+                    re += c;
+                    i += 1;
+                }
+            }
+            re += "$";
+            try { return new RegExp(re).test(s); } catch (e) { return false; }
+        }
+
+        function normalizeTool(toolName, params) {
+            if (!toolName) return "bash";
+            var t = String(toolName).toLowerCase();
+            if (t === "file_guard" || t === "fileguard") return "bash";
+            if (t === "snapshot_file" || t === "restore_file") return "edit";
+            if (t === "read" || t === "read_file" || t === "list_dir" || t === "grep") return "read";
+            if (t === "edit" || t === "write" || t === "search_replace") return "edit";
+            if (t === "bash" || t === "shell") return "bash";
+            return "bash";
+        }
+
+        function extractValue(tool, params) {
+            params = params || {};
+            if (tool === "bash") return params.command || "";
+            if (tool === "read" || tool === "edit") return params.path || params.file_path || "";
+            return params.command || params.path || "";
+        }
+
+        function evaluate(toolName, params) {
+            var mode = getDefaultMode();
+            var tool = normalizeTool(toolName, params);
+            var value = extractValue(tool, params);
+            var rules = getRules();
+
+            var denyHit = null;
+            var askHit = null;
+            var allowHit = null;
+
+            for (var i = 0; i < rules.length; i++) {
+                var r = rules[i];
+                if (!matchTool(r.tool, tool)) continue;
+                if (!r.pattern) continue;
+                if (r.pattern === "*" || matchPattern(r.pattern, value)) {
+                    if (r.action === "deny" && !denyHit) denyHit = r;
+                    else if (r.action === "ask" && !askHit) askHit = r;
+                    else if (r.action === "allow" && !allowHit) allowHit = r;
+                }
+            }
+
+            if (denyHit) {
+                return { verdict: "DENY", reason: "deny rule: " + denyHit.pattern, matched_rule: denyHit, mode: mode };
+            }
+            if (askHit) {
+                return { verdict: "ASK", reason: "ask rule: " + askHit.pattern, matched_rule: askHit, mode: mode };
+            }
+            if (allowHit) {
+                return { verdict: "ALLOW", reason: "allow rule: " + allowHit.pattern, matched_rule: allowHit, mode: mode };
+            }
+
+            if (mode === "dontAsk") {
+                return { verdict: "DENY", reason: "dontAsk: no allow rule matched", mode: mode };
+            }
+            if (mode === "bypassPermissions") {
+                return { verdict: "ALLOW", reason: "bypassPermissions", mode: mode };
+            }
+            return { verdict: "FALLTHROUGH", reason: "default mode: fall through to preflight", mode: mode };
+        }
+
+        return {
+            evaluate: evaluate,
+            normalizeTool: normalizeTool,
+            extractValue: extractValue,
+            matchPattern: matchPattern,
+            globMatch: globMatch,
+            getRules: getRules,
+            getDefaultMode: getDefaultMode,
+        };
+    }
+
+    // ======================================================================
+    // §21h HookRegistry — four lifecycle hooks (PreToolUse/PostToolUse/
+    // Stop/SessionStart). Borrowed from Grok grok-build hooks.
+    // Each hook can return { decision: "deny"|"allow"|"continue", reason,
+    // mutated_result? }. fail_open default true: hook crash = allow.
+    // ======================================================================
+    function HookRegistry(deps) {
+        deps = deps || {};
+        var manifest = deps.manifest || null;
+        var audit = deps.audit || null;
+        var enforcer = deps.enforcer || null;
+        var ledger = deps.ledger || null;
+
+        var hooks = {
+            PreToolUse: [],
+            PostToolUse: [],
+            Stop: [],
+            SessionStart: [],
+        };
+        var enabled = true;
+        var timeoutMs = 5;
+        var failOpen = true;
+
+        function loadFromManifest() {
+            var m = manifest ? manifest.load() : null;
+            if (!m || !m.hooks || !m.hooks.enabled) {
+                enabled = false;
+                return;
+            }
+            enabled = true;
+            timeoutMs = m.hooks.timeout_ms || 5;
+            failOpen = m.hooks.fail_open !== false;
+            var reg = m.hooks.registry || {};
+            var phases = ["PreToolUse", "PostToolUse", "Stop", "SessionStart"];
+            for (var i = 0; i < phases.length; i++) {
+                var phase = phases[i];
+                hooks[phase] = [];
+                var entries = reg[phase] || [];
+                for (var j = 0; j < entries.length; j++) {
+                    var e = entries[j];
+                    hooks[phase].push({
+                        id: e.id,
+                        matcher: e.matcher || "*",
+                        description: e.description,
+                        source: e.source || "manifest",
+                        handler: builtinHandler(e.id, phase),
+                    });
+                }
+            }
+        }
+
+        function builtinHandler(id, phase) {
+            if (id === "dangerous_cmd_guard") {
+                return function (ctx) {
+                    var cmd = (ctx && ctx.params && ctx.params.command) || "";
+                    if (!cmd) return { decision: "continue" };
+                    var sg = ShellGuard.analyze(cmd);
+                    if (sg.verdict === "ASK" && sg.dangerous_hits.length > 0) {
+                        return { decision: "deny", reason: "危险命令被 Hook 拦截: " + sg.dangerous_hits[0].primary };
+                    }
+                    return { decision: "continue" };
+                };
+            }
+            if (id === "audit_after") {
+                return function (ctx) {
+                    if (audit && ctx && ctx.result) {
+                        audit.append({
+                            tool: ctx.tool,
+                            task_id: ctx.task_id,
+                            trigger: "post_tool_use",
+                            duration_ms: ctx.duration_ms || 0,
+                            result_code: (ctx.result && ctx.result.code) || (ctx.result && ctx.result.success ? "OK" : "UNKNOWN"),
+                            result_summary: ctx.result ? safeStr(ctx.result.error || ctx.result.state || (ctx.result.success ? "success" : "fail")) : null,
+                        });
+                        audit.flush();
+                    }
+                    return { decision: "continue" };
+                };
+            }
+            if (id === "stop_guard") {
+                return function (ctx) {
+                    var stopResult = checkStopConditions();
+                    if (!stopResult.all_met) {
+                        return { decision: "deny", reason: "Stop hook 守护未满足: " + stopResult.unmet.join(", "), mutated_result: stopResult };
+                    }
+                    return { decision: "continue" };
+                };
+            }
+            if (id === "session_init") {
+                return function (ctx) {
+                    return { decision: "continue" };
+                };
+            }
+            return function () { return { decision: "continue" }; };
+        }
+
+        function checkStopConditions() {
+            var m = manifest ? manifest.load() : null;
+            var conditions = (m && m.stop_hooks && m.stop_hooks.conditions) || [];
+            var unmet = [];
+            var met = [];
+            for (var i = 0; i < conditions.length; i++) {
+                var c = conditions[i];
+                var passed = false;
+                try {
+                    if (c.id === "all_tools_completed" && ledger) {
+                        passed = ledger.pendingCount() === 0;
+                    } else if (c.id === "no_active_block" && enforcer) {
+                        passed = enforcer.snapshot().length === 0;
+                    } else if (c.id === "audit_flushed" && audit) {
+                        passed = audit.snapshot().length === 0;
+                    } else {
+                        passed = true;
+                    }
+                } catch (e) {
+                    passed = failOpen;
+                }
+                if (passed) met.push(c.id);
+                else unmet.push(c.id);
+            }
+            return { all_met: unmet.length === 0, met: met, unmet: unmet };
+        }
+
+        function matchHook(hook, toolName) {
+            if (!hook.matcher || hook.matcher === "*") return true;
+            if (!toolName) return false;
+            return hook.matcher.toLowerCase() === toolName.toLowerCase();
+        }
+
+        function run(phase, ctx) {
+            if (!enabled) return { decision: "continue" };
+            var list = hooks[phase] || [];
+            var decisions = [];
+            var finalDecision = "continue";
+            var denyReason = null;
+            var mutatedResult = null;
+
+            for (var i = 0; i < list.length; i++) {
+                var h = list[i];
+                if (!matchHook(h, ctx && ctx.tool)) continue;
+                var hookResult;
+                try {
+                    hookResult = h.handler(ctx) || { decision: "continue" };
+                } catch (e) {
+                    if (failOpen) {
+                        hookResult = { decision: "continue", error: String(e && e.message || e) };
+                    } else {
+                        return { decision: "deny", reason: "Hook " + h.id + " crashed: " + String(e && e.message || e) };
+                    }
+                }
+                decisions.push({ hook_id: h.id, decision: hookResult.decision });
+                if (hookResult.decision === "deny" && finalDecision !== "deny") {
+                    finalDecision = "deny";
+                    denyReason = hookResult.reason || ("Hook " + h.id + " denied");
+                }
+                if (hookResult.mutated_result) {
+                    mutatedResult = hookResult.mutated_result;
+                }
+            }
+
+            var out = { decision: finalDecision, decisions: decisions };
+            if (denyReason) out.reason = denyReason;
+            if (mutatedResult) out.mutated_result = mutatedResult;
+            return out;
+        }
+
+        function register(phase, hook) {
+            if (!hooks[phase]) hooks[phase] = [];
+            hooks[phase].push({
+                id: hook.id,
+                matcher: hook.matcher || "*",
+                description: hook.description,
+                source: hook.source || "runtime",
+                handler: hook.handler,
+            });
+        }
+
+        function snapshot() {
+            var out = {};
+            for (var phase in hooks) {
+                if (!hooks.hasOwnProperty(phase)) continue;
+                out[phase] = hooks[phase].map(function (h) {
+                    return { id: h.id, matcher: h.matcher, source: h.source };
+                });
+            }
+            return out;
+        }
+
+        loadFromManifest();
+
+        return {
+            run: run,
+            register: register,
+            snapshot: snapshot,
+            checkStopConditions: checkStopConditions,
+            loadFromManifest: loadFromManifest,
+            isEnabled: function () { return enabled; },
+        };
+    }
+
+    // ======================================================================
     // §22 Module factory — instantiate modules with injected dependencies
     // ======================================================================
     function create(deps) {
@@ -1921,6 +2596,16 @@ const ZeroApex = (function () {
         var audit = new AuditLogger({ Files: deps.Files });
         var enforcer = new BlockEnforcer();
         var manifest = new ManifestLoader({ Files: deps.Files });
+        // §21e-h new modules
+        var sandbox = new SandboxProfile({ manifest: manifest });
+        var permissions = new PermissionRules({ manifest: manifest });
+        // §21h HookRegistry depends on manifest/audit/enforcer/ledger
+        var hooks = new HookRegistry({
+            manifest: manifest,
+            audit: audit,
+            enforcer: enforcer,
+            ledger: ledger,
+        });
 
         function preflight(goal, command, evidence, filesRead) {
             var result = preflightGate({ ledger: ledger }, goal, command, evidence, filesRead);
@@ -1979,6 +2664,9 @@ const ZeroApex = (function () {
             audit: audit,
             enforcer: enforcer,
             manifest: manifest,
+            sandbox: sandbox,
+            permissions: permissions,
+            hooks: hooks,
             checkBlock: checkBlock,
             checkToolAllowed: checkToolAllowed,
             // Infrastructure exposed for testing / extension
@@ -1997,6 +2685,10 @@ const ZeroApex = (function () {
                 AuditLogger: AuditLogger,
                 BlockEnforcer: BlockEnforcer,
                 ManifestLoader: ManifestLoader,
+                ShellGuard: ShellGuard,
+                SandboxProfile: SandboxProfile,
+                PermissionRules: PermissionRules,
+                HookRegistry: HookRegistry,
             },
         };
     }
@@ -2022,6 +2714,9 @@ const ZeroApex = (function () {
     var defaultEnforcer = defaultInstance.enforcer;
     var defaultAudit = defaultInstance.audit;
     var defaultManifest = defaultInstance.manifest;
+    var defaultSandbox = defaultInstance.sandbox;
+    var defaultPermissions = defaultInstance.permissions;
+    var defaultHooks = defaultInstance.hooks;
 
     return {
         // Re-export modules for direct internal access (backward compat)
@@ -2151,7 +2846,69 @@ async function audit_log(params) {
     };
 }
 
+// §21g tool: evaluate_permission — run deny>ask>allow evaluation
+async function evaluate_permission(params) {
+    if (!defaultPermissions) {
+        return { success: false, code: "E5002_DEPENDENCY_MISSING", error: "PermissionRules 未初始化" };
+    }
+    var tool = params.tool || "bash";
+    var value = defaultPermissions.extractValue(defaultPermissions.normalizeTool(tool, params), params);
+    var result = defaultPermissions.evaluate(tool, params);
+    return {
+        success: true,
+        code: "OK",
+        tool: tool,
+        value: value,
+        verdict: result.verdict,
+        reason: result.reason,
+        mode: result.mode,
+        matched_rule: result.matched_rule || null,
+    };
+}
+
+// §21f tool: check_sandbox — validate path/command against profile
+async function check_sandbox(params) {
+    if (!defaultSandbox) {
+        return { success: false, code: "E5002_DEPENDENCY_MISSING", error: "SandboxProfile 未初始化" };
+    }
+    var result = defaultSandbox.check(params);
+    return {
+        success: true,
+        code: "OK",
+        profile: params.profile || defaultSandbox.getDefaultProfile(),
+        target: params.path || params.command || "",
+        allowed: result.allowed,
+        verdict: result.verdict,
+        reason: result.reason || null,
+        matched_pattern: result.matched_pattern || null,
+    };
+}
+
+// §21h tool: run_hook — manually trigger a lifecycle hook phase
+async function run_hook(params) {
+    var phase = params.phase || "PreToolUse";
+    if (!defaultHooks) {
+        return { success: false, code: "E5002_DEPENDENCY_MISSING", error: "HookRegistry 未初始化" };
+    }
+    var result = defaultHooks.run(phase, {
+        tool: params.tool || null,
+        params: params.tool_params || {},
+        task_id: params.task_id || null,
+        result: params.result || null,
+    });
+    return {
+        success: true,
+        code: "OK",
+        phase: phase,
+        decision: result.decision,
+        decisions: result.decisions || [],
+        reason: result.reason || null,
+        enabled: defaultHooks.isEnabled(),
+    };
+}
+
 // Unified wrapper: catch exceptions, complete, audit, enforce block (#2, #5, #8)
+// + PreToolUse hook + PermissionRules + SandboxProfile (2.3.0) + PostToolUse hook
 async function wrapToolExecution(func, params, toolName) {
     var startTs = Date.now();
     var p = params || {};
@@ -2196,7 +2953,123 @@ async function wrapToolExecution(func, params, toolName) {
             complete(curtResult);
             return;
         }
+        // §21h PreToolUse hook (2.3.0): may deny before execution
+        if (defaultHooks && defaultHooks.isEnabled()) {
+            var preHook = defaultHooks.run("PreToolUse", {
+                tool: toolName,
+                params: p,
+                task_id: taskId,
+            });
+            if (preHook.decision === "deny") {
+                var hookDenyResult = {
+                    success: false,
+                    code: "E4001_GUARD_BLOCK",
+                    error: "PreToolUse Hook 拒绝: " + (preHook.reason || "未提供原因"),
+                    blocked_by: "hook:PreToolUse",
+                };
+                defaultAudit.append({
+                    tool: toolName || "unknown",
+                    task_id: taskId,
+                    trigger: "hook_deny",
+                    duration_ms: Date.now() - startTs,
+                    result_code: "E4001_GUARD_BLOCK",
+                    result_summary: preHook.reason || "PreToolUse deny",
+                });
+                defaultAudit.flush();
+                complete(hookDenyResult);
+                return;
+            }
+        }
+        // §21g PermissionRules (2.3.0): deny > ask > allow evaluation
+        if (defaultPermissions) {
+            var perm = defaultPermissions.evaluate(toolName, p);
+            if (perm.verdict === "DENY") {
+                var permDenyResult = {
+                    success: false,
+                    code: "E4001_GUARD_BLOCK",
+                    error: "Permission 规则拒绝: " + perm.reason,
+                    blocked_by: "permission:deny",
+                };
+                defaultAudit.append({
+                    tool: toolName || "unknown",
+                    task_id: taskId,
+                    trigger: "permission_deny",
+                    duration_ms: Date.now() - startTs,
+                    result_code: "E4001_GUARD_BLOCK",
+                    result_summary: perm.reason,
+                });
+                defaultAudit.flush();
+                complete(permDenyResult);
+                return;
+            }
+            if (perm.verdict === "ASK") {
+                // default 模式下 ASK 升级到 BLOCK（无交互式 UI）；dontAsk/bypassPermissions 已在 evaluate 内处理
+                var askResult = {
+                    success: false,
+                    code: "E4001_GUARD_BLOCK",
+                    error: "Permission 规则要求确认: " + perm.reason + "（无交互式 UI，按 deny 处理）",
+                    blocked_by: "permission:ask",
+                };
+                defaultAudit.append({
+                    tool: toolName || "unknown",
+                    task_id: taskId,
+                    trigger: "permission_ask",
+                    duration_ms: Date.now() - startTs,
+                    result_code: "E4001_GUARD_BLOCK",
+                    result_summary: perm.reason,
+                });
+                defaultAudit.flush();
+                complete(askResult);
+                return;
+            }
+        }
+        // §21f SandboxProfile (2.3.0): check path/command against profile
+        if (defaultSandbox) {
+            var sandboxParams = null;
+            if (p.command) {
+                sandboxParams = { command: p.command };
+            } else if (p.path) {
+                sandboxParams = { path: p.path, action: "write" };
+            } else if (p.file_path) {
+                sandboxParams = { path: p.file_path, action: "write" };
+            }
+            if (sandboxParams) {
+                var sandboxResult = defaultSandbox.check(sandboxParams);
+                if (!sandboxResult.allowed) {
+                    var sbDenyResult = {
+                        success: false,
+                        code: "E4001_GUARD_BLOCK",
+                        error: "Sandbox 拒绝: " + sandboxResult.reason,
+                        blocked_by: "sandbox:" + (sandboxParams.command ? "command" : "path"),
+                    };
+                    defaultAudit.append({
+                        tool: toolName || "unknown",
+                        task_id: taskId,
+                        trigger: "sandbox_deny",
+                        duration_ms: Date.now() - startTs,
+                        result_code: "E4001_GUARD_BLOCK",
+                        result_summary: sandboxResult.reason,
+                    });
+                    defaultAudit.flush();
+                    complete(sbDenyResult);
+                    return;
+                }
+            }
+        }
         var result = await func(p);
+        // §21h PostToolUse hook (2.3.0): may audit or mutate result
+        if (defaultHooks && defaultHooks.isEnabled()) {
+            var postHook = defaultHooks.run("PostToolUse", {
+                tool: toolName,
+                params: p,
+                task_id: taskId,
+                result: result,
+                duration_ms: Date.now() - startTs,
+            });
+            if (postHook.mutated_result) {
+                result = postHook.mutated_result;
+            }
+        }
         // #8: audit successful call
         defaultAudit.append({
             tool: toolName || "unknown",
@@ -2204,7 +3077,7 @@ async function wrapToolExecution(func, params, toolName) {
             trigger: p.trigger || null,
             duration_ms: Date.now() - startTs,
             result_code: (result && result.code) || (result && result.success ? "OK" : "UNKNOWN"),
-            result_summary: result ? (result.error || result.state || (result.success ? "success" : "fail")).slice(0, 120) : null,
+            result_summary: result ? safeStr(result.error || result.state || (result.success ? "success" : "fail")) : null,
         });
         defaultAudit.flush();
         complete(result);
@@ -2374,6 +3247,9 @@ exports.snapshot_file = function (params) { return wrapToolExecution(snapshot_fi
 exports.restore_file = function (params) { return wrapToolExecution(restore_file, params, "restore_file"); };
 exports.enforce_block = function (params) { return wrapToolExecution(enforce_block, params, "enforce_block"); };
 exports.audit_log = function (params) { return wrapToolExecution(audit_log, params, "audit_log"); };
+exports.evaluate_permission = function (params) { return wrapToolExecution(evaluate_permission, params, "evaluate_permission"); };
+exports.check_sandbox = function (params) { return wrapToolExecution(check_sandbox, params, "check_sandbox"); };
+exports.run_hook = function (params) { return wrapToolExecution(run_hook, params, "run_hook"); };
 exports.main = main;
 exports.create = ZeroApex.create;
 exports._infra = ZeroApex._infra;

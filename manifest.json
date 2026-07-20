@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "name": "zero_apex",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "首席工程师执行引擎。守护层为可执行 JS，运行在 Operit QuickJS 沙箱。",
   "compatibility": "Operit AI",
   "license": "Apache-2.0",
@@ -165,6 +165,36 @@
       "blocking": false,
       "description": "记录每次工具调用的触发原因/耗时/结果/task_id 到 audit_log.jsonl",
       "added_in": "2.2.0"
+    },
+    {
+      "name": "evaluate_permission",
+      "layer": "权限",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": ["before_tool_exec"],
+      "blocking": true,
+      "description": "按 deny>ask>allow 规则评估工具调用，default 模式下未匹配走 preflight 现有逻辑",
+      "added_in": "2.3.0"
+    },
+    {
+      "name": "check_sandbox",
+      "layer": "沙箱",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": ["path_write", "command_exec"],
+      "blocking": true,
+      "description": "按 sandbox profile（workspace/read-only/strict）校验可写路径与可执行命令",
+      "added_in": "2.3.0"
+    },
+    {
+      "name": "run_hook",
+      "layer": "钩子",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": ["pre_tool_use", "post_tool_use", "stop", "session_start"],
+      "blocking": true,
+      "description": "在工具执行前后/会话启停时运行用户配置的 JS 钩子，可 deny/audit/改写返回值",
+      "added_in": "2.3.0"
     }
   ],
   "references": [
@@ -267,6 +297,36 @@
       "triggers": ["task_complete:batch", "manual:evolve"],
       "conflicts_with": [],
       "added_in": "2.2.0"
+    },
+    {
+      "name": "hooks",
+      "path": "references/hooks.md",
+      "layer": "钩子",
+      "priority": "high",
+      "min_permission": "none",
+      "triggers": ["pre_tool_use", "post_tool_use", "stop", "session_start"],
+      "conflicts_with": [],
+      "added_in": "2.3.0"
+    },
+    {
+      "name": "sandbox",
+      "path": "references/sandbox.md",
+      "layer": "沙箱",
+      "priority": "critical",
+      "min_permission": "none",
+      "triggers": ["path_write", "command_exec"],
+      "conflicts_with": [],
+      "added_in": "2.3.0"
+    },
+    {
+      "name": "permissions",
+      "path": "references/permissions.md",
+      "layer": "权限",
+      "priority": "critical",
+      "min_permission": "none",
+      "triggers": ["before_tool_exec"],
+      "conflicts_with": [],
+      "added_in": "2.3.0"
     }
   ],
   "deactivates_on": [
@@ -292,5 +352,121 @@
     "enabled": true,
     "log_path": ".zero_apex/audit_log.jsonl",
     "fields": ["timestamp", "tool", "task_id", "trigger", "duration_ms", "result_code", "result_summary"]
+  },
+  "hooks": {
+    "enabled": true,
+    "lifecycle": ["PreToolUse", "PostToolUse", "Stop", "SessionStart"],
+    "timeout_ms": 5,
+    "fail_open": true,
+    "registry": {
+      "PreToolUse": [
+        {
+          "id": "dangerous_cmd_guard",
+          "matcher": "*",
+          "description": "命中危险命令清单（rm/chmod/kill 等）时升级到 deny",
+          "source": "builtin"
+        }
+      ],
+      "PostToolUse": [
+        {
+          "id": "audit_after",
+          "matcher": "*",
+          "description": "工具执行后写审计日志",
+          "source": "builtin"
+        }
+      ],
+      "Stop": [
+        {
+          "id": "stop_guard",
+          "matcher": "*",
+          "description": "任务结束前检查 stop_hooks 条件，未满足则返回继续指令",
+          "source": "builtin"
+        }
+      ],
+      "SessionStart": [
+        {
+          "id": "session_init",
+          "matcher": "*",
+          "description": "会话启动时加载上下文与注册动态规则",
+          "source": "builtin"
+        }
+      ]
+    }
+  },
+  "sandbox": {
+    "default_profile": "workspace",
+    "profiles": {
+      "workspace": {
+        "description": "仅允许 .zero_apex/ 工作目录写文件，其他路径需显式 allow",
+        "writable_paths": [".zero_apex/**", ".trash/**"],
+        "readable_paths": ["*"],
+        "executable_commands": ["*"],
+        "deny_paths": ["/proc/**", "/sys/**", "/dev/**", "/etc/shadow", "/etc/passwd"]
+      },
+      "read-only": {
+        "description": "默认禁止一切写操作，所有写都需 manifest 显式 allow",
+        "writable_paths": [],
+        "readable_paths": ["*"],
+        "executable_commands": ["ls", "cat", "pwd", "date", "whoami", "hostname", "uptime", "ps", "head", "tail", "wc", "sort", "uniq", "tr", "cut", "grep", "rg", "git status", "git branch", "git log", "git diff", "git show", "git rev-parse", "kubectl get", "kubectl logs", "kubectl describe", "cargo check"],
+        "deny_paths": ["**"]
+      },
+      "strict": {
+        "description": "最严格：所有写、执行、网络均需 manifest 显式 allow，read-only 命令集 + 路径白名单",
+        "writable_paths": [],
+        "readable_paths": [".zero_apex/**"],
+        "executable_commands": ["ls", "cat", "pwd"],
+        "deny_paths": ["**"]
+      }
+    },
+    "dangerous_commands": ["rm", "rmdir", "unlink", "shred", "chmod", "chown", "chgrp", "chattr", "pkill", "kill", "killall", "git push", "shutdown", "reboot", "poweroff", "init", "mkfs", "fdisk", "parted", "mount", "umount", "iptables", "ip6tables", "nft", "ufw", "firewall-cmd", "useradd", "userdel", "usermod", "passwd", "visudo", "chroot", "sudo", "su"]
+  },
+  "permission": {
+    "default_mode": "default",
+    "modes": {
+      "default": "未匹配规则的调用走 preflight 现有逻辑",
+      "dontAsk": "未匹配 allow 的调用一律 deny",
+      "bypassPermissions": "自动批准（deny/hook 仍生效）"
+    },
+    "rules": [
+      { "action": "deny", "tool": "*", "pattern": "Bash(rm -rf *)" },
+      { "action": "deny", "tool": "*", "pattern": "Bash(chmod 777 *)" },
+      { "action": "deny", "tool": "*", "pattern": "Bash(:(){ :|:& };:)" },
+      { "action": "deny", "tool": "read", "pattern": "/etc/shadow" },
+      { "action": "deny", "tool": "read", "pattern": "/etc/passwd" },
+      { "action": "deny", "tool": "edit", "pattern": "/proc/**" },
+      { "action": "deny", "tool": "edit", "pattern": "/sys/**" },
+      { "action": "deny", "tool": "edit", "pattern": "/dev/**" },
+      { "action": "ask", "tool": "edit", "pattern": "**/.env" },
+      { "action": "ask", "tool": "edit", "pattern": "**/*.key" },
+      { "action": "ask", "tool": "bash", "pattern": "git push *" },
+      { "action": "ask", "tool": "bash", "pattern": "npm publish *" },
+      { "action": "allow", "tool": "read", "pattern": ".zero_apex/**" },
+      { "action": "allow", "tool": "edit", "pattern": ".zero_apex/**" },
+      { "action": "allow", "tool": "bash", "pattern": "Bash(ls *)" },
+      { "action": "allow", "tool": "bash", "pattern": "Bash(cat *)" },
+      { "action": "allow", "tool": "bash", "pattern": "Bash(git status)" },
+      { "action": "allow", "tool": "bash", "pattern": "Bash(git log *)" },
+      { "action": "allow", "tool": "bash", "pattern": "Bash(git diff *)" }
+    ]
+  },
+  "stop_hooks": {
+    "enabled": true,
+    "conditions": [
+      {
+        "id": "all_tools_completed",
+        "description": "所有入队任务必须完成或显式取消，否则禁止 agent 提前结束",
+        "check": "ledger.pendingCount() === 0"
+      },
+      {
+        "id": "no_active_block",
+        "description": "当前不存在未过期的 preflight BLOCK",
+        "check": "enforcer.snapshot().length === 0"
+      },
+      {
+        "id": "audit_flushed",
+        "description": "审计日志缓冲已 flush",
+        "check": "audit.snapshot().length === 0"
+      }
+    ]
   }
 }

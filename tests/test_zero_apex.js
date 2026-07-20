@@ -6,7 +6,22 @@
  */
 
 const path = require("path");
+const fs = require("fs");
 const m = require(path.join(__dirname, "..", "engine", "zero_apex.js"));
+
+// Load real manifest.json so ManifestLoader picks up hooks/sandbox/permission
+// configs instead of falling back to the builtin minimal manifest.
+// NOTE: Operit sandbox Files.read is synchronous; mock matches that contract.
+const manifestContent = fs.readFileSync(
+  path.join(__dirname, "..", "manifest.json"),
+  "utf8"
+);
+const manifestFilesMock = {
+  exists: () => ({ exists: true }),
+  read: (p) => (p === "manifest.json" ? { content: manifestContent } : { content: "" }),
+  write: () => ({ successful: true }),
+  listFiles: () => ({ entries: [] }),
+};
 
 let failures = 0;
 function assert(cond, msg) {
@@ -229,11 +244,235 @@ async function runGuardTests() {
   console.log("[guard-test] all guard assertions done, failures=%d", failures);
 }
 
+async function runShellGuardTests() {
+  const sg = m.ZeroApex._infra.ShellGuard;
+
+  // D: read-only command whitelist
+  assert(sg.isReadOnly("ls -la /sdcard"), "ShellGuard ls is read-only");
+  assert(sg.isReadOnly("cat /etc/hosts"), "ShellGuard cat is read-only");
+  assert(sg.isReadOnly("git status"), "ShellGuard git status read-only");
+  assert(sg.isReadOnly("git log --oneline -5"), "ShellGuard git log read-only");
+  assert(!sg.isReadOnly("rm -rf /tmp"), "ShellGuard rm not read-only");
+  assert(!sg.isReadOnly("npm install"), "ShellGuard npm not read-only");
+
+  // Wrapper peeling
+  assert(sg.peelWrapper("timeout 10 ls").indexOf("ls") === 0, "ShellGuard peels timeout");
+  assert(sg.peelWrapper("nice -n 5 cat /etc/hosts").indexOf("cat") === 0, "ShellGuard peels nice");
+  assert(sg.peelWrapper("env FOO=bar ls -la").indexOf("ls") === 0, "ShellGuard peels env prefix");
+
+  // Chain splitting
+  const segs = sg.splitChain("ls -la && rm -rf /tmp; cat /etc/hosts");
+  assert(segs.length === 3, "ShellGuard splits 3 segments");
+  assert(sg.isReadOnly(segs[0].trim()), "ShellGuard segment 0 read-only");
+  assert(sg.isDangerous(segs[1].trim()), "ShellGuard segment 1 dangerous");
+
+  // E: dangerous command escalation
+  const d1 = sg.analyze("rm -rf /home/user");
+  assert(d1.verdict === "ASK", "ShellGuard rm -> ASK");
+  assert(d1.dangerous_hits.length > 0, "ShellGuard rm dangerous hit");
+  assert(d1.dangerous_hits[0].primary === "rm", "ShellGuard rm primary");
+
+  const d2 = sg.analyze("chmod 777 /etc");
+  assert(d2.verdict === "ASK", "ShellGuard chmod -> ASK");
+
+  const d3 = sg.analyze("git push origin master");
+  assert(d3.verdict === "ASK", "ShellGuard git push -> ASK");
+
+  const d4 = sg.analyze("ls -la && cat /etc/hosts");
+  assert(d4.verdict === "ALLOW", "ShellGuard read-only chain ALLOW");
+  assert(d4.all_read_only, "ShellGuard chain all read-only");
+
+  const d5 = sg.analyze("ls && rm -rf /tmp");
+  assert(d5.verdict === "ASK", "ShellGuard mixed chain ASK");
+  assert(!d5.all_read_only, "ShellGuard mixed chain not all read-only");
+
+  // Unsafe tokens
+  const u1 = sg.analyze("ls $(rm -rf /)");
+  assert(u1.unsafe_token === "$(", "ShellGuard detects $( substitution");
+  assert(u1.verdict === "ASK", "ShellGuard unsafe token -> ASK");
+
+  console.log("[shellguard-test] all assertions done, failures=%d", failures);
+}
+
+async function runSandboxTests() {
+  const inst = m.create({ Files: manifestFilesMock });
+  const sb = inst.sandbox;
+
+  // B: workspace default profile
+  assert(sb.getDefaultProfile() === "workspace", "Sandbox default workspace");
+
+  // workspace: .zero_apex/ writable
+  const w1 = sb.checkPath(".zero_apex/test.json", "write", "workspace");
+  assert(w1.allowed, "Sandbox workspace allows .zero_apex/ write");
+
+  // workspace: /etc/shadow denied
+  const w2 = sb.checkPath("/etc/shadow", "write", "workspace");
+  assert(!w2.allowed, "Sandbox workspace denies /etc/shadow");
+
+  // workspace: /proc/ denied
+  const w3 = sb.checkPath("/proc/self/environ", "read", "workspace");
+  assert(!w3.allowed, "Sandbox workspace denies /proc/");
+
+  // workspace: /tmp/random.txt denied (not in writable_paths)
+  const w4 = sb.checkPath("/tmp/random.txt", "write", "workspace");
+  assert(!w4.allowed, "Sandbox workspace denies /tmp/ write");
+
+  // read-only profile: all writes denied
+  const r1 = sb.checkPath(".zero_apex/test.json", "write", "read-only");
+  assert(!r1.allowed, "Sandbox read-only denies .zero_apex/ write");
+
+  // read-only profile: read-only commands allowed
+  const r2 = sb.checkCommand("ls -la", "read-only");
+  assert(r2.allowed, "Sandbox read-only allows ls");
+
+  // read-only profile: rm denied
+  const r3 = sb.checkCommand("rm -rf /tmp", "read-only");
+  assert(!r3.allowed, "Sandbox read-only denies rm");
+
+  // strict profile: only ls/cat/pwd allowed
+  const s1 = sb.checkCommand("ls", "strict");
+  assert(s1.allowed, "Sandbox strict allows ls");
+  const s2 = sb.checkCommand("git status", "strict");
+  assert(!s2.allowed, "Sandbox strict denies git status");
+
+  // Glob matching
+  assert(sb.matchGlob(".zero_apex/**", ".zero_apex/sub/file.json"), "Sandbox glob ** matches nested");
+  assert(!sb.matchGlob(".zero_apex/*", ".zero_apex/sub/file.json"), "Sandbox glob * no cross-slash");
+  assert(sb.matchGlob("*", "anything"), "Sandbox glob * matches all");
+
+  console.log("[sandbox-test] all assertions done, failures=%d", failures);
+}
+
+async function runPermissionTests() {
+  const inst = m.create({ Files: manifestFilesMock });
+  const pm = inst.permissions;
+
+  // C: default mode (manifest declares default)
+  assert(pm.getDefaultMode() === "default", "Permission default mode");
+
+  // deny rule: Bash(rm -rf *)
+  const d1 = pm.evaluate("bash", { command: "rm -rf /home" });
+  assert(d1.verdict === "DENY", "Permission deny rm -rf");
+
+  // deny rule: Bash(chmod 777 *)
+  const d2 = pm.evaluate("bash", { command: "chmod 777 /etc" });
+  assert(d2.verdict === "DENY", "Permission deny chmod 777");
+
+  // deny rule: Read /etc/shadow
+  const d3 = pm.evaluate("read", { path: "/etc/shadow" });
+  assert(d3.verdict === "DENY", "Permission deny read /etc/shadow");
+
+  // deny rule: Edit /proc/**
+  const d4 = pm.evaluate("edit", { path: "/proc/self/environ" });
+  assert(d4.verdict === "DENY", "Permission deny edit /proc/");
+
+  // ask rule: Edit **/.env
+  const a1 = pm.evaluate("edit", { path: "config/.env" });
+  assert(a1.verdict === "ASK", "Permission ask edit .env");
+
+  // ask rule: Bash git push *
+  const a2 = pm.evaluate("bash", { command: "git push origin master" });
+  assert(a2.verdict === "ASK", "Permission ask git push");
+
+  // allow rule: Bash ls *
+  const al1 = pm.evaluate("bash", { command: "ls -la /home" });
+  assert(al1.verdict === "ALLOW", "Permission allow ls");
+
+  // allow rule: Bash git status (exact)
+  const al2 = pm.evaluate("bash", { command: "git status" });
+  assert(al2.verdict === "ALLOW", "Permission allow git status");
+
+  // unmatched in default mode -> FALLTHROUGH
+  const f1 = pm.evaluate("bash", { command: "npm install" });
+  assert(f1.verdict === "FALLTHROUGH", "Permission default fallthrough npm install");
+
+  // Pattern matching: prefix
+  const m1 = pm.matchPattern("Bash(git *)", "git log --oneline");
+  assert(m1, "Permission pattern git * matches git log");
+
+  // Pattern matching: glob with *
+  const m2 = pm.matchPattern("Bash(git commit:*)", "git commit -m hello");
+  assert(m2, "Permission pattern git commit:* matches");
+
+  console.log("[permission-test] all assertions done, failures=%d", failures);
+}
+
+async function runHookTests() {
+  const inst = m.create({ Files: manifestFilesMock });
+  const hk = inst.hooks;
+
+  // A: four phases registered
+  assert(hk.isEnabled(), "HookRegistry enabled");
+  const snap = hk.snapshot();
+  assert(snap.PreToolUse && snap.PreToolUse.length > 0, "HookRegistry PreToolUse registered");
+  assert(snap.PostToolUse && snap.PostToolUse.length > 0, "HookRegistry PostToolUse registered");
+  assert(snap.Stop && snap.Stop.length > 0, "HookRegistry Stop registered");
+  assert(snap.SessionStart && snap.SessionStart.length > 0, "HookRegistry SessionStart registered");
+
+  // PreToolUse: dangerous_cmd_guard denies rm
+  const pre1 = hk.run("PreToolUse", { tool: "file_guard", params: { command: "rm -rf /home" } });
+  assert(pre1.decision === "deny", "Hook PreToolUse denies rm -rf");
+  assert(pre1.reason.indexOf("危险命令") >= 0, "Hook PreToolUse deny reason");
+
+  // PreToolUse: safe command continues
+  const pre2 = hk.run("PreToolUse", { tool: "file_guard", params: { command: "ls -la" } });
+  assert(pre2.decision === "continue", "Hook PreToolUse continues for ls");
+
+  // PostToolUse: audit_after always continues
+  const post1 = hk.run("PostToolUse", { tool: "preflight", params: {}, result: { success: true, code: "OK" } });
+  assert(post1.decision === "continue", "Hook PostToolUse continues");
+
+  // Stop hook: with pending tasks should deny
+  inst.ledger.enqueue({ goal: "pending", priority: 1 });
+  const stop1 = hk.run("Stop", { tool: null, params: {} });
+  assert(stop1.decision === "deny", "Hook Stop denies with pending tasks");
+  assert(stop1.reason.indexOf("all_tools_completed") >= 0, "Hook Stop reason mentions all_tools_completed");
+
+  // Drain ledger, Stop should pass
+  const next = inst.ledger.next();
+  inst.ledger.complete(next.id, { ok: true });
+  // Clear enforcer + audit buffer to satisfy other conditions
+  inst.enforcer.clear();
+  inst.audit.clear();
+  const stop2 = hk.run("Stop", { tool: null, params: {} });
+  assert(stop2.decision === "continue", "Hook Stop continues when all clear");
+
+  // SessionStart: always continues
+  const ss1 = hk.run("SessionStart", { tool: null, params: {} });
+  assert(ss1.decision === "continue", "Hook SessionStart continues");
+
+  // F: checkStopConditions directly
+  inst.ledger.enqueue({ goal: "pending2", priority: 1 });
+  const cond1 = hk.checkStopConditions();
+  assert(!cond1.all_met, "StopConditions unmet with pending");
+  const next2 = inst.ledger.next();
+  inst.ledger.complete(next2.id, { ok: true });
+  const cond2 = hk.checkStopConditions();
+  assert(cond2.all_met, "StopConditions all met when drained");
+
+  // Custom hook registration
+  hk.register("PreToolUse", {
+    id: "test_custom",
+    matcher: "*",
+    description: "test",
+    handler: function () { return { decision: "deny", reason: "custom deny" }; },
+  });
+  const custom1 = hk.run("PreToolUse", { tool: "any", params: {} });
+  assert(custom1.decision === "deny", "Custom hook deny");
+  assert(custom1.reason === "custom deny", "Custom hook reason");
+
+  console.log("[hook-test] all assertions done, failures=%d", failures);
+}
+
 (async () => {
   try {
     await runSelfTest();
     await runDITests();
     await runGuardTests();
+    await runShellGuardTests();
+    await runSandboxTests();
+    await runPermissionTests();
+    await runHookTests();
     if (failures === 0) {
       console.log("\nALL TESTS PASSED");
       process.exit(0);
