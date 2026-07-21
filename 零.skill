@@ -1,11 +1,12 @@
 ---
 name: 零
-version: "2.3.0"
+version: "2.4.0"
 description: |
   首席工程师执行引擎。守护层（防幻觉/自我意识/防删代码/证据验证/输出防火墙）
   全部为可执行 JS 代码，运行在 Operit QuickJS 沙箱。记忆走 Operit 持久化记忆库，
   开源搜索走真实 GitHub API，文件快照走真实文件系统。
-  v2.3 新增：Hooks 生命周期 / Sandbox profiles / Permission rules / 危险命令清单。
+   v2.4 清理：删除 Hooks 生命周期 / Sandbox profiles / Permission rules（空转），
+   仅保留 ShellGuard→文件守卫、PermissionRules→preflight 集成、SandboxProfile→诊断工具。
 compatibility: Operit AI
 type: skill
 engine: zero_apex
@@ -20,12 +21,9 @@ references:
   - references/memory.md
   - references/snapshot.md
   - references/preflight.md
-  - references/operit_capabilities.md
-  - references/evolution.md
-  - references/hooks.md
-  - references/sandbox.md
-  - references/permissions.md
-triggers:
+   - references/operit_capabilities.md
+   - references/evolution.md
+ triggers:
   - task_type: [engineering, debugging, refactoring, build, deploy, code_review]
   - keywords: [编译, 构建, 修复, 重构, 部署, 安装, 测试, 交付, 代码审查]
   - command_risk: destructive
@@ -69,11 +67,8 @@ metadata:
 | 即将删除或覆盖文件 | 关键词"删除/覆盖/截断" | `references/snapshot.md` |
 | 工具调用失败 | 工具返回 error/permission_denied | `references/operit_capabilities.md` |
 | 批量任务完成需沉淀 | task_complete:batch | `references/evolution.md` |
-| 需要检查任务是否被阻断 | preflight:BLOCK | `enforce_block` 工具 |
-| 需要查看审计记录 | 调试/排查 | `audit_log` 工具 |
-| 工具执行前后需介入规则 | pre/post tool use | `references/hooks.md` |
-| 路径/命令需沙箱校验 | path_write/command_exec | `references/sandbox.md` |
-| 工具调用需权限评估 | before_tool_exec | `references/permissions.md` |
+ | 需要检查任务是否被阻断 | preflight:BLOCK | `enforce_block` 工具 |
+ | 需要查看审计记录 | 调试/排查 | `audit_log` 工具 |
 
 ### 不适用场景（应当降级为轻量应答，不启动本 skill）
 
@@ -84,7 +79,7 @@ metadata:
 
 遇到上述场景，跳过所有门禁，直接给出简短应答。
 
-## 工具列表（16 个可执行工具）
+## 工具列表（15 个可执行工具）
 
 引擎代码位于 `engine/zero_apex.js`，通过 `operit_editor:debug_install_js_package` 安装。工具按需调用，不必每次全部加载。
 
@@ -105,7 +100,6 @@ metadata:
 | `audit_log` | 调试 | 查看最近的工具调用审计记录 |
 | `evaluate_permission` | 权限 | 按 deny>ask>allow 评估工具调用 |
 | `check_sandbox` | 沙箱 | 按 profile 校验路径/命令 |
-| `run_hook` | 钩子 | 手动触发生命周期钩子 |
 
 ## 核心工作流
 

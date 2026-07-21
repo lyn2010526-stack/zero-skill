@@ -185,16 +185,6 @@
       "blocking": true,
       "description": "按 sandbox profile（workspace/read-only/strict）校验可写路径与可执行命令",
       "added_in": "2.3.0"
-    },
-    {
-      "name": "run_hook",
-      "layer": "钩子",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": ["pre_tool_use", "post_tool_use", "stop", "session_start"],
-      "blocking": true,
-      "description": "在工具执行前后/会话启停时运行用户配置的 JS 钩子，可 deny/audit/改写返回值",
-      "added_in": "2.3.0"
     }
   ],
   "references": [
@@ -297,36 +287,6 @@
       "triggers": ["task_complete:batch", "manual:evolve"],
       "conflicts_with": [],
       "added_in": "2.2.0"
-    },
-    {
-      "name": "hooks",
-      "path": "references/hooks.md",
-      "layer": "钩子",
-      "priority": "high",
-      "min_permission": "none",
-      "triggers": ["pre_tool_use", "post_tool_use", "stop", "session_start"],
-      "conflicts_with": [],
-      "added_in": "2.3.0"
-    },
-    {
-      "name": "sandbox",
-      "path": "references/sandbox.md",
-      "layer": "沙箱",
-      "priority": "critical",
-      "min_permission": "none",
-      "triggers": ["path_write", "command_exec"],
-      "conflicts_with": [],
-      "added_in": "2.3.0"
-    },
-    {
-      "name": "permissions",
-      "path": "references/permissions.md",
-      "layer": "权限",
-      "priority": "critical",
-      "min_permission": "none",
-      "triggers": ["before_tool_exec"],
-      "conflicts_with": [],
-      "added_in": "2.3.0"
     }
   ],
   "deactivates_on": [
@@ -352,46 +312,6 @@
     "enabled": true,
     "log_path": ".zero_apex/audit_log.jsonl",
     "fields": ["timestamp", "tool", "task_id", "trigger", "duration_ms", "result_code", "result_summary"]
-  },
-  "hooks": {
-    "enabled": true,
-    "lifecycle": ["PreToolUse", "PostToolUse", "Stop", "SessionStart"],
-    "timeout_ms": 5,
-    "fail_open": true,
-    "registry": {
-      "PreToolUse": [
-        {
-          "id": "dangerous_cmd_guard",
-          "matcher": "*",
-          "description": "命中危险命令清单（rm/chmod/kill 等）时升级到 deny",
-          "source": "builtin"
-        }
-      ],
-      "PostToolUse": [
-        {
-          "id": "audit_after",
-          "matcher": "*",
-          "description": "工具执行后写审计日志",
-          "source": "builtin"
-        }
-      ],
-      "Stop": [
-        {
-          "id": "stop_guard",
-          "matcher": "*",
-          "description": "任务结束前检查 stop_hooks 条件，未满足则返回继续指令",
-          "source": "builtin"
-        }
-      ],
-      "SessionStart": [
-        {
-          "id": "session_init",
-          "matcher": "*",
-          "description": "会话启动时加载上下文与注册动态规则",
-          "source": "builtin"
-        }
-      ]
-    }
   },
   "sandbox": {
     "default_profile": "workspace",
@@ -447,26 +367,6 @@
       { "action": "allow", "tool": "bash", "pattern": "Bash(git status)" },
       { "action": "allow", "tool": "bash", "pattern": "Bash(git log *)" },
       { "action": "allow", "tool": "bash", "pattern": "Bash(git diff *)" }
-    ]
-  },
-  "stop_hooks": {
-    "enabled": true,
-    "conditions": [
-      {
-        "id": "all_tools_completed",
-        "description": "所有入队任务必须完成或显式取消，否则禁止 agent 提前结束",
-        "check": "ledger.pendingCount() === 0"
-      },
-      {
-        "id": "no_active_block",
-        "description": "当前不存在未过期的 preflight BLOCK",
-        "check": "enforcer.snapshot().length === 0"
-      },
-      {
-        "id": "audit_flushed",
-        "description": "审计日志缓冲已 flush",
-        "check": "audit.snapshot().length === 0"
-      }
     ]
   }
 }

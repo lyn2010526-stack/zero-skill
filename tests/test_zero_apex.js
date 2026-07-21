@@ -9,7 +9,7 @@ const path = require("path");
 const fs = require("fs");
 const m = require(path.join(__dirname, "..", "engine", "zero_apex.js"));
 
-// Load real manifest.json so ManifestLoader picks up hooks/sandbox/permission
+// Load real manifest.json so ManifestLoader picks up sandbox/permission
 // configs instead of falling back to the builtin minimal manifest.
 // NOTE: Operit sandbox Files.read is synchronous; mock matches that contract.
 const manifestContent = fs.readFileSync(
@@ -397,72 +397,6 @@ async function runPermissionTests() {
   console.log("[permission-test] all assertions done, failures=%d", failures);
 }
 
-async function runHookTests() {
-  const inst = m.create({ Files: manifestFilesMock });
-  const hk = inst.hooks;
-
-  // A: four phases registered
-  assert(hk.isEnabled(), "HookRegistry enabled");
-  const snap = hk.snapshot();
-  assert(snap.PreToolUse && snap.PreToolUse.length > 0, "HookRegistry PreToolUse registered");
-  assert(snap.PostToolUse && snap.PostToolUse.length > 0, "HookRegistry PostToolUse registered");
-  assert(snap.Stop && snap.Stop.length > 0, "HookRegistry Stop registered");
-  assert(snap.SessionStart && snap.SessionStart.length > 0, "HookRegistry SessionStart registered");
-
-  // PreToolUse: dangerous_cmd_guard denies rm
-  const pre1 = hk.run("PreToolUse", { tool: "file_guard", params: { command: "rm -rf /home" } });
-  assert(pre1.decision === "deny", "Hook PreToolUse denies rm -rf");
-  assert(pre1.reason.indexOf("危险命令") >= 0, "Hook PreToolUse deny reason");
-
-  // PreToolUse: safe command continues
-  const pre2 = hk.run("PreToolUse", { tool: "file_guard", params: { command: "ls -la" } });
-  assert(pre2.decision === "continue", "Hook PreToolUse continues for ls");
-
-  // PostToolUse: audit_after always continues
-  const post1 = hk.run("PostToolUse", { tool: "preflight", params: {}, result: { success: true, code: "OK" } });
-  assert(post1.decision === "continue", "Hook PostToolUse continues");
-
-  // Stop hook: with pending tasks should deny
-  inst.ledger.enqueue({ goal: "pending", priority: 1 });
-  const stop1 = hk.run("Stop", { tool: null, params: {} });
-  assert(stop1.decision === "deny", "Hook Stop denies with pending tasks");
-  assert(stop1.reason.indexOf("all_tools_completed") >= 0, "Hook Stop reason mentions all_tools_completed");
-
-  // Drain ledger, Stop should pass
-  const next = inst.ledger.next();
-  inst.ledger.complete(next.id, { ok: true });
-  // Clear enforcer + audit buffer to satisfy other conditions
-  inst.enforcer.clear();
-  inst.audit.clear();
-  const stop2 = hk.run("Stop", { tool: null, params: {} });
-  assert(stop2.decision === "continue", "Hook Stop continues when all clear");
-
-  // SessionStart: always continues
-  const ss1 = hk.run("SessionStart", { tool: null, params: {} });
-  assert(ss1.decision === "continue", "Hook SessionStart continues");
-
-  // F: checkStopConditions directly
-  inst.ledger.enqueue({ goal: "pending2", priority: 1 });
-  const cond1 = hk.checkStopConditions();
-  assert(!cond1.all_met, "StopConditions unmet with pending");
-  const next2 = inst.ledger.next();
-  inst.ledger.complete(next2.id, { ok: true });
-  const cond2 = hk.checkStopConditions();
-  assert(cond2.all_met, "StopConditions all met when drained");
-
-  // Custom hook registration
-  hk.register("PreToolUse", {
-    id: "test_custom",
-    matcher: "*",
-    description: "test",
-    handler: function () { return { decision: "deny", reason: "custom deny" }; },
-  });
-  const custom1 = hk.run("PreToolUse", { tool: "any", params: {} });
-  assert(custom1.decision === "deny", "Custom hook deny");
-  assert(custom1.reason === "custom deny", "Custom hook reason");
-
-  console.log("[hook-test] all assertions done, failures=%d", failures);
-}
 
 (async () => {
   try {
@@ -472,7 +406,6 @@ async function runHookTests() {
     await runShellGuardTests();
     await runSandboxTests();
     await runPermissionTests();
-    await runHookTests();
     if (failures === 0) {
       console.log("\nALL TESTS PASSED");
       process.exit(0);

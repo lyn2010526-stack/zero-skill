@@ -163,7 +163,7 @@
 //   §21e ShellGuard (D+E)              (lines ~1918)  [2.3.0]
 //   §21f SandboxProfile (B)            (lines ~2094)  [2.3.0]
 //   §21g PermissionRules (C)           (lines ~2227)  [2.3.0]
-//   §21h HookRegistry (A, four-phase)  (lines ~2387)  [2.3.0]
+//   §21e ShellGuard   §21f SandboxProfile   §21g PermissionRules   [2.3.0]
 //   §22 create() factory + tool layer  (lines ~2587)
 //   §23 Self-test (main)               (lines ~2905)
 //
@@ -720,7 +720,52 @@ const ZeroApex = (function () {
                 }
             }
 
-            return buildRiskResult(isDelete, requiresConfirmation, hits, pathRisks);
+            // §21e ShellGuard enhancement: dangerous command + read-only chain
+            var sg = ShellGuard.analyze(cmd);
+            var sgReasons = [];
+            if (sg.dangerous_hits && sg.dangerous_hits.length > 0) {
+                for (var di = 0; di < sg.dangerous_hits.length; di++) {
+                    var dhit = sg.dangerous_hits[di];
+                    var prim = dhit.primary || "";
+                    hits.push({
+                        pattern: "dangerous:" + prim,
+                        desc: "危险命令: " + prim + " [" + dhit.segment + "]",
+                        soft: false,
+                    });
+                    if (prim === "rm" || prim === "rmdir" || prim === "unlink" || prim === "shred") {
+                        isDelete = true;
+                    }
+                }
+                requiresConfirmation = true;
+                sgReasons = sg.reasons.slice();
+            } else if (sg.unsafe_token) {
+                hits.push({
+                    pattern: "unsafe_token:" + sg.unsafe_token,
+                    desc: "含不可检查的 shell 构造: " + sg.unsafe_token,
+                    soft: false,
+                });
+                requiresConfirmation = true;
+                sgReasons.push("含不可检查的 shell 构造: " + sg.unsafe_token);
+            }
+            // Pure read-only chain with no other risk: downgrade to LOW/no-confirm
+            var noOtherRisk = hits.length === 0 && pathRisks.length === 0;
+            if (sg.all_read_only && noOtherRisk) {
+                requiresConfirmation = false;
+            }
+
+            var result = buildRiskResult(isDelete, requiresConfirmation, hits, pathRisks);
+            for (var sr = 0; sr < sgReasons.length; sr++) {
+                if (result.reasons.indexOf(sgReasons[sr]) < 0) {
+                    result.reasons.push(sgReasons[sr]);
+                }
+            }
+            // Bump level if dangerous hits present
+            if (sg.dangerous_hits && sg.dangerous_hits.length > 0) {
+                if (result.risk_level === "LOW" || result.risk_level === "MEDIUM") {
+                    result.risk_level = isDelete ? "CRITICAL" : "HIGH";
+                }
+            }
+            return result;
         }
 
         function scanScript(content) {
@@ -1532,6 +1577,16 @@ const ZeroApex = (function () {
                 allowed = false;
                 requiresConfirmation = true;
                 for (var r = 0; r < risk.reasons.length; r++) reasons.push(risk.reasons[r]);
+            }
+        }
+
+        // §21g PermissionRules: deny rule as BLOCK reason
+        if (command && deps && deps.permissions) {
+            var perm = deps.permissions.evaluate("bash", { command: command });
+            if (perm.verdict === "DENY") {
+                gates.push("permission");
+                allowed = false;
+                reasons.push("权限拒绝: " + perm.reason);
             }
         }
 
@@ -2383,205 +2438,6 @@ const ZeroApex = (function () {
         };
     }
 
-    // ======================================================================
-    // §21h HookRegistry — four lifecycle hooks (PreToolUse/PostToolUse/
-    // Stop/SessionStart). Borrowed from Grok grok-build hooks.
-    // Each hook can return { decision: "deny"|"allow"|"continue", reason,
-    // mutated_result? }. fail_open default true: hook crash = allow.
-    // ======================================================================
-    function HookRegistry(deps) {
-        deps = deps || {};
-        var manifest = deps.manifest || null;
-        var audit = deps.audit || null;
-        var enforcer = deps.enforcer || null;
-        var ledger = deps.ledger || null;
-
-        var hooks = {
-            PreToolUse: [],
-            PostToolUse: [],
-            Stop: [],
-            SessionStart: [],
-        };
-        var enabled = true;
-        var timeoutMs = 5;
-        var failOpen = true;
-
-        function loadFromManifest() {
-            var m = manifest ? manifest.load() : null;
-            if (!m || !m.hooks || !m.hooks.enabled) {
-                enabled = false;
-                return;
-            }
-            enabled = true;
-            timeoutMs = m.hooks.timeout_ms || 5;
-            failOpen = m.hooks.fail_open !== false;
-            var reg = m.hooks.registry || {};
-            var phases = ["PreToolUse", "PostToolUse", "Stop", "SessionStart"];
-            for (var i = 0; i < phases.length; i++) {
-                var phase = phases[i];
-                hooks[phase] = [];
-                var entries = reg[phase] || [];
-                for (var j = 0; j < entries.length; j++) {
-                    var e = entries[j];
-                    hooks[phase].push({
-                        id: e.id,
-                        matcher: e.matcher || "*",
-                        description: e.description,
-                        source: e.source || "manifest",
-                        handler: builtinHandler(e.id, phase),
-                    });
-                }
-            }
-        }
-
-        function builtinHandler(id, phase) {
-            if (id === "dangerous_cmd_guard") {
-                return function (ctx) {
-                    var cmd = (ctx && ctx.params && ctx.params.command) || "";
-                    if (!cmd) return { decision: "continue" };
-                    var sg = ShellGuard.analyze(cmd);
-                    if (sg.verdict === "ASK" && sg.dangerous_hits.length > 0) {
-                        return { decision: "deny", reason: "危险命令被 Hook 拦截: " + sg.dangerous_hits[0].primary };
-                    }
-                    return { decision: "continue" };
-                };
-            }
-            if (id === "audit_after") {
-                return function (ctx) {
-                    if (audit && ctx && ctx.result) {
-                        audit.append({
-                            tool: ctx.tool,
-                            task_id: ctx.task_id,
-                            trigger: "post_tool_use",
-                            duration_ms: ctx.duration_ms || 0,
-                            result_code: (ctx.result && ctx.result.code) || (ctx.result && ctx.result.success ? "OK" : "UNKNOWN"),
-                            result_summary: ctx.result ? safeStr(ctx.result.error || ctx.result.state || (ctx.result.success ? "success" : "fail")) : null,
-                        });
-                        audit.flush();
-                    }
-                    return { decision: "continue" };
-                };
-            }
-            if (id === "stop_guard") {
-                return function (ctx) {
-                    var stopResult = checkStopConditions();
-                    if (!stopResult.all_met) {
-                        return { decision: "deny", reason: "Stop hook 守护未满足: " + stopResult.unmet.join(", "), mutated_result: stopResult };
-                    }
-                    return { decision: "continue" };
-                };
-            }
-            if (id === "session_init") {
-                return function (ctx) {
-                    return { decision: "continue" };
-                };
-            }
-            return function () { return { decision: "continue" }; };
-        }
-
-        function checkStopConditions() {
-            var m = manifest ? manifest.load() : null;
-            var conditions = (m && m.stop_hooks && m.stop_hooks.conditions) || [];
-            var unmet = [];
-            var met = [];
-            for (var i = 0; i < conditions.length; i++) {
-                var c = conditions[i];
-                var passed = false;
-                try {
-                    if (c.id === "all_tools_completed" && ledger) {
-                        passed = ledger.pendingCount() === 0;
-                    } else if (c.id === "no_active_block" && enforcer) {
-                        passed = enforcer.snapshot().length === 0;
-                    } else if (c.id === "audit_flushed" && audit) {
-                        passed = audit.snapshot().length === 0;
-                    } else {
-                        passed = true;
-                    }
-                } catch (e) {
-                    passed = failOpen;
-                }
-                if (passed) met.push(c.id);
-                else unmet.push(c.id);
-            }
-            return { all_met: unmet.length === 0, met: met, unmet: unmet };
-        }
-
-        function matchHook(hook, toolName) {
-            if (!hook.matcher || hook.matcher === "*") return true;
-            if (!toolName) return false;
-            return hook.matcher.toLowerCase() === toolName.toLowerCase();
-        }
-
-        function run(phase, ctx) {
-            if (!enabled) return { decision: "continue" };
-            var list = hooks[phase] || [];
-            var decisions = [];
-            var finalDecision = "continue";
-            var denyReason = null;
-            var mutatedResult = null;
-
-            for (var i = 0; i < list.length; i++) {
-                var h = list[i];
-                if (!matchHook(h, ctx && ctx.tool)) continue;
-                var hookResult;
-                try {
-                    hookResult = h.handler(ctx) || { decision: "continue" };
-                } catch (e) {
-                    if (failOpen) {
-                        hookResult = { decision: "continue", error: String(e && e.message || e) };
-                    } else {
-                        return { decision: "deny", reason: "Hook " + h.id + " crashed: " + String(e && e.message || e) };
-                    }
-                }
-                decisions.push({ hook_id: h.id, decision: hookResult.decision });
-                if (hookResult.decision === "deny" && finalDecision !== "deny") {
-                    finalDecision = "deny";
-                    denyReason = hookResult.reason || ("Hook " + h.id + " denied");
-                }
-                if (hookResult.mutated_result) {
-                    mutatedResult = hookResult.mutated_result;
-                }
-            }
-
-            var out = { decision: finalDecision, decisions: decisions };
-            if (denyReason) out.reason = denyReason;
-            if (mutatedResult) out.mutated_result = mutatedResult;
-            return out;
-        }
-
-        function register(phase, hook) {
-            if (!hooks[phase]) hooks[phase] = [];
-            hooks[phase].push({
-                id: hook.id,
-                matcher: hook.matcher || "*",
-                description: hook.description,
-                source: hook.source || "runtime",
-                handler: hook.handler,
-            });
-        }
-
-        function snapshot() {
-            var out = {};
-            for (var phase in hooks) {
-                if (!hooks.hasOwnProperty(phase)) continue;
-                out[phase] = hooks[phase].map(function (h) {
-                    return { id: h.id, matcher: h.matcher, source: h.source };
-                });
-            }
-            return out;
-        }
-
-        loadFromManifest();
-
-        return {
-            run: run,
-            register: register,
-            snapshot: snapshot,
-            checkStopConditions: checkStopConditions,
-            loadFromManifest: loadFromManifest,
-            isEnabled: function () { return enabled; },
-        };
-    }
 
     // ======================================================================
     // §22 Module factory — instantiate modules with injected dependencies
@@ -2596,19 +2452,12 @@ const ZeroApex = (function () {
         var audit = new AuditLogger({ Files: deps.Files });
         var enforcer = new BlockEnforcer();
         var manifest = new ManifestLoader({ Files: deps.Files });
-        // §21e-h new modules
+        // §21e-g: ShellGuard is module-static; SandboxProfile + PermissionRules
         var sandbox = new SandboxProfile({ manifest: manifest });
         var permissions = new PermissionRules({ manifest: manifest });
-        // §21h HookRegistry depends on manifest/audit/enforcer/ledger
-        var hooks = new HookRegistry({
-            manifest: manifest,
-            audit: audit,
-            enforcer: enforcer,
-            ledger: ledger,
-        });
 
         function preflight(goal, command, evidence, filesRead) {
-            var result = preflightGate({ ledger: ledger }, goal, command, evidence, filesRead);
+            var result = preflightGate({ ledger: ledger, permissions: permissions }, goal, command, evidence, filesRead);
             // #5: if preflight blocks, register hard block on task_id
             if (!result.allowed && result.task_id) {
                 enforcer.block(result.task_id, result.state + ": " + (result.reasons || []).join("; "));
@@ -2666,7 +2515,6 @@ const ZeroApex = (function () {
             manifest: manifest,
             sandbox: sandbox,
             permissions: permissions,
-            hooks: hooks,
             checkBlock: checkBlock,
             checkToolAllowed: checkToolAllowed,
             // Infrastructure exposed for testing / extension
@@ -2688,7 +2536,6 @@ const ZeroApex = (function () {
                 ShellGuard: ShellGuard,
                 SandboxProfile: SandboxProfile,
                 PermissionRules: PermissionRules,
-                HookRegistry: HookRegistry,
             },
         };
     }
@@ -2716,7 +2563,6 @@ const ZeroApex = (function () {
     var defaultManifest = defaultInstance.manifest;
     var defaultSandbox = defaultInstance.sandbox;
     var defaultPermissions = defaultInstance.permissions;
-    var defaultHooks = defaultInstance.hooks;
 
     return {
         // Re-export modules for direct internal access (backward compat)
@@ -2884,31 +2730,8 @@ async function check_sandbox(params) {
     };
 }
 
-// §21h tool: run_hook — manually trigger a lifecycle hook phase
-async function run_hook(params) {
-    var phase = params.phase || "PreToolUse";
-    if (!defaultHooks) {
-        return { success: false, code: "E5002_DEPENDENCY_MISSING", error: "HookRegistry 未初始化" };
-    }
-    var result = defaultHooks.run(phase, {
-        tool: params.tool || null,
-        params: params.tool_params || {},
-        task_id: params.task_id || null,
-        result: params.result || null,
-    });
-    return {
-        success: true,
-        code: "OK",
-        phase: phase,
-        decision: result.decision,
-        decisions: result.decisions || [],
-        reason: result.reason || null,
-        enabled: defaultHooks.isEnabled(),
-    };
-}
-
 // Unified wrapper: catch exceptions, complete, audit, enforce block (#2, #5, #8)
-// + PreToolUse hook + PermissionRules + SandboxProfile (2.3.0) + PostToolUse hook
+// + ShellGuard (2.3.0) inline dangerous-cmd guard + PermissionRules + SandboxProfile
 async function wrapToolExecution(func, params, toolName) {
     var startTs = Date.now();
     var p = params || {};
@@ -2952,33 +2775,6 @@ async function wrapToolExecution(func, params, toolName) {
             defaultAudit.flush();
             complete(curtResult);
             return;
-        }
-        // §21h PreToolUse hook (2.3.0): may deny before execution
-        if (defaultHooks && defaultHooks.isEnabled()) {
-            var preHook = defaultHooks.run("PreToolUse", {
-                tool: toolName,
-                params: p,
-                task_id: taskId,
-            });
-            if (preHook.decision === "deny") {
-                var hookDenyResult = {
-                    success: false,
-                    code: "E4001_GUARD_BLOCK",
-                    error: "PreToolUse Hook 拒绝: " + (preHook.reason || "未提供原因"),
-                    blocked_by: "hook:PreToolUse",
-                };
-                defaultAudit.append({
-                    tool: toolName || "unknown",
-                    task_id: taskId,
-                    trigger: "hook_deny",
-                    duration_ms: Date.now() - startTs,
-                    result_code: "E4001_GUARD_BLOCK",
-                    result_summary: preHook.reason || "PreToolUse deny",
-                });
-                defaultAudit.flush();
-                complete(hookDenyResult);
-                return;
-            }
         }
         // §21g PermissionRules (2.3.0): deny > ask > allow evaluation
         if (defaultPermissions) {
@@ -3057,19 +2853,6 @@ async function wrapToolExecution(func, params, toolName) {
             }
         }
         var result = await func(p);
-        // §21h PostToolUse hook (2.3.0): may audit or mutate result
-        if (defaultHooks && defaultHooks.isEnabled()) {
-            var postHook = defaultHooks.run("PostToolUse", {
-                tool: toolName,
-                params: p,
-                task_id: taskId,
-                result: result,
-                duration_ms: Date.now() - startTs,
-            });
-            if (postHook.mutated_result) {
-                result = postHook.mutated_result;
-            }
-        }
         // #8: audit successful call
         defaultAudit.append({
             tool: toolName || "unknown",
@@ -3249,7 +3032,6 @@ exports.enforce_block = function (params) { return wrapToolExecution(enforce_blo
 exports.audit_log = function (params) { return wrapToolExecution(audit_log, params, "audit_log"); };
 exports.evaluate_permission = function (params) { return wrapToolExecution(evaluate_permission, params, "evaluate_permission"); };
 exports.check_sandbox = function (params) { return wrapToolExecution(check_sandbox, params, "check_sandbox"); };
-exports.run_hook = function (params) { return wrapToolExecution(run_hook, params, "run_hook"); };
 exports.main = main;
 exports.create = ZeroApex.create;
 exports._infra = ZeroApex._infra;
