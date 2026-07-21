@@ -2524,8 +2524,149 @@ const ZeroApex = (function () {
     var defaultSandbox = defaultInstance.sandbox;
     var defaultPermissions = defaultInstance.permissions;
 
+    function complete(taskId, result) {
+        if (taskId && defaultInstance.ledger) {
+            try { defaultInstance.ledger.complete(taskId, result); } catch (e) {}
+        }
+    }
+
+    async function wrapToolExecution(func, params, toolName) {
+        var startTs = Date.now();
+        var p = params || {};
+        var taskId = p.task_id || null;
+        try {
+            if (taskId && defaultEnforcer.isBlocked(taskId)) {
+                var blockResult = {
+                    success: false,
+                    code: "E4001_GUARD_BLOCK",
+                    error: "任务 " + taskId + " 已被 preflight 硬阻断，后续工具调用被拒绝",
+                    blocked_by: "enforce_block",
+                };
+                defaultAudit.append({ tool: toolName || "unknown", task_id: taskId, trigger: "blocked", duration_ms: Date.now() - startTs, result_code: "E4001_GUARD_BLOCK", result_summary: "enforce_block rejected" });
+                defaultAudit.flush();
+                complete(taskId, blockResult);
+                return blockResult;
+            }
+            if (toolName && defaultManifest && !defaultManifest.isToolAllowed(toolName, defaultDeps)) {
+                var curtResult = {
+                    success: false,
+                    code: "E5002_DEPENDENCY_MISSING",
+                    error: "工具 " + toolName + " 在当前环境权限下不可用（被 manifest 裁剪）",
+                };
+                defaultAudit.append({ tool: toolName, task_id: taskId, trigger: "curtailed", duration_ms: Date.now() - startTs, result_code: "E5002_DEPENDENCY_MISSING", result_summary: "env curtail rejected" });
+                defaultAudit.flush();
+                complete(taskId, curtResult);
+                return curtResult;
+            }
+            if (defaultPermissions) {
+                var perm = defaultPermissions.evaluate(toolName, p);
+                if (perm.verdict === "DENY") {
+                    var permDenyResult = { success: false, code: "E4001_GUARD_BLOCK", error: "Permission 规则拒绝: " + perm.reason, blocked_by: "permission:deny" };
+                    defaultAudit.append({ tool: toolName || "unknown", task_id: taskId, trigger: "permission_deny", duration_ms: Date.now() - startTs, result_code: "E4001_GUARD_BLOCK", result_summary: perm.reason });
+                    defaultAudit.flush();
+                    complete(taskId, permDenyResult);
+                    return permDenyResult;
+                }
+                if (perm.verdict === "ASK") {
+                    var askResult = { success: false, code: "E4001_GUARD_BLOCK", error: "Permission 规则要求确认: " + perm.reason + "（无交互式 UI，按 deny 处理）", blocked_by: "permission:ask" };
+                    defaultAudit.append({ tool: toolName || "unknown", task_id: taskId, trigger: "permission_ask", duration_ms: Date.now() - startTs, result_code: "E4001_GUARD_BLOCK", result_summary: perm.reason });
+                    defaultAudit.flush();
+                    complete(taskId, askResult);
+                    return askResult;
+                }
+            }
+            if (defaultSandbox) {
+                var sandboxParams = null;
+                if (p.command) {
+                    sandboxParams = { command: p.command };
+                } else if (p.path) {
+                    sandboxParams = { path: p.path, action: "write" };
+                } else if (p.file_path) {
+                    sandboxParams = { path: p.file_path, action: "write" };
+                }
+                if (sandboxParams) {
+                    var sandboxResult = defaultSandbox.check(sandboxParams);
+                    if (!sandboxResult.allowed) {
+                        var sbDenyResult = { success: false, code: "E4001_GUARD_BLOCK", error: "Sandbox 拒绝: " + sandboxResult.reason, blocked_by: "sandbox:" + (sandboxParams.command ? "command" : "path") };
+                        defaultAudit.append({ tool: toolName || "unknown", task_id: taskId, trigger: "sandbox_deny", duration_ms: Date.now() - startTs, result_code: "E4001_GUARD_BLOCK", result_summary: sandboxResult.reason });
+                        defaultAudit.flush();
+                        complete(taskId, sbDenyResult);
+                        return sbDenyResult;
+                    }
+                }
+            }
+            var result = await func(p);
+            defaultAudit.append({ tool: toolName || "unknown", task_id: taskId, trigger: p.trigger || null, duration_ms: Date.now() - startTs, result_code: (result && result.code) || (result && result.success ? "OK" : "UNKNOWN"), result_summary: result ? safeStr(result.error || result.state || (result.success ? "success" : "fail")) : null });
+            defaultAudit.flush();
+            complete(taskId, result);
+            return result;
+        } catch (error) {
+            var errResult = { success: false, code: "E5001_INTERNAL_ERROR", error: "工具执行异常: " + (error && error.message ? error.message : String(error)) };
+            defaultAudit.append({ tool: toolName || "unknown", task_id: taskId, trigger: "exception", duration_ms: Date.now() - startTs, result_code: "E5001_INTERNAL_ERROR", result_summary: safeStr(error) });
+            defaultAudit.flush();
+            complete(taskId, errResult);
+            return errResult;
+        }
+    }
+
+    // Tool functions that need IIFE-scoped default* variables
+    async function enforce_block(params) {
+        var taskId = params.task_id;
+        if (!taskId) {
+            return { success: false, code: "E1002_MISSING_REQUIRED", error: "task_id 为必填" };
+        }
+        var blocked = defaultEnforcer.isBlocked(taskId);
+        return {
+            success: true,
+            code: "OK",
+            task_id: taskId,
+            is_blocked: blocked,
+            action: blocked ? "BLOCK: 该任务已被 preflight 硬阻断，禁止执行后续工具调用" : "PASS",
+        };
+    }
+
+    async function audit_log(params) {
+        var limit = params.limit != null ? params.limit : 20;
+        var snap = defaultAudit.snapshot();
+        if (snap.length > limit) snap = snap.slice(snap.length - limit);
+        return { success: true, code: "OK", count: snap.length, entries: snap };
+    }
+
+    async function evaluate_permission(params) {
+        if (!defaultPermissions) {
+            return { success: false, code: "E5002_DEPENDENCY_MISSING", error: "PermissionRules 未初始化" };
+        }
+        var tool = params.tool || "bash";
+        var value = defaultPermissions.extractValue(defaultPermissions.normalizeTool(tool, params), params);
+        var result = defaultPermissions.evaluate(tool, params);
+        return {
+            success: true, code: "OK", tool: tool, value: value,
+            verdict: result.verdict, reason: result.reason,
+            mode: result.mode, matched_rule: result.matched_rule || null,
+        };
+    }
+
+    async function check_sandbox(params) {
+        if (!defaultSandbox) {
+            return { success: false, code: "E5002_DEPENDENCY_MISSING", error: "SandboxProfile 未初始化" };
+        }
+        var result = defaultSandbox.check(params);
+        return {
+            success: true, code: "OK",
+            profile: params.profile || defaultSandbox.getDefaultProfile(),
+            target: params.path || params.command || "",
+            allowed: result.allowed, verdict: result.verdict,
+            reason: result.reason || null, matched_pattern: result.matched_pattern || null,
+        };
+    }
+
+    function safeStr(e) {
+        if (!e) return "";
+        if (e.message) return String(e.message).slice(0, 120);
+        return String(e).slice(0, 120);
+    }
+
     return {
-        // Re-export modules for direct internal access (backward compat)
         FileGuard: FileGuard,
         Hallucination: Hallucination,
         Evidence: defaultInstance.Evidence,
@@ -2535,7 +2676,12 @@ const ZeroApex = (function () {
         Memory: defaultInstance.Memory,
         Snapshot: defaultInstance.Snapshot,
         preflightGate: defaultInstance.preflight,
+        enforce_block: enforce_block,
+        audit_log: audit_log,
+        evaluate_permission: evaluate_permission,
+        check_sandbox: check_sandbox,
         create: create,
+        wrapToolExecution: wrapToolExecution,
         _infra: defaultInstance._infra,
     };
 })();
@@ -2544,8 +2690,6 @@ const ZeroApex = (function () {
 // Tool export layer: map internal engine to Operit tool interface.
 // Each tool wraps execution, catches exceptions, audits, enforces block.
 // ==========================================================================
-
-function complete(result) { /* no-op: task ledger completion placeholder */ }
 
 async function preflight(params) {
     return await ZeroApex.preflightGate(
@@ -2620,236 +2764,6 @@ async function restore_file(params) {
     return await ZeroApex.Snapshot.restore(params.path, params.snapshot_name);
 }
 
-// #5: enforce_block — model-callable check for hard block status
-async function enforce_block(params) {
-    var taskId = params.task_id;
-    if (!taskId) {
-        return {
-            success: false,
-            code: "E1002_MISSING_REQUIRED",
-            error: "task_id 为必填",
-        };
-    }
-    // Use default instance enforcer
-    var blocked = defaultEnforcer.isBlocked(taskId);
-    return {
-        success: true,
-        code: "OK",
-        task_id: taskId,
-        is_blocked: blocked,
-        action: blocked ? "BLOCK: 该任务已被 preflight 硬阻断，禁止执行后续工具调用" : "PASS",
-    };
-}
-
-// #8: audit_log — query recent audit entries
-async function audit_log(params) {
-    var limit = params.limit != null ? params.limit : 20;
-    var snap = defaultAudit.snapshot();
-    if (snap.length > limit) snap = snap.slice(snap.length - limit);
-    return {
-        success: true,
-        code: "OK",
-        count: snap.length,
-        entries: snap,
-    };
-}
-
-// §21g tool: evaluate_permission — run deny>ask>allow evaluation
-async function evaluate_permission(params) {
-    if (!defaultPermissions) {
-        return { success: false, code: "E5002_DEPENDENCY_MISSING", error: "PermissionRules 未初始化" };
-    }
-    var tool = params.tool || "bash";
-    var value = defaultPermissions.extractValue(defaultPermissions.normalizeTool(tool, params), params);
-    var result = defaultPermissions.evaluate(tool, params);
-    return {
-        success: true,
-        code: "OK",
-        tool: tool,
-        value: value,
-        verdict: result.verdict,
-        reason: result.reason,
-        mode: result.mode,
-        matched_rule: result.matched_rule || null,
-    };
-}
-
-// §21f tool: check_sandbox — validate path/command against profile
-async function check_sandbox(params) {
-    if (!defaultSandbox) {
-        return { success: false, code: "E5002_DEPENDENCY_MISSING", error: "SandboxProfile 未初始化" };
-    }
-    var result = defaultSandbox.check(params);
-    return {
-        success: true,
-        code: "OK",
-        profile: params.profile || defaultSandbox.getDefaultProfile(),
-        target: params.path || params.command || "",
-        allowed: result.allowed,
-        verdict: result.verdict,
-        reason: result.reason || null,
-        matched_pattern: result.matched_pattern || null,
-    };
-}
-
-// Unified wrapper: catch exceptions, complete, audit, enforce block (#2, #5, #8)
-// + ShellGuard (2.3.0) inline dangerous-cmd guard + PermissionRules + SandboxProfile
-async function wrapToolExecution(func, params, toolName) {
-    var startTs = Date.now();
-    var p = params || {};
-    var taskId = p.task_id || null;
-    try {
-        // #5: enforce block — if task is blocked, refuse
-        if (taskId && defaultEnforcer.isBlocked(taskId)) {
-            var blockResult = {
-                success: false,
-                code: "E4001_GUARD_BLOCK",
-                error: "任务 " + taskId + " 已被 preflight 硬阻断，后续工具调用被拒绝",
-                blocked_by: "enforce_block",
-            };
-            defaultAudit.append({
-                tool: toolName || "unknown",
-                task_id: taskId,
-                trigger: "blocked",
-                duration_ms: Date.now() - startTs,
-                result_code: "E4001_GUARD_BLOCK",
-                result_summary: "enforce_block rejected",
-            });
-            defaultAudit.flush();
-            complete(blockResult);
-            return blockResult;
-        }
-        // #7: env curtail — check tool allowed in current env
-        if (toolName && defaultManifest && !defaultManifest.isToolAllowed(toolName, defaultDeps)) {
-            var curtResult = {
-                success: false,
-                code: "E5002_DEPENDENCY_MISSING",
-                error: "工具 " + toolName + " 在当前环境权限下不可用（被 manifest 裁剪）",
-            };
-            defaultAudit.append({
-                tool: toolName,
-                task_id: taskId,
-                trigger: "curtailed",
-                duration_ms: Date.now() - startTs,
-                result_code: "E5002_DEPENDENCY_MISSING",
-                result_summary: "env curtail rejected",
-            });
-            defaultAudit.flush();
-            complete(curtResult);
-            return curtResult;
-        }
-        // §21g PermissionRules (2.3.0): deny > ask > allow evaluation
-        if (defaultPermissions) {
-            var perm = defaultPermissions.evaluate(toolName, p);
-            if (perm.verdict === "DENY") {
-                var permDenyResult = {
-                    success: false,
-                    code: "E4001_GUARD_BLOCK",
-                    error: "Permission 规则拒绝: " + perm.reason,
-                    blocked_by: "permission:deny",
-                };
-                defaultAudit.append({
-                    tool: toolName || "unknown",
-                    task_id: taskId,
-                    trigger: "permission_deny",
-                    duration_ms: Date.now() - startTs,
-                    result_code: "E4001_GUARD_BLOCK",
-                    result_summary: perm.reason,
-                });
-                defaultAudit.flush();
-                complete(permDenyResult);
-                return permDenyResult;
-            }
-            if (perm.verdict === "ASK") {
-                // default 模式下 ASK 升级到 BLOCK（无交互式 UI）；dontAsk/bypassPermissions 已在 evaluate 内处理
-                var askResult = {
-                    success: false,
-                    code: "E4001_GUARD_BLOCK",
-                    error: "Permission 规则要求确认: " + perm.reason + "（无交互式 UI，按 deny 处理）",
-                    blocked_by: "permission:ask",
-                };
-                defaultAudit.append({
-                    tool: toolName || "unknown",
-                    task_id: taskId,
-                    trigger: "permission_ask",
-                    duration_ms: Date.now() - startTs,
-                    result_code: "E4001_GUARD_BLOCK",
-                    result_summary: perm.reason,
-                });
-                defaultAudit.flush();
-                complete(askResult);
-                return askResult;
-            }
-        }
-        // §21f SandboxProfile (2.3.0): check path/command against profile
-        if (defaultSandbox) {
-            var sandboxParams = null;
-            if (p.command) {
-                sandboxParams = { command: p.command };
-            } else if (p.path) {
-                sandboxParams = { path: p.path, action: "write" };
-            } else if (p.file_path) {
-                sandboxParams = { path: p.file_path, action: "write" };
-            }
-            if (sandboxParams) {
-                var sandboxResult = defaultSandbox.check(sandboxParams);
-                if (!sandboxResult.allowed) {
-                    var sbDenyResult = {
-                        success: false,
-                        code: "E4001_GUARD_BLOCK",
-                        error: "Sandbox 拒绝: " + sandboxResult.reason,
-                        blocked_by: "sandbox:" + (sandboxParams.command ? "command" : "path"),
-                    };
-                    defaultAudit.append({
-                        tool: toolName || "unknown",
-                        task_id: taskId,
-                        trigger: "sandbox_deny",
-                        duration_ms: Date.now() - startTs,
-                        result_code: "E4001_GUARD_BLOCK",
-                        result_summary: sandboxResult.reason,
-                    });
-                    defaultAudit.flush();
-                    complete(sbDenyResult);
-                    return sbDenyResult;
-                }
-            }
-        }
-        var result = await func(p);
-        // #8: audit successful call
-        defaultAudit.append({
-            tool: toolName || "unknown",
-            task_id: taskId,
-            trigger: p.trigger || null,
-            duration_ms: Date.now() - startTs,
-            result_code: (result && result.code) || (result && result.success ? "OK" : "UNKNOWN"),
-            result_summary: result ? safeStr(result.error || result.state || (result.success ? "success" : "fail")) : null,
-        });
-        defaultAudit.flush();
-        complete(result);
-    } catch (error) {
-        var errResult = {
-            success: false,
-            code: "E5001_INTERNAL_ERROR",
-            error: "工具执行异常: " + (error && error.message ? error.message : String(error)),
-        };
-        defaultAudit.append({
-            tool: toolName || "unknown",
-            task_id: taskId,
-            trigger: "exception",
-            duration_ms: Date.now() - startTs,
-            result_code: "E5001_INTERNAL_ERROR",
-            result_summary: safeStr(error),
-        });
-        defaultAudit.flush();
-        complete(errResult);
-    }
-}
-
-function safeStr(e) {
-    if (!e) return "";
-    if (e.message) return String(e.message).slice(0, 120);
-    return String(e).slice(0, 120);
-}
 
 // Self-test entry: pure logic layer only, verifies engine runs.
 async function main() {
@@ -2979,21 +2893,24 @@ function TaskLedger_test() {
     return first.goal === "high" && ledger.pendingCount() === 1;
 }
 
-exports.preflight = function (params) { return wrapToolExecution(preflight, params, "preflight"); };
-exports.file_guard = function (params) { return wrapToolExecution(file_guard, params, "file_guard"); };
-exports.hallucination_guard = function (params) { return wrapToolExecution(hallucination_guard, params, "hallucination_guard"); };
-exports.evidence_check = function (params) { return wrapToolExecution(evidence_check, params, "evidence_check"); };
-exports.self_monitor = function (params) { return wrapToolExecution(self_monitor, params, "self_monitor"); };
-exports.output_firewall = function (params) { return wrapToolExecution(output_firewall, params, "output_firewall"); };
-exports.search_opensource = function (params) { return wrapToolExecution(search_opensource, params, "search_opensource"); };
-exports.remember = function (params) { return wrapToolExecution(remember, params, "remember"); };
-exports.recall = function (params) { return wrapToolExecution(recall, params, "recall"); };
-exports.snapshot_file = function (params) { return wrapToolExecution(snapshot_file, params, "snapshot_file"); };
-exports.restore_file = function (params) { return wrapToolExecution(restore_file, params, "restore_file"); };
-exports.enforce_block = function (params) { return wrapToolExecution(enforce_block, params, "enforce_block"); };
-exports.audit_log = function (params) { return wrapToolExecution(audit_log, params, "audit_log"); };
-exports.evaluate_permission = function (params) { return wrapToolExecution(evaluate_permission, params, "evaluate_permission"); };
-exports.check_sandbox = function (params) { return wrapToolExecution(check_sandbox, params, "check_sandbox"); };
+function wrapExport(toolFn, toolName) {
+    return function (params) { return ZeroApex.wrapToolExecution(toolFn, params, toolName); };
+}
+exports.preflight = wrapExport(preflight, "preflight");
+exports.file_guard = wrapExport(file_guard, "file_guard");
+exports.hallucination_guard = wrapExport(hallucination_guard, "hallucination_guard");
+exports.evidence_check = wrapExport(evidence_check, "evidence_check");
+exports.self_monitor = wrapExport(self_monitor, "self_monitor");
+exports.output_firewall = wrapExport(output_firewall, "output_firewall");
+exports.search_opensource = wrapExport(search_opensource, "search_opensource");
+exports.remember = wrapExport(remember, "remember");
+exports.recall = wrapExport(recall, "recall");
+exports.snapshot_file = wrapExport(snapshot_file, "snapshot_file");
+exports.restore_file = wrapExport(restore_file, "restore_file");
+exports.enforce_block = wrapExport(ZeroApex.enforce_block, "enforce_block");
+exports.audit_log = wrapExport(ZeroApex.audit_log, "audit_log");
+exports.evaluate_permission = wrapExport(ZeroApex.evaluate_permission, "evaluate_permission");
+exports.check_sandbox = wrapExport(ZeroApex.check_sandbox, "check_sandbox");
 exports.main = main;
 exports.create = ZeroApex.create;
 exports._infra = ZeroApex._infra;
