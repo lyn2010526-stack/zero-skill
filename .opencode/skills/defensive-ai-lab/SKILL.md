@@ -23,6 +23,7 @@ Run one evidence-driven workflow combining safe AI experiments and defensive rev
 | Safety rules | `references/safety-policy.md` |
 | Core workflow pipeline | `references/unified-workflow.md` |
 | Protocols & evidence gate | `references/protocols.md` |
+| Evidence trust & corroboration | `references/evidence-protocol.md` |
 
 Determine workflow type (`ai_experiment`, `local_security_review`, `authorization_regression`, `evidence_report`, `mixed`), create case UUID under `.defensive-ai-lab/cases/<id>/` only when persisting, execute with evidence gate.
 

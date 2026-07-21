@@ -10,6 +10,7 @@ references:
   - references/safety-policy.md
   - references/unified-workflow.md
   - references/protocols.md
+  - references/evidence-protocol.md
 triggers:
   - task_type: [security_review, ai_experiment, authorization_regression, code_audit, defensive_analysis]
   - keywords: [安全审查, 漏洞, 授权, 回归测试, 防御实验, 代码审计, 证据, 安全报告]
@@ -48,6 +49,7 @@ metadata:
 | 安全规则 | `references/safety-policy.md` |
 | 核心工作流 | `references/unified-workflow.md` |
 | 协议与证据门 | `references/protocols.md` |
+| 证据信任与佐证 | `references/evidence-protocol.md` |
 
 确定工作流类型（`ai_experiment`、`local_security_review`、`authorization_regression`、`evidence_report`、`mixed`），创建案例 UUID，执行时通过证据门。
 

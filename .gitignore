@@ -181,3 +181,4 @@
 *.lzma
 *.iso
 .zero_apex/
+.defensive-ai-lab/
