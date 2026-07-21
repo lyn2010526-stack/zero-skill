@@ -55,6 +55,9 @@ metadata:
 
 ## 工具
 
+> **注意**：以下 Python 脚本仅在 opencode 环境（有 Python 运行时）中执行。
+> Operit 加载本技能时仅读取引用文档作为工作流指导，不执行 Python。
+
 ```bash
 python3 scripts/labctl.py init --workflow <type> --scope <path> --output markdown --output json
 python3 scripts/labctl.py audit --case <dir> --event <name> --metadata '<json>'

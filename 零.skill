@@ -20,10 +20,10 @@ references:
   - references/open_source.md
   - references/memory.md
   - references/snapshot.md
-  - references/preflight.md
+   - references/preflight.md
    - references/operit_capabilities.md
    - references/evolution.md
- triggers:
+  triggers:
   - task_type: [engineering, debugging, refactoring, build, deploy, code_review]
   - keywords: [编译, 构建, 修复, 重构, 部署, 安装, 测试, 交付, 代码审查]
   - command_risk: destructive
