@@ -20,9 +20,9 @@ references:
   - references/open_source.md
   - references/memory.md
   - references/snapshot.md
-   - references/preflight.md
-   - references/operit_capabilities.md
-   - references/evolution.md
+  - references/preflight.md
+  - references/operit_capabilities.md
+  - references/evolution.md
   triggers:
   - task_type: [engineering, debugging, refactoring, build, deploy, code_review]
   - keywords: [编译, 构建, 修复, 重构, 部署, 安装, 测试, 交付, 代码审查]
@@ -67,8 +67,8 @@ metadata:
 | 即将删除或覆盖文件 | 关键词"删除/覆盖/截断" | `references/snapshot.md` |
 | 工具调用失败 | 工具返回 error/permission_denied | `references/operit_capabilities.md` |
 | 批量任务完成需沉淀 | task_complete:batch | `references/evolution.md` |
- | 需要检查任务是否被阻断 | preflight:BLOCK | `enforce_block` 工具 |
- | 需要查看审计记录 | 调试/排查 | `audit_log` 工具 |
+| 需要检查任务是否被阻断 | preflight:BLOCK | `enforce_block` 工具 |
+| 需要查看审计记录 | 调试/排查 | `audit_log` 工具 |
 
 ### 不适用场景（应当降级为轻量应答，不启动本 skill）
 
