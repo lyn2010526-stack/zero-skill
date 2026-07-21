@@ -923,8 +923,8 @@ const ZeroApex = (function () {
             if (!path) return false;
             if (!Files) return false;
             try {
-                var r = await Files.exists(path);
-                return !!(r && r.exists);
+                var r = await Files.read(path);
+                return !!(r && (r.content !== undefined || r.exists));
             } catch (e) {
                 return false;
             }
@@ -1116,9 +1116,27 @@ const ZeroApex = (function () {
         function filler() { return ConfigRegistry.get("output_firewall.filler", []); }
         function emotional() { return ConfigRegistry.get("output_firewall.emotional", []); }
 
-        function check(rawText) {
+         function check(rawText) {
             var text = safeString(rawText);
             var violations = [];
+
+            // Secret / credential leak detection
+            var secretPatterns = [
+                { re: /ghp_[A-Za-z0-9]{20,}/g, label: "GitHub Token" },
+                { re: /sk-[A-Za-z0-9]{20,}/g, label: "API Key (sk-)" },
+                { re: /-----BEGIN (RSA |EC |DSA |OPENSSH |PRIVATE )?PRIVATE KEY-----/, label: "Private Key" },
+                { re: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, label: "Email Address" },
+                { re: /(mysql|postgres|mongodb|redis):\/\/[^\s]+/gi, label: "Connection String" },
+                { re: /(password|passwd|secret|token|api_key)\s*[:=]\s*['"][^'"]{8,}['"]/gi, label: "Credential Assignment" },
+                { re: /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, label: "JWT Token" },
+            ];
+            for (var si = 0; si < secretPatterns.length; si++) {
+                var sp = secretPatterns[si];
+                var sm = text.match(sp.re);
+                if (sm) {
+                    violations.push({ type: "secret_leak", hit: sp.label + " (" + sm.length + " occurrences)", fix: "Replace with [REDACTED]" });
+                }
+            }
 
             var tl = thoughtLeak();
             for (var i = 0; i < tl.length; i++) {
@@ -1161,7 +1179,7 @@ const ZeroApex = (function () {
             var severity;
             var hasSevere = false;
             for (var v = 0; v < violations.length; v++) {
-                if (violations[v].type === "tool_leak" || violations[v].type === "mojibake") {
+                if (violations[v].type === "tool_leak" || violations[v].type === "mojibake" || violations[v].type === "secret_leak") {
                     hasSevere = true; break;
                 }
             }
@@ -1423,13 +1441,14 @@ const ZeroApex = (function () {
 
         async function doSnapshot(path) {
             try {
-                var ex = await Files.exists(path);
-                if (!ex || !ex.exists) {
+                var content;
+                try {
+                    content = await Files.read(path);
+                } catch (readErr) {
                     return { success: false, code: ErrorCode.FILE_NOT_FOUND, error: "源文件不存在: " + path };
                 }
                 var td = PathUtils.trashDir(path);
                 try { await Files.write(PathUtils.join(td, ".keep"), ""); } catch (e) {}
-                var content = await Files.read(path);
                 var snapName = PathUtils.basename(path) + "." + nowStamp();
                 var dest = PathUtils.join(td, snapName);
                 var w = await Files.write(dest, (content && content.content) || "");
@@ -2711,12 +2730,33 @@ async function hallucination_guard(params) {
 }
 
 async function evidence_check(params) {
-    return await ZeroApex.Evidence.classify(params.claim, {
+    var ctx = {
         exit_code: params.exit_code,
         stdout: params.stdout,
         stderr: params.stderr,
         artifact_path: params.artifact_path,
-    });
+    };
+    // Parse 'supports' array: ["exit_code:0", "stdout:build passed", "artifact:path", "stderr:error msg"]
+    if (params.supports && params.supports.length > 0) {
+        for (var i = 0; i < params.supports.length; i++) {
+            var s = String(params.supports[i]);
+            var colonIdx = s.indexOf(':');
+            if (colonIdx > 0) {
+                var key = s.slice(0, colonIdx);
+                var val = s.slice(colonIdx + 1);
+                if (key === 'exit_code') {
+                    ctx.exit_code = parseInt(val, 10);
+                } else if (key === 'stdout') {
+                    ctx.stdout = val;
+                } else if (key === 'stderr') {
+                    ctx.stderr = val;
+                } else if (key === 'artifact') {
+                    ctx.artifact_path = val;
+                }
+            }
+        }
+    }
+    return await ZeroApex.Evidence.classify(params.claim, ctx);
 }
 
 async function self_monitor(params) {
