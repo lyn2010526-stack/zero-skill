@@ -203,40 +203,6 @@ const ZeroApex = (function () {
     });
 
     // ======================================================================
-    // §1 ResultEnvelope — unified return shape (audit #8)
-    // Every module returns { success, code, data?, error?, meta? }.
-    // ======================================================================
-    function ok(data, meta) {
-        var env = { success: true, code: ErrorCode.OK };
-        if (data !== undefined) env.data = data;
-        if (meta) env.meta = meta;
-        return env;
-    }
-
-    function fail(code, message, meta) {
-        var env = { success: false, code: code || ErrorCode.INTERNAL_ERROR, error: message || code };
-        if (meta) env.meta = meta;
-        return env;
-    }
-
-    // Legacy adapter: flatten data fields into top-level for backward compat
-    // with existing exports.* signatures and main() self-tests.
-    function legacy(env) {
-        if (env.success && env.data) {
-            var flat = env.data;
-            flat.success = true;
-            flat.code = ErrorCode.OK;
-            return flat;
-        }
-        if (!env.success) {
-            var err = { success: false, code: env.code, error: env.error };
-            if (env.meta) err.meta = env.meta;
-            return err;
-        }
-        return env;
-    }
-
-    // ======================================================================
     // §2 ConfigRegistry — centralized config with validation (audit #6)
     // ======================================================================
     var ConfigRegistry = (function () {
@@ -320,14 +286,6 @@ const ZeroApex = (function () {
             return join(dir, ".trash");
         }
 
-        // Path-traversal guard: reject ".." segments that escape base.
-        function isWithin(base, target) {
-            var b = normalize(base);
-            var t = normalize(target);
-            if (t.indexOf(b + SEP) !== 0 && t !== b) return false;
-            return true;
-        }
-
         // Reject traversal patterns in user-supplied paths.
         function hasTraversal(p) {
             var s = String(p || "");
@@ -341,7 +299,6 @@ const ZeroApex = (function () {
             basename: basename,
             dirname: dirname,
             trashDir: trashDir,
-            isWithin: isWithin,
             hasTraversal: hasTraversal,
         };
     })();
@@ -587,7 +544,6 @@ const ZeroApex = (function () {
     function TaskLedger(deps) {
         var ledger = [];
         var seq = 0;
-        var persistPath = ".zero_apex/ledger.json";
 
         function nextId() { return "T" + (++seq) + "_" + nowStamp(); }
 
@@ -1903,6 +1859,10 @@ const ZeroApex = (function () {
                     { name: "recall", min_permission: "basic", requires: ["Tools.Memory"] },
                     { name: "snapshot_file", min_permission: "basic", requires: ["Files"] },
                     { name: "restore_file", min_permission: "basic", requires: ["Files"] },
+                    { name: "enforce_block", min_permission: "none", requires: [] },
+                    { name: "audit_log", min_permission: "basic", requires: ["Files"] },
+                    { name: "evaluate_permission", min_permission: "none", requires: [] },
+                    { name: "check_sandbox", min_permission: "none", requires: [] },
                 ],
                 references: [],
                 env_requirements: {
@@ -2528,7 +2488,6 @@ const ZeroApex = (function () {
                 TemplateStore: TemplateStore,
                 OutputChunker: OutputChunker,
                 TaskLedger: TaskLedger,
-                ResultEnvelope: { ok: ok, fail: fail, legacy: legacy },
                 ErrorCode: ErrorCode,
                 AuditLogger: AuditLogger,
                 BlockEnforcer: BlockEnforcer,

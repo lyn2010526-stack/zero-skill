@@ -117,12 +117,6 @@ async function runDITests() {
   assert(ec.NETWORK_ERROR === "E3001_NETWORK_ERROR", "ErrorCode.NETWORK_ERROR stable");
   assert(ec.GUARD_BLOCK === "E4001_GUARD_BLOCK", "ErrorCode.GUARD_BLOCK stable");
 
-  // ResultEnvelope
-  const envOk = inst._infra.ResultEnvelope.ok({ x: 1 });
-  assert(envOk.success && envOk.code === "OK" && envOk.data.x === 1, "Envelope ok");
-  const envFail = inst._infra.ResultEnvelope.fail(ec.NETWORK_ERROR, "timeout");
-  assert(!envFail.success && envFail.code === ec.NETWORK_ERROR && envFail.error === "timeout", "Envelope fail");
-
   // PathUtils
   const pu = inst._infra.PathUtils;
   assert(pu.hasTraversal("../../etc"), "PathUtils detects traversal");
