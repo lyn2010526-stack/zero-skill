@@ -58,7 +58,7 @@ READY              ← 以上都不满足
   "reasons": ["偏差[过度自信]: ...", "删除操作: rm ..."],
   "self_awareness": { ... },
   "hallucination": { ... },
-  "status_card": "[自我意识] 就绪度 60/100 ...",
+  "status_card": "[自检] 就绪度 60/100 ...",
   "task_id": "T3_20240101_120000"
 }
 ```

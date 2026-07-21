@@ -58,6 +58,10 @@
 7. **记忆层 (Memory)** — Operit 持久化记忆 + 分片 + LRU 缓存
 8. **文件快照层 (Snapshot)** — .trash 备份/恢复 + 路径互斥 + 自动清理（TTL 24h / 上限 50 个）
 
+## 工具数量
+
+引擎共有 16 个可执行工具，其中 preflight 串联 6 个门禁层。
+
 ## preflight 串联
 
 `preflight` 工具一次性触发全部 6 个门禁层：
@@ -81,7 +85,7 @@ operit_editor:debug_install_js_package
 
 详见 `references/operit_capabilities.md` 中的权限分级和能力探测流程。
 
-## 工具列表（14 个）
+## 工具列表（16 个）
 
 | 工具 | 层 | 用途 |
 |------|-----|------|
@@ -99,6 +103,8 @@ operit_editor:debug_install_js_package
 | `snapshot_cleanup` | 快照 | 清理过期快照（TTL/容量） |
 | `enforce_block` | 强制拦截 | preflight BLOCK 后硬阻断后续工具调用 |
 | `audit_log` | 调试 | 查看最近的工具调用审计记录 |
+| `evaluate_permission` | 权限 | 按 deny>ask>allow 规则评估工具调用 |
+| `check_sandbox` | 沙箱 | 按 profile 校验路径/命令 |
 
 ## 测试
 
@@ -109,7 +115,7 @@ node tests/test_skill_activation.js # skill 层行为约束 + 强制拦截 + 环
 
 CI/CD：GitHub Actions 在 push/PR 时自动运行上述测试。
 
-当前测试覆盖：内置自测 19 项 + DI 集成 40+ 断言 + 守卫层 15+ 断言 + skill 层 113 断言。
+当前测试覆盖：内置自测 19 项 + DI 集成 100+ 断言 + 守卫层 15+ 断言 + skill 层 113 断言。
 
 ## Skill 结构
 

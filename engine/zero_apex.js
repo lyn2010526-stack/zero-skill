@@ -6,7 +6,7 @@
         "en": "Zero Apex Engine"
     },
     "description": {
-        "zh": "首席工程师执行引擎的真实运行时。防幻觉层/自我意识层/防删代码层/证据验证层全部为可执行代码，非文本。记忆走 Operit 真实持久化记忆库，开源搜索走真实 GitHub API，文件快照走真实文件系统。",
+        "zh": "首席工程师执行引擎的真实运行时。防幻觉层/自检层/防删代码层/证据验证层全部为可执行代码，非文本。记忆走 Operit 真实持久化记忆库，开源搜索走真实 GitHub API，文件快照走真实文件系统。",
         "en": "The real runtime of the Zero Apex chief-engineer skill. Hallucination guard / self-awareness / file-delete guard / evidence verifier are all executable code. Memory uses Operit's real persistent memory library; open-source search hits the real GitHub API; file snapshots use the real filesystem."
     },
     "category": "Engineering",
@@ -14,7 +14,7 @@
     "tools": [
         {
             "name": "preflight",
-            "description": { "zh": "执行前综合门禁：整合自我意识层、防删代码层、防幻觉层、证据验证层，返回是否允许执行以及原因。", "en": "Pre-execution gate combining self-awareness, file-delete guard, hallucination guard and evidence verifier." },
+            "description": { "zh": "执行前综合门禁：整合自检层、防删代码层、防幻觉层、证据验证层，返回是否允许执行以及原因。", "en": "Pre-execution gate combining self-awareness, file-delete guard, hallucination guard and evidence verifier." },
             "parameters": [
                 { "name": "goal", "description": { "zh": "用户目标/任务描述", "en": "User goal/task" }, "type": "string", "required": true },
                 { "name": "command", "description": { "zh": "可选：即将执行的命令", "en": "Optional: the command about to run" }, "type": "string", "required": false },
@@ -53,7 +53,7 @@
         },
         {
             "name": "self_monitor",
-            "description": { "zh": "自我意识层：评估当前工程六维状态（目标清晰/已读文件/证据就绪/不可逆风险/需确认/置信度），返回状态卡。", "en": "Self-awareness layer: assess six engineering meta-state dimensions and return a status card." },
+            "description": { "zh": "自检层：评估当前工程六维状态（目标清晰/已读文件/证据就绪/不可逆风险/需确认/置信度），返回状态卡。", "en": "Self-awareness layer: assess six engineering meta-state dimensions and return a status card." },
             "parameters": [
                 { "name": "goal", "description": { "zh": "当前目标", "en": "Current goal" }, "type": "string", "required": true },
                 { "name": "goal_clear", "description": { "zh": "可选：目标是否清晰", "en": "Optional: whether the goal is clear" }, "type": "boolean", "required": false },
@@ -493,7 +493,7 @@ const ZeroApex = (function () {
         function has(name) { return !!templates[name]; }
 
         // Built-in templates registered at load time
-        register("status_card", "[自我意识] 就绪度 {{readiness}}/100 · 置信度 {{confidence}} · 因果链 {{causal}}{{blockers}}");
+        register("status_card", "[自检] 就绪度 {{readiness}}/100 · 置信度 {{confidence}} · 因果链 {{causal}}{{blockers}}");
         register("preflight_card", "[门禁] 状态={{state}} · 置信度={{confidence}} · 就绪={{readiness}}{{gates}}{{reasons}}");
         register("gate_reason", "\n  - {{reason}}");
 
@@ -1533,23 +1533,61 @@ const ZeroApex = (function () {
                 var now = Date.now();
                 var cutoff = now - maxAgeHours * 3600 * 1000;
                 var cleaned = 0;
-                if (entries.length > maxCount) {
-                    var sorted = entries.slice().sort(function (a, b) {
-                        var na = typeof a === "string" ? a : (a.name || "");
-                        var nb = typeof b === "string" ? b : (b.name || "");
-                        return na < nb ? -1 : na > nb ? 1 : 0;
-                    });
-                    var toRemove = sorted.length - maxCount;
-                    for (var i = 0; i < toRemove; i++) {
-                        var n = typeof sorted[i] === "string" ? sorted[i] : (sorted[i].name || "");
-                        if (n === ".keep") continue;
-                        try { await Files.write(PathUtils.join(td, n), ""); cleaned++; } catch (e2) {}
+                var skip = {};
+                var cands = [];
+                for (var i = 0; i < entries.length; i++) {
+                    var n = typeof entries[i] === "string" ? entries[i] : (entries[i].name || "");
+                    if (n === ".keep" || n === ".deleted") continue;
+                    var ts = extractTimestamp(n);
+                    if (ts > 0 && ts < cutoff) {
+                        try {
+                            var p = PathUtils.join(td, n);
+                            await Files.write(PathUtils.join(td, n + ".deleted"), "");
+                            await Files.write(p, "");
+                            skip[n] = true;
+                            cleaned++;
+                        } catch (e2) {}
                     }
                 }
-                return { success: true, code: ErrorCode.OK, cleaned: cleaned, message: "清理了 " + cleaned + " 个过期快照" };
+                var remaining = [];
+                for (var j = 0; j < entries.length; j++) {
+                    var rn = typeof entries[j] === "string" ? entries[j] : (entries[j].name || "");
+                    if (skip[rn]) continue;
+                    if (rn === ".keep" || rn === ".deleted") continue;
+                    remaining.push(entries[j]);
+                }
+                if (remaining.length > maxCount) {
+                    remaining.sort(function (a, b) {
+                        var na = typeof a === "string" ? a : (a.name || "");
+                        var nb = typeof b === "string" ? b : (b.name || "");
+                        var ta = extractTimestamp(na);
+                        var tb = extractTimestamp(nb);
+                        return ta < tb ? -1 : ta > tb ? 1 : 0;
+                    });
+                    var excess = remaining.length - maxCount;
+                    for (var k = 0; k < excess; k++) {
+                        var en = typeof remaining[k] === "string" ? remaining[k] : (remaining[k].name || "");
+                        try {
+                            var ep = PathUtils.join(td, en);
+                            await Files.write(PathUtils.join(td, en + ".deleted"), "");
+                            await Files.write(ep, "");
+                            cleaned++;
+                        } catch (e3) {}
+                    }
+                }
+                return { success: true, code: ErrorCode.OK, cleaned: cleaned, message: "标记清理了 " + cleaned + " 个过期/超限快照" };
             } catch (e) {
                 return { success: false, code: ErrorCode.INTERNAL_ERROR, error: safeString(e) };
             }
+        }
+
+        function extractTimestamp(name) {
+            var dot = name.lastIndexOf(".");
+            if (dot < 0) return 0;
+            var tail = name.substring(dot + 1);
+            if (!/^\d+$/.test(tail)) return 0;
+            var ts = parseInt(tail, 10);
+            return isNaN(ts) ? 0 : ts;
         }
 
         return { snapshot: snapshot, restore: restore, cleanup: cleanup };
@@ -1623,8 +1661,8 @@ const ZeroApex = (function () {
             if (of.severity === "SEVERE") allowed = false;
         }
 
-        // Snapshot awareness: destructive command without prior snapshot
-        if (command && FileGuard.analyzeCommand(command).is_delete && filesRead && filesRead.length > 0) {
+        // Snapshot awareness: destructive command on a task with file reads
+        if (command && FileGuard.analyzeCommand(command).is_delete && filesRead === true) {
             gates.push("snapshot");
             reasons.push("提示: 执行破坏性命令前建议先调用 snapshot_file 备份目标文件");
         }

@@ -85,7 +85,7 @@
     },
     {
       "name": "self_monitor",
-      "layer": "自我意识",
+      "layer": "自检",
       "requires": [],
       "min_permission": "none",
       "triggers": ["task_start"],
@@ -228,7 +228,7 @@
     {
       "name": "self_monitor",
       "path": "references/self_monitor.md",
-      "layer": "自我意识",
+      "layer": "自检",
       "priority": "high",
       "min_permission": "none",
       "triggers": ["task_start"],

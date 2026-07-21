@@ -1,4 +1,4 @@
-# SelfMonitor Reference — 自我意识层
+# SelfMonitor Reference — 自检层
 
 > 当任务开始前或执行中需要评估工程元状态时加载本文件。
 
@@ -60,7 +60,7 @@ self_monitor({
   "cognitive_biases": [{ "bias": "过度自信偏差", "warn": "..." }],
   "blockers": ["改动类任务但未读取相关文件"],
   "state": "NOT_READY",
-  "status_card": "[自我意识] 就绪度 60/100 · 置信度 INFERRED · 因果链 medium · 阻塞: ..."
+  "status_card": "[自检] 就绪度 60/100 · 置信度 INFERRED · 因果链 medium · 阻塞: ..."
 }
 ```
 
