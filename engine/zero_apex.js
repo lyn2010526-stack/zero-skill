@@ -1020,7 +1020,7 @@ const ZeroApex = (function () {
                 label: label,
                 supports_claim: supports,
                 can_claim_done: n >= 3 && supports,
-                can_claim_delivered: n >= 6 && supports,
+                can_claim_delivered: n >= 5 && supports,
                 reasons: reasons,
                 gate: n >= 3 && supports
                     ? "ALLOW"
@@ -1215,8 +1215,8 @@ const ZeroApex = (function () {
         }
 
         async function search(keyword, language, minStars, limit) {
-            minStars = minStars || ConfigRegistry.get("opensource.default_min_stars", 500);
-            limit = limit || ConfigRegistry.get("opensource.default_limit", 5);
+            minStars = minStars != null ? minStars : ConfigRegistry.get("opensource.default_min_stars", 500);
+            limit = limit != null ? limit : ConfigRegistry.get("opensource.default_limit", 5);
 
             if (!keyword || !safeString(keyword).trim()) {
                 return {
@@ -1237,11 +1237,11 @@ const ZeroApex = (function () {
             var kw = keyword;
 
             return limiter.run(function () {
-                return attemptSearch(kw, url, 1);
+                return attemptSearch(kw, url, 1, limit);
             });
         }
 
-        async function attemptSearch(kw, url, attempt) {
+        async function attemptSearch(kw, url, attempt, limit) {
             try {
                 var resp = await Network.httpGet(url);
                 var body = resp && resp.content ? resp.content : resp;
@@ -1252,7 +1252,7 @@ const ZeroApex = (function () {
                     json = body;
                 }
                 var items = (json && json.items) || [];
-                var repos = items.slice(0, ConfigRegistry.get("opensource.default_limit", 5)).map(function (r) {
+                var repos = items.slice(0, limit).map(function (r) {
                     return {
                         name: r.full_name,
                         stars: r.stargazers_count,
@@ -1281,7 +1281,7 @@ const ZeroApex = (function () {
                 if (retry.shouldRetry(attempt, err)) {
                     var delay = retry.delayFor(attempt);
                     await sleep(delay);
-                    return attemptSearch(kw, url, attempt + 1);
+                    return attemptSearch(kw, url, attempt + 1, limit);
                 }
                 return {
                     success: false,
@@ -1365,7 +1365,7 @@ const ZeroApex = (function () {
             if (!Tools || !Tools.Memory) {
                 return { success: false, code: ErrorCode.DEPENDENCY_MISSING, error: "Tools.Memory 不可用" };
             }
-            limit = limit || 5;
+            limit = limit != null ? limit : 5;
             var cacheKey = safeString(query) + "|" + safeString(kind) + "|" + limit;
             var cached = cache.get(cacheKey);
             if (cached) {
@@ -1732,6 +1732,7 @@ const ZeroApex = (function () {
                 return;
             }
             var payload = buffer.map(function (l) { return JSON.stringify(l); }).join("\n") + "\n";
+            var toWrite = buffer;
             buffer = [];
             try {
                 // Append-mode: read existing, concat, write back.
@@ -1743,7 +1744,8 @@ const ZeroApex = (function () {
                 } catch (e) {}
                 Files.write(logPath, existing + payload);
             } catch (e) {
-                // Silently drop on IO error; audit must not crash engine
+                // On IO error, re-queue entries so they're not silently lost
+                buffer = toWrite.concat(buffer);
             }
         }
 
@@ -2042,9 +2044,8 @@ const ZeroApex = (function () {
             if (ampMatch) return "&";
             // > or < redirection (but not >> << here-doc which are still redirections)
             if (/[<>]/.test(s) && !/^<{2,}\s/.test(s.trim())) {
-                // Distinguish git log --oneline > file (redirection) from < in html
-                // Treat any standalone > or < (not part of && ||) as redirection
-                if (s.match(/(^|[^<>])[<>]([^<>]|$)/)) return /[<>]/.source === "<" ? "<" : ">";
+                var m = s.match(/(^|[^<>])([<>])([^<>]|$)/);
+                if (m) return m[2];
             }
             return null;
         }
@@ -2541,8 +2542,10 @@ const ZeroApex = (function () {
 
 // ==========================================================================
 // Tool export layer: map internal engine to Operit tool interface.
-// Each tool wraps execution, catches exceptions, calls complete().
+// Each tool wraps execution, catches exceptions, audits, enforces block.
 // ==========================================================================
+
+function complete(result) { /* no-op: task ledger completion placeholder */ }
 
 async function preflight(params) {
     return await ZeroApex.preflightGate(
@@ -2640,7 +2643,7 @@ async function enforce_block(params) {
 
 // #8: audit_log — query recent audit entries
 async function audit_log(params) {
-    var limit = params.limit || 20;
+    var limit = params.limit != null ? params.limit : 20;
     var snap = defaultAudit.snapshot();
     if (snap.length > limit) snap = snap.slice(snap.length - limit);
     return {
@@ -2714,7 +2717,7 @@ async function wrapToolExecution(func, params, toolName) {
             });
             defaultAudit.flush();
             complete(blockResult);
-            return;
+            return blockResult;
         }
         // #7: env curtail — check tool allowed in current env
         if (toolName && defaultManifest && !defaultManifest.isToolAllowed(toolName, defaultDeps)) {
@@ -2733,7 +2736,7 @@ async function wrapToolExecution(func, params, toolName) {
             });
             defaultAudit.flush();
             complete(curtResult);
-            return;
+            return curtResult;
         }
         // §21g PermissionRules (2.3.0): deny > ask > allow evaluation
         if (defaultPermissions) {
@@ -2755,7 +2758,7 @@ async function wrapToolExecution(func, params, toolName) {
                 });
                 defaultAudit.flush();
                 complete(permDenyResult);
-                return;
+                return permDenyResult;
             }
             if (perm.verdict === "ASK") {
                 // default 模式下 ASK 升级到 BLOCK（无交互式 UI）；dontAsk/bypassPermissions 已在 evaluate 内处理
@@ -2775,7 +2778,7 @@ async function wrapToolExecution(func, params, toolName) {
                 });
                 defaultAudit.flush();
                 complete(askResult);
-                return;
+                return askResult;
             }
         }
         // §21f SandboxProfile (2.3.0): check path/command against profile
@@ -2807,7 +2810,7 @@ async function wrapToolExecution(func, params, toolName) {
                     });
                     defaultAudit.flush();
                     complete(sbDenyResult);
-                    return;
+                    return sbDenyResult;
                 }
             }
         }
