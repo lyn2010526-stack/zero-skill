@@ -16,29 +16,44 @@
 
 ```
 defensive-ai-lab/
-├── SKILL.md                    # opencode 技能定义
-├── defensive-ai-lab.skill      # operit 兼容清单
-├── references/                 # 按需加载的引用文档
-│   ├── safety-policy.md        # 硬性边界
-│   ├── unified-workflow.md     # 工作流地图
-│   ├── protocols.md            # 协议合集
-│   └── evidence-protocol.md    # 证据门
-├── schemas/                    # JSON schema 验证
+├── SKILL.md                        # opencode 技能定义
+├── defensive-ai-lab.skill          # operit 兼容清单
+├── engine/
+│   └── defensive-ai-lab.js         # QuickJS 引擎（Operit 运行）
+├── references/                     # 按需加载的引用文档
+│   ├── safety-policy.md            # 硬性边界
+│   ├── unified-workflow.md         # 工作流地图
+│   ├── protocols.md                # 协议合集
+│   └── evidence-protocol.md        # 证据门
+├── schemas/                        # JSON schema 验证
 │   ├── evidence.schema.json
 │   ├── finding.schema.json
 │   ├── case-manifest.schema.json
 │   └── case-report.schema.json
-├── scripts/                    # 确定性工具
-│   ├── labctl.py               # 主 CLI
-│   ├── sarif_export.py         # SARIF 导出
-│   ├── vector_index.py         # 向量索引
-│   ├── storage_sqlite.py       # SQLite 存储
-│   └── llm_provider.py         # LLM 提供者
+├── scripts/                        # Python 工具（opencode 运行）
+│   ├── labctl.py                   # 主 CLI
+│   ├── sarif_export.py             # SARIF 导出
+│   ├── vector_index.py             # 向量索引
+│   ├── storage_sqlite.py           # SQLite 存储
+│   └── llm_provider.py             # LLM 提供者
 ├── adr/                        # 架构决策记录
 └── tests/                      # 单元测试
 ```
 
-## 使用
+## 双引擎架构
+
+| 平台 | 引擎 | 能力 |
+|------|------|------|
+| **opencode** | Python scripts (labctl.py) | 完整功能：SARIF/SBOM 导入、知识管理、AI 实验 |
+| **operit** | QuickJS engine (defensive-ai-lab.js) | 核心功能：案例管理、审计日志、检查点、验证、报告渲染 |
+
+两个引擎共享相同的 references、schemas 和 evidence gate 协议。
+
+### Operit（QuickJS 引擎）
+
+引擎安装后自动暴露 5 个工具：`init`、`audit`、`checkpoint`、`validate`、`render`。
+
+### opencode（Python 脚本）
 
 ```bash
 # 初始化案例

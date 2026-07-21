@@ -51,3 +51,16 @@
 
 - defensive-ai-lab 22 测试通过
 - zero-skill 234 断言通过
+
+## 1.1.0 — 2026-07-21
+
+### 新增
+
+- **QuickJS 引擎**：`engine/defensive-ai-lab.js`，265 行，5 个工具（init/audit/checkpoint/validate/render）
+- **真正 Operit 可用**：在 QuickJS 沙箱中运行，不依赖 Python
+- **defensive-ai-lab.skill** 添加 engine/entrypoint 字段
+
+### 变更
+
+- **defensive-ai-lab.skill**：从纯声明的技能升级为带 JS 引擎的可执行技能
+- **SKILL.md**：添加 engine/entrypoint 字段

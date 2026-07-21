@@ -2,6 +2,8 @@
 name: defensive-ai-lab
 description: Defensive AI experiments, evidence-based local code security reviews, authorization regression tests, isolated execution planning, and auditable reports. Local-only; no scanning/exploitation/credential attacks.
 compatibility: OpenCode, Operit AI
+engine: defensive-ai-lab
+entrypoint: engine/defensive-ai-lab.js
 metadata:
   category: defensive-security
   safety: local-only

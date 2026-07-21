@@ -6,6 +6,8 @@ description: |
   仅本地操作；禁止扫描、利用、凭据攻击、授权绕过、流量代理或第三方代理安装。
 compatibility: Operit AI
 type: skill
+engine: defensive-ai-lab
+entrypoint: engine/defensive-ai-lab.js
 references:
   - references/safety-policy.md
   - references/unified-workflow.md
