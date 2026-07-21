@@ -147,6 +147,16 @@
       "description": "从 .trash 恢复文件"
     },
     {
+      "name": "snapshot_cleanup",
+      "layer": "快照",
+      "requires": ["Files"],
+      "min_permission": "basic",
+      "triggers": ["periodic", "manual"],
+      "blocking": false,
+      "description": "清理过期快照：超过 max_age_hours（默认 24h）或超过 max_count（默认 50 个）时删除最旧快照",
+      "added_in": "2.4.0"
+    },
+    {
       "name": "enforce_block",
       "layer": "强制拦截",
       "requires": [],

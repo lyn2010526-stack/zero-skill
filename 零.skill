@@ -85,17 +85,18 @@ metadata:
 
 | 工具 | 层 | 触发时机 |
 |------|-----|----------|
-| `preflight` | 综合 | 执行前四层串联 |
+| `preflight` | 综合 | 执行前六层门禁串联 |
 | `file_guard` | 防删 | 即将执行命令/脚本 |
 | `hallucination_guard` | 防幻觉 | 即将输出技术断言 |
 | `evidence_check` | 证据 | 即将宣称完成 |
-| `self_monitor` | 自我意识 | 任务开始前评估 |
+| `self_monitor` | 自检 | 任务开始前评估准备度 + 置信度 |
 | `output_firewall` | 防火墙 | 即将向用户输出 |
 | `search_opensource` | 开源 | 需要搜索方案 |
 | `remember` | 记忆 | 任务完成/失败后 |
 | `recall` | 记忆 | 遇到类似任务时 |
 | `snapshot_file` | 快照 | 删除前备份 |
 | `restore_file` | 快照 | 误删后恢复 |
+| `snapshot_cleanup` | 快照 | 清理过期快照（TTL/容量上限） |
 | `enforce_block` | 强制拦截 | preflight 返回 BLOCK 后，检查任务是否被硬阻断 |
 | `audit_log` | 调试 | 查看最近的工具调用审计记录 |
 | `evaluate_permission` | 权限 | 按 deny>ask>allow 评估工具调用 |

@@ -4,7 +4,7 @@
 
 ## 这是什么
 
-一个 Operit Sandbox Package，在 QuickJS 沙箱内运行可执行代码，为工程任务提供四层门禁：防删代码、防幻觉、证据验证、自我意识。所有"守护"行为由代码强制执行并返回结构化结果，不是软提示词。
+一个 Operit Sandbox Package，在 QuickJS 沙箱内运行可执行代码，为工程任务提供门禁：防删代码、防幻觉、证据验证、输出防火墙、记忆、快照。所有"守护"行为由代码强制执行并返回结构化结果，不是软提示词。
 
 ## 两种运行形态
 
@@ -31,33 +31,45 @@
  │    ├── TemplateStore        模板外部化
  │    ├── OutputChunker        大输出分块
  │    ├── TaskLedger           优先级任务队列
- │    ├── ResultEnvelope       统一返回体
  │    ├── ErrorCode            错误码枚举
- │    ├── AuditLogger          触发日志 (#8)
- │    ├── BlockEnforcer        硬阻断拦截器 (#5)
- │    ├── ManifestLoader       环境裁剪 (#7)
+ │    ├── AuditLogger          触发日志
+ │    ├── BlockEnforcer        硬阻断拦截器
+ │    ├── ManifestLoader       环境裁剪
  │    ├── FileGuard            防删代码层
  │    ├── Hallucination        防幻觉层
  │    ├── Evidence             证据验证层
- │    ├── SelfMonitor          自我意识层
- │    ├── OutputFirewall       输出防火墙
+ │    ├── SelfMonitor          自检层（目标清晰度、置信度、准备度评分）
+ │    ├── OutputFirewall       输出防火墙（秘密泄露、思考泄漏、填充语）
  │    ├── OpenSource           GitHub API 搜索
  │    ├── Memory               Operit 持久化记忆
- │    └── Snapshot             .trash 备份/恢复
- └── scripts/evolve.js (自动进化闭环 #6)
+ │    └── Snapshot             .trash 备份/恢复/自动清理
+ └── scripts/evolve.js (自动进化闭环)
       提取失败经验 → 聚类 → 生成新 reference → 测试 → 备份 → 合并
 ```
 
-## 八个能力层
+## 能力层
 
-1. **防删代码层 (FileGuard)** — 14 种破坏命令 + 9 种间接删除 + 7 类高风险路径 + 路径遍历检测
-2. **防幻觉层 (Hallucination)** — 5 类幻觉检测 + 自动置信度标签建议
+1. **防删代码层 (FileGuard)** — 14 种破坏命令正则匹配 + 9 种间接删除 + 7 类高风险路径 + 路径遍历检测
+2. **防幻觉层 (Hallucination)** — 5 类幻觉关键词检测（完成声明/绝对化词/无证据断言等）+ 自动置信度标签建议
 3. **证据验证层 (Evidence)** — L0-L6 七级验证 + 真实产物存在性检查
-4. **自我意识层 (SelfMonitor)** — 六维元状态 + 认知偏差自检 + 因果链深度
-5. **输出防火墙 (OutputFirewall)** — 6 类违规检测
+4. **自检层 (SelfMonitor)** — 评估目标清晰度、置信度、准备度评分（0-100）
+5. **输出防火墙 (OutputFirewall)** — 6 类违规检测：秘密泄露（GitHub Token/API Key/邮箱/私钥/JWT）、思考泄漏、工具泄漏、填充语、情绪化表达、超大代码块
 6. **开源搜索层 (OpenSource)** — 真实 GitHub API + 重试 + 限流
 7. **记忆层 (Memory)** — Operit 持久化记忆 + 分片 + LRU 缓存
-8. **文件快照层 (Snapshot)** — .trash 备份/恢复 + 路径互斥
+8. **文件快照层 (Snapshot)** — .trash 备份/恢复 + 路径互斥 + 自动清理（TTL 24h / 上限 50 个）
+
+## preflight 串联
+
+`preflight` 工具一次性触发全部 6 个门禁层：
+
+| 层 | 触发条件 | 结果 |
+|----|---------|------|
+| 自检层 | 始终 | 置信度 + 准备度评分 |
+| 防删层 | 传入 command | 破坏命令 → BLOCK |
+| 权限层 | 传入 command + permissions | DENY → BLOCK |
+| 防幻觉层 | 传入 goal + evidence | 无证断言 → BLOCK |
+| 输出防火墙 | 传入 goal | SEVERE → BLOCK |
+| 快照提示 | 破坏性命令 + 已读文件 | 建议先备份 |
 
 ## 安装
 
@@ -69,21 +81,22 @@ operit_editor:debug_install_js_package
 
 详见 `references/operit_capabilities.md` 中的权限分级和能力探测流程。
 
-## 工具列表（13 个）
+## 工具列表（14 个）
 
 | 工具 | 层 | 用途 |
 |------|-----|------|
-| `preflight` | 综合 | 四层门禁串联 |
+| `preflight` | 综合 | 六层门禁串联 |
 | `file_guard` | 防删 | 命令/脚本/路径风险分析 |
 | `hallucination_guard` | 防幻觉 | 幻觉检测 + 标签建议 |
 | `evidence_check` | 证据 | L0-L6 验证等级 |
-| `self_monitor` | 自我意识 | 六维元状态评估 |
+| `self_monitor` | 自检 | 准备度 + 置信度评分 |
 | `output_firewall` | 防火墙 | 六类违规检测 |
 | `search_opensource` | 开源 | GitHub API 搜索 |
 | `remember` | 记忆 | 写入持久化记忆 |
 | `recall` | 记忆 | 检索历史经验 |
 | `snapshot_file` | 快照 | 备份到 .trash |
 | `restore_file` | 快照 | 从 .trash 恢复 |
+| `snapshot_cleanup` | 快照 | 清理过期快照（TTL/容量） |
 | `enforce_block` | 强制拦截 | preflight BLOCK 后硬阻断后续工具调用 |
 | `audit_log` | 调试 | 查看最近的工具调用审计记录 |
 
@@ -93,6 +106,8 @@ operit_editor:debug_install_js_package
 node tests/test_zero_apex.js        # 引擎 + DI 集成 + 守卫层
 node tests/test_skill_activation.js # skill 层行为约束 + 强制拦截 + 环境裁剪 + 审计日志 + 进化闭环
 ```
+
+CI/CD：GitHub Actions 在 push/PR 时自动运行上述测试。
 
 当前测试覆盖：内置自测 19 项 + DI 集成 40+ 断言 + 守卫层 15+ 断言 + skill 层 113 断言。
 

@@ -1,0 +1,23 @@
+name: Tests
+
+on:
+  push:
+    branches: [master, main, "260720-refactor-engine-audit"]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Engine self-test + DI + guards
+        run: node tests/test_zero_apex.js
+
+      - name: Skill behavior + activation
+        run: node tests/test_skill_activation.js

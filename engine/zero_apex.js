@@ -1517,7 +1517,42 @@ const ZeroApex = (function () {
             }
         }
 
-        return { snapshot: snapshot, restore: restore };
+        async function cleanup(options) {
+            if (!Files) return { success: false, code: ErrorCode.DEPENDENCY_MISSING, error: "Files 不可用" };
+            options = options || {};
+            var maxAgeHours = options.max_age_hours || 24;
+            var maxCount = options.max_count || 50;
+            var basePath = options.base_path;
+            try {
+                var td = basePath ? PathUtils.trashDir(basePath) : null;
+                if (!td) return { success: true, code: ErrorCode.OK, cleaned: 0, message: "未指定 base_path，跳过清理" };
+                var listing;
+                try { listing = Files.listFiles ? await Files.listFiles(td) : null; } catch (e) {}
+                if (!listing || !listing.entries) return { success: true, code: ErrorCode.OK, cleaned: 0, message: "无法列出快照目录" };
+                var entries = listing.entries;
+                var now = Date.now();
+                var cutoff = now - maxAgeHours * 3600 * 1000;
+                var cleaned = 0;
+                if (entries.length > maxCount) {
+                    var sorted = entries.slice().sort(function (a, b) {
+                        var na = typeof a === "string" ? a : (a.name || "");
+                        var nb = typeof b === "string" ? b : (b.name || "");
+                        return na < nb ? -1 : na > nb ? 1 : 0;
+                    });
+                    var toRemove = sorted.length - maxCount;
+                    for (var i = 0; i < toRemove; i++) {
+                        var n = typeof sorted[i] === "string" ? sorted[i] : (sorted[i].name || "");
+                        if (n === ".keep") continue;
+                        try { await Files.write(PathUtils.join(td, n), ""); cleaned++; } catch (e2) {}
+                    }
+                }
+                return { success: true, code: ErrorCode.OK, cleaned: cleaned, message: "清理了 " + cleaned + " 个过期快照" };
+            } catch (e) {
+                return { success: false, code: ErrorCode.INTERNAL_ERROR, error: safeString(e) };
+            }
+        }
+
+        return { snapshot: snapshot, restore: restore, cleanup: cleanup };
     }
 
     // ======================================================================
@@ -1578,6 +1613,22 @@ const ZeroApex = (function () {
             if (shouldBlock) allowed = false;
         }
 
+        // OutputFirewall: check goal text for violations
+        var of = OutputFirewall.check(goal);
+        if (of.severity === "SEVERE" || of.severity === "MAJOR") {
+            gates.push("output_firewall");
+            for (var ov = 0; ov < of.violations.length; ov++) {
+                reasons.push("防火墙[" + of.violations[ov].type + "]: " + of.violations[ov].hit);
+            }
+            if (of.severity === "SEVERE") allowed = false;
+        }
+
+        // Snapshot awareness: destructive command without prior snapshot
+        if (command && FileGuard.analyzeCommand(command).is_delete && filesRead && filesRead.length > 0) {
+            gates.push("snapshot");
+            reasons.push("提示: 执行破坏性命令前建议先调用 snapshot_file 备份目标文件");
+        }
+
         var state;
         if (requiresConfirmation) state = "WAIT_CONFIRMATION";
         else if (!allowed) state = "NEED_EVIDENCE";
@@ -1600,6 +1651,8 @@ const ZeroApex = (function () {
             reasons: uniqReasons,
             self_awareness: self,
             hallucination: hallu,
+            output_firewall: of,
+            snapshot_advice: gates.indexOf("snapshot") >= 0,
             status_card: self.status_card,
             task_id: taskId,
         };
@@ -1880,6 +1933,7 @@ const ZeroApex = (function () {
                     { name: "recall", min_permission: "basic", requires: ["Tools.Memory"] },
                     { name: "snapshot_file", min_permission: "basic", requires: ["Files"] },
                     { name: "restore_file", min_permission: "basic", requires: ["Files"] },
+                    { name: "snapshot_cleanup", min_permission: "basic", requires: ["Files"] },
                     { name: "enforce_block", min_permission: "none", requires: [] },
                     { name: "audit_log", min_permission: "basic", requires: ["Files"] },
                     { name: "evaluate_permission", min_permission: "none", requires: [] },
@@ -2353,7 +2407,7 @@ const ZeroApex = (function () {
             if (!toolName) return "bash";
             var t = String(toolName).toLowerCase();
             if (t === "file_guard" || t === "fileguard") return "bash";
-            if (t === "snapshot_file" || t === "restore_file") return "edit";
+            if (t === "snapshot_file" || t === "restore_file" || t === "snapshot_cleanup") return "edit";
             if (t === "read" || t === "read_file" || t === "list_dir" || t === "grep") return "read";
             if (t === "edit" || t === "write" || t === "search_replace") return "edit";
             if (t === "bash" || t === "shell") return "bash";
@@ -2804,6 +2858,14 @@ async function restore_file(params) {
     return await ZeroApex.Snapshot.restore(params.path, params.snapshot_name);
 }
 
+async function snapshot_cleanup(params) {
+    return await ZeroApex.Snapshot.cleanup({
+        base_path: (params && params.base_path) || "/workspace",
+        max_age_hours: (params && params.max_age_hours) || 24,
+        max_count: (params && params.max_count) || 50,
+    });
+}
+
 
 // Self-test entry: pure logic layer only, verifies engine runs.
 async function main() {
@@ -2947,6 +3009,7 @@ exports.remember = wrapExport(remember, "remember");
 exports.recall = wrapExport(recall, "recall");
 exports.snapshot_file = wrapExport(snapshot_file, "snapshot_file");
 exports.restore_file = wrapExport(restore_file, "restore_file");
+exports.snapshot_cleanup = wrapExport(snapshot_cleanup, "snapshot_cleanup");
 exports.enforce_block = wrapExport(ZeroApex.enforce_block, "enforce_block");
 exports.audit_log = wrapExport(ZeroApex.audit_log, "audit_log");
 exports.evaluate_permission = wrapExport(ZeroApex.evaluate_permission, "evaluate_permission");
