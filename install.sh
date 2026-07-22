@@ -9,6 +9,7 @@ ENGINE_SRC="engine/zero_apex.js"
 MANIFEST_SRC="manifest.json"
 SKILL_SRC="零.skill"
 SKILL_MD_SRC="零.md"
+SKILL_ENG_SRC="skill.md"
 REFERENCES_SRC="references/"
 
 # 检测 Operit 默认安装路径
@@ -80,6 +81,9 @@ cp "$SKILL_SRC" "$TARGET/零.skill"
 if [ -f "$SKILL_MD_SRC" ]; then
     cp "$SKILL_MD_SRC" "$TARGET/零.md"
 fi
+if [ -f "$SKILL_ENG_SRC" ]; then
+    cp "$SKILL_ENG_SRC" "$TARGET/skill.md"
+fi
 
 if [ -d "$REFERENCES_SRC" ]; then
     cp -r "$REFERENCES_SRC"* "$TARGET/references/" 2>/dev/null || true
@@ -102,6 +106,7 @@ echo "引擎: $TARGET/engine/zero_apex.js"
 echo "清单: $TARGET/manifest.json"
 echo "Skill: $TARGET/零.skill"
 echo "Skill (md): $TARGET/零.md"
+echo "Skill (Operit pkg mgr): $TARGET/skill.md"
 echo ""
 echo "回滚（安装失败时）:"
 if [ -d "$BACKUP_DIR" ]; then
