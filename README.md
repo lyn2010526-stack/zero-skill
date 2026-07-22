@@ -77,9 +77,21 @@
 
 ## 安装
 
+### 方式 A：Operit SkillMarket（推荐）
+
+打开 Operit 的 **SkillMarket / 插件市场 → 添加链接**，粘贴：
+
+```
+https://github.com/lyn2010526-stack/zero-skill
+```
+
+Operit 会拉取 `main` 分支的 codeload zip，自动识别仓库根目录的 `SKILL.md` 作为 skill 定义并安装。详细逻辑见 [docs/operit_install.md](docs/operit_install.md)。
+
+### 方式 B：手动 install.sh
+
 ```bash
 bash install.sh                          # 默认路径（/sdcard/Download/Operit/dev_package/zero_apex）
-bash install.sh --version v2.5.1         # 版本锁定，版本不匹配时拒绝
+bash install.sh --version v2.5.5         # 版本锁定，版本不匹配时拒绝
 bash install.sh ~/custom-path            # 自定义路径
 ```
 
