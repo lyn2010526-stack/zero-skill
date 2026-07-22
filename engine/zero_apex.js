@@ -239,7 +239,9 @@ const ZeroApex = (function () {
             return out;
         }
 
-        return { register: register, get: get, has: has, snapshot: snapshot };
+        function exportCfg() { return snapshot(); }
+
+        return { register: register, get: get, has: has, snapshot: snapshot, export: exportCfg };
     })();
 
     // ======================================================================
@@ -1522,8 +1524,9 @@ const ZeroApex = (function () {
         async function cleanup(options) {
             if (!Files) return { success: false, code: ErrorCode.DEPENDENCY_MISSING, error: "Files 不可用" };
             options = options || {};
-            var maxAgeHours = options.max_age_hours || 24;
-            var maxCount = options.max_count || 50;
+            var defaults = ConfigRegistry.get("snapshot.cleanup", {});
+            var maxAgeHours = options.max_age_hours || defaults.max_age_hours || 168;
+            var maxCount = options.max_count || defaults.max_count || 50;
             var basePath = options.base_path;
             try {
                 var td = basePath ? PathUtils.trashDir(basePath) : null;
@@ -1876,6 +1879,9 @@ const ZeroApex = (function () {
         ConfigRegistry.register("memory.root", "zero_apex");
         ConfigRegistry.register("memory.cache_size", 64);
 
+        // Snapshot cleanup config
+        ConfigRegistry.register("snapshot.cleanup", { max_age_hours: 168, max_count: 50 });
+
         // Audit config (#8)
         ConfigRegistry.register("audit.enabled", true);
         ConfigRegistry.register("audit.log_path", ".zero_apex/audit_log.jsonl");
@@ -2054,6 +2060,8 @@ const ZeroApex = (function () {
                     { name: "audit_log", min_permission: "basic", requires: ["Files"] },
                     { name: "evaluate_permission", min_permission: "none", requires: [] },
                     { name: "check_sandbox", min_permission: "none", requires: [] },
+                    { name: "config_get", min_permission: "none", requires: [] },
+                    { name: "config_set", min_permission: "basic", requires: [] },
                 ],
                 references: [],
                 env_requirements: {
@@ -2859,24 +2867,42 @@ const ZeroApex = (function () {
         return String(e).slice(0, 120);
     }
 
-    return {
-        FileGuard: FileGuard,
-        Hallucination: Hallucination,
-        Evidence: defaultInstance.Evidence,
-        SelfMonitor: SelfMonitor,
-        OutputFirewall: OutputFirewall,
-        OpenSource: defaultInstance.OpenSource,
-        Memory: defaultInstance.Memory,
-        Snapshot: defaultInstance.Snapshot,
-        preflightGate: defaultInstance.preflight,
-        enforce_block: enforce_block,
-        audit_log: audit_log,
-        evaluate_permission: evaluate_permission,
-        check_sandbox: check_sandbox,
-        create: create,
-        wrapToolExecution: wrapToolExecution,
-        _infra: defaultInstance._infra,
-    };
+    async function config_get(params) {
+        var key = params && params.key;
+        if (key) {
+            return { success: true, key: key, value: ConfigRegistry.get(key) };
+        }
+        return { success: true, code: "OK", config: ConfigRegistry.export() };
+    }
+
+    async function config_set(params) {
+        if (!params || !params.key) {
+            return { success: false, code: "E4001", error: "缺少 key 参数" };
+        }
+        ConfigRegistry.register(params.key, params.value);
+        return { success: true, code: "OK", key: params.key, value: params.value };
+    }
+
+     return {
+         FileGuard: FileGuard,
+         Hallucination: Hallucination,
+         Evidence: defaultInstance.Evidence,
+         SelfMonitor: SelfMonitor,
+         OutputFirewall: OutputFirewall,
+         OpenSource: defaultInstance.OpenSource,
+         Memory: defaultInstance.Memory,
+         Snapshot: defaultInstance.Snapshot,
+         preflightGate: defaultInstance.preflight,
+         enforce_block: enforce_block,
+         audit_log: audit_log,
+         evaluate_permission: evaluate_permission,
+         check_sandbox: check_sandbox,
+         config_get: config_get,
+         config_set: config_set,
+         create: create,
+         wrapToolExecution: wrapToolExecution,
+         _infra: defaultInstance._infra,
+     };
 })();
 
 // ==========================================================================
@@ -3134,6 +3160,8 @@ exports.enforce_block = wrapExport(ZeroApex.enforce_block, "enforce_block");
 exports.audit_log = wrapExport(ZeroApex.audit_log, "audit_log");
 exports.evaluate_permission = wrapExport(ZeroApex.evaluate_permission, "evaluate_permission");
 exports.check_sandbox = wrapExport(ZeroApex.check_sandbox, "check_sandbox");
+exports.config_get = wrapExport(ZeroApex.config_get, "config_get");
+exports.config_set = wrapExport(ZeroApex.config_set, "config_set");
 exports.main = main;
 exports.create = ZeroApex.create;
 exports._infra = ZeroApex._infra;

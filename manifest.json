@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "name": "zero_apex",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "description": "首席工程师执行引擎。守护层为可执行 JS，运行在 Operit QuickJS 沙箱。",
   "compatibility": "Operit AI",
   "license": "Apache-2.0",
@@ -195,6 +195,26 @@
       "blocking": true,
       "description": "按 sandbox profile（workspace/read-only/strict）校验可写路径与可执行命令",
       "added_in": "2.3.0"
+    },
+    {
+      "name": "config_get",
+      "layer": "配置",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": ["manual"],
+      "blocking": false,
+      "description": "读取运行时配置项（如 snapshot.cleanup TTL/容量），不传 key 返回全部配置",
+      "added_in": "2.5.0"
+    },
+    {
+      "name": "config_set",
+      "layer": "配置",
+      "requires": [],
+      "min_permission": "basic",
+      "triggers": ["manual"],
+      "blocking": false,
+      "description": "运行时修改配置项（如 snapshot.cleanup.max_age_hours=720）",
+      "added_in": "2.5.0"
     }
   ],
   "references": [

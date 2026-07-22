@@ -389,6 +389,26 @@ async function runPermissionTests() {
   assert(m2, "Permission pattern git commit:* matches");
 
   console.log("[permission-test] all assertions done, failures=%d", failures);
+  runConfigTests();
+}
+
+function runConfigTests() {
+  var ZA = m.ZeroApex;
+  // config_get returns config value
+  var c1 = ZA.config_get({ key: "snapshot.cleanup" });
+  assert("config_get returns snapshot.cleanup", c1.success && c1.value && c1.value.max_age_hours === 168);
+  // config_get without key returns all
+  var c2 = ZA.config_get({});
+  assert("config_get all returns config", c2.success && c2.config && c2.config["snapshot.cleanup"]);
+  // config_set updates value
+  var c3 = ZA.config_set({ key: "snapshot.cleanup.max_age_hours", value: 720 });
+  assert("config_set updates value", c3.success && c3.value === 720);
+  // Verify it persisted
+  var c4 = ZA.config_get({ key: "snapshot.cleanup.max_age_hours" });
+  assert("config_set persisted", c4.value === 720);
+  // Restore default
+  ZA.config_set({ key: "snapshot.cleanup.max_age_hours", value: 168 });
+  console.log("[config-test] all config assertions done, failures=%d", failures);
 }
 
 
@@ -400,6 +420,7 @@ async function runPermissionTests() {
     await runShellGuardTests();
     await runSandboxTests();
     await runPermissionTests();
+    runConfigTests();
     if (failures === 0) {
       console.log("\nALL TESTS PASSED");
       process.exit(0);

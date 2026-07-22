@@ -17,7 +17,36 @@ jobs:
           node-version: "18"
 
       - name: Engine self-test + DI + guards
-        run: node tests/test_zero_apex.js
+        run: |
+          OUTPUT=$(node tests/test_zero_apex.js 2>&1)
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q "FAILED"; then
+            echo "::error::Engine self-test failed"
+            exit 1
+          fi
 
       - name: Skill behavior + activation
-        run: node tests/test_skill_activation.js
+        run: |
+          OUTPUT=$(node tests/test_skill_activation.js 2>&1)
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q "FAILED"; then
+            echo "::error::Skill activation tests failed"
+            exit 1
+          fi
+
+      - name: Coverage gate (minimum assertions)
+        run: |
+          # Extract assertion counts from test output
+          SELFTEST=$(node tests/test_zero_apex.js 2>&1 | grep 'self-test' | grep -oP 'total=\K[0-9]+')
+          SKILL=$(node tests/test_skill_activation.js 2>&1 | grep -oP '[0-9]+ passed' | grep -oP '[0-9]+')
+          echo "Self-test: $SELFTEST assertions"
+          echo "Skill: $SKILL assertions"
+          if [ "$SELFTEST" -lt 19 ] 2>/dev/null; then
+            echo "::error::Self-test coverage below threshold (19)"
+            exit 1
+          fi
+          if [ "$SKILL" -lt 100 ] 2>/dev/null; then
+            echo "::error::Skill test coverage below threshold (100)"
+            exit 1
+          fi
+          echo "Coverage gate: PASSED"

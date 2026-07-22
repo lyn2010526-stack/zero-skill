@@ -77,15 +77,15 @@
 
 ## 安装
 
-引擎文件：`engine/zero_apex.js`
-
+```bash
+bash install.sh                          # 默认路径（/sdcard/Download/Operit/dev_package/zero_apex）
+bash install.sh --version v2.5.1         # 版本锁定，版本不匹配时拒绝
+bash install.sh ~/custom-path            # 自定义路径
 ```
-operit_editor:debug_install_js_package
-```
 
-详见 `references/operit_capabilities.md` 中的权限分级和能力探测流程。
+安装时自动备份现有版本，失败时输出回滚命令。
 
-## 工具列表（16 个）
+## 工具列表（18 个）
 
 | 工具 | 层 | 用途 |
 |------|-----|------|
@@ -100,11 +100,13 @@ operit_editor:debug_install_js_package
 | `recall` | 记忆 | 检索历史经验 |
 | `snapshot_file` | 快照 | 备份到 .trash |
 | `restore_file` | 快照 | 从 .trash 恢复 |
-| `snapshot_cleanup` | 快照 | 清理过期快照（TTL/容量） |
+| `snapshot_cleanup` | 快照 | 清理过期快照（TTL/容量可配置） |
 | `enforce_block` | 强制拦截 | preflight BLOCK 后硬阻断后续工具调用 |
 | `audit_log` | 调试 | 查看最近的工具调用审计记录 |
 | `evaluate_permission` | 权限 | 按 deny>ask>allow 规则评估工具调用 |
 | `check_sandbox` | 沙箱 | 按 profile 校验路径/命令 |
+| `config_get` | 配置 | 读取运行时配置项 |
+| `config_set` | 配置 | 运行时修改配置项 |
 
 ## 测试
 
@@ -113,7 +115,7 @@ node tests/test_zero_apex.js        # 引擎 + DI 集成 + 守卫层
 node tests/test_skill_activation.js # skill 层行为约束 + 强制拦截 + 环境裁剪 + 审计日志 + 进化闭环
 ```
 
-CI/CD：GitHub Actions 在 push/PR 时自动运行上述测试。
+CI/CD：GitHub Actions 在 push/PR 时自动运行测试，覆盖率阈值（self-test ≥19, skill ≥100）未达标时阻断合并。
 
 当前测试覆盖：内置自测 19 项 + DI 集成 100+ 断言 + 守卫层 15+ 断言 + skill 层 113 断言。
 
