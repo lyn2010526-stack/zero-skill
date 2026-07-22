@@ -8,6 +8,7 @@ set -euo pipefail
 ENGINE_SRC="engine/zero_apex.js"
 MANIFEST_SRC="manifest.json"
 SKILL_SRC="零.skill"
+SKILL_MD_SRC="零.md"
 REFERENCES_SRC="references/"
 
 # 检测 Operit 默认安装路径
@@ -76,6 +77,9 @@ mkdir -p "$TARGET/tests"
 cp "$ENGINE_SRC" "$TARGET/engine/zero_apex.js"
 cp "$MANIFEST_SRC" "$TARGET/manifest.json"
 cp "$SKILL_SRC" "$TARGET/零.skill"
+if [ -f "$SKILL_MD_SRC" ]; then
+    cp "$SKILL_MD_SRC" "$TARGET/零.md"
+fi
 
 if [ -d "$REFERENCES_SRC" ]; then
     cp -r "$REFERENCES_SRC"* "$TARGET/references/" 2>/dev/null || true
@@ -97,6 +101,7 @@ echo "版本: v$CURRENT_VERSION"
 echo "引擎: $TARGET/engine/zero_apex.js"
 echo "清单: $TARGET/manifest.json"
 echo "Skill: $TARGET/零.skill"
+echo "Skill (md): $TARGET/零.md"
 echo ""
 echo "回滚（安装失败时）:"
 if [ -d "$BACKUP_DIR" ]; then
