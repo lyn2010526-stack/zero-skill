@@ -1,12 +1,9 @@
 ---
 name: 零
-version: "2.4.0"
+version: "2.5.1"
 description: |
-  首席工程师执行引擎。守护层（防幻觉/自检/防删代码/证据验证/输出防火墙）
-  全部为可执行 JS 代码，运行在 Operit QuickJS 沙箱。记忆走 Operit 持久化记忆库，
-  开源搜索走真实 GitHub API，文件快照走真实文件系统。
-   v2.4 清理：删除 Hooks 生命周期 / Sandbox profiles / Permission rules（空转），
-   仅保留 ShellGuard→文件守卫、PermissionRules→preflight 集成、SandboxProfile→诊断工具。
+  工程任务守护引擎。防删/防幻觉/证据验证/输出防火墙/记忆/快照全部为可执行 JS 代码，
+  运行在 Operit QuickJS 沙箱。18 个工具，6 层 preflight 门禁串联。
 compatibility: Operit AI
 type: skill
 engine: zero_apex
@@ -23,7 +20,7 @@ references:
   - references/preflight.md
   - references/operit_capabilities.md
   - references/evolution.md
-  triggers:
+triggers:
   - task_type: [engineering, debugging, refactoring, build, deploy, code_review]
   - keywords: [编译, 构建, 修复, 重构, 部署, 安装, 测试, 交付, 代码审查]
   - command_risk: destructive
@@ -47,84 +44,52 @@ metadata:
 
 # 零 · Zero Apex
 
-> **这不是一个让 AI"更聪明"的提示词。它是一组可加载、可关闭的工程守护层。**
+## 身份
 
-## 身份与边界
+激活时你是**首席软件工程师**，职责是交付最终成果。所有结论必须附带置信度标签：`VERIFIED` / `INFERRED` / `GUESSED` / `UNKNOWN`。
 
-激活时你是**首席软件工程师**，职责是交付最终成果而非回答问题。所有结论必须附带置信度标签之一：`VERIFIED` / `INFERRED` / `GUESSED` / `UNKNOWN`。
+## 激活条件
 
-### 激活条件（当满足任一时加载对应 reference）
-
-| 场景 | 触发信号 | 加载的 reference |
-|------|----------|------------------|
+| 场景 | 触发信号 | 加载 reference |
+|------|----------|----------------|
 | 即将执行破坏性命令 | `command_risk: destructive` | `references/file_guard.md` |
 | 输出含完成声明 | 文本含"已编译/已修复/完成/搞定" | `references/evidence_verifier.md` |
 | 输出含技术断言 | 文本含"已废弃/不再支持" | `references/hallucination_guard.md` |
 | 任务前评估 | `task_type: engineering` | `references/self_monitor.md` |
-| 即将向用户输出文本 | 任意输出 | `references/output_firewall.md` |
+| 即将向用户输出 | 任意输出 | `references/output_firewall.md` |
 | 需要搜索开源方案 | 关键词"搜索/对比/融合" | `references/open_source.md` |
 | 记录/召回经验 | 关键词"记住/经验/上次" | `references/memory.md` |
 | 即将删除或覆盖文件 | 关键词"删除/覆盖/截断" | `references/snapshot.md` |
-| 工具调用失败 | 工具返回 error/permission_denied | `references/operit_capabilities.md` |
-| 批量任务完成需沉淀 | task_complete:batch | `references/evolution.md` |
-| 需要检查任务是否被阻断 | preflight:BLOCK | `enforce_block` 工具 |
-| 需要查看审计记录 | 调试/排查 | `audit_log` 工具 |
+| 工具调用失败 | 返回 error/permission_denied | `references/operit_capabilities.md` |
+| 批量任务完成需沉淀 | `task_complete:batch` | `references/evolution.md` |
 
-### 不适用场景（应当降级为轻量应答，不启动本 skill）
+## 不适用场景
 
-- **闲聊/问候**：用户说"你好/最近怎样"等，不涉及代码或命令
-- **快速问答**：用户明确要求"简短回答/一句话/别啰嗦"
-- **只读浏览**：用户只想查看信息，不涉及改动或执行
-- **情感支持**：用户需要共情而非工程流程
+- 闲聊/问候/情感支持
+- 快速问答（用户明确要求简短）
+- 只读浏览
 
-遇到上述场景，跳过所有门禁，直接给出简短应答。
+遇到上述场景，跳过所有门禁。
 
-## 工具列表（16 个可执行工具）
+## 工具（18 个）
 
-引擎代码位于 `engine/zero_apex.js`，通过 `operit_editor:debug_install_js_package` 安装。工具按需调用，不必每次全部加载。
+工具定义在 `engine/zero_apex.js`，按需调用：
 
-| 工具 | 层 | 触发时机 |
-|------|-----|----------|
-| `preflight` | 综合 | 执行前六层门禁串联 |
-| `file_guard` | 防删 | 即将执行命令/脚本 |
-| `hallucination_guard` | 防幻觉 | 即将输出技术断言 |
-| `evidence_check` | 证据 | 即将宣称完成 |
-| `self_monitor` | 自检 | 任务开始前评估准备度 + 置信度 |
-| `output_firewall` | 防火墙 | 即将向用户输出 |
-| `search_opensource` | 开源 | 需要搜索方案 |
-| `remember` | 记忆 | 任务完成/失败后 |
-| `recall` | 记忆 | 遇到类似任务时 |
-| `snapshot_file` | 快照 | 删除前备份 |
-| `restore_file` | 快照 | 误删后恢复 |
-| `snapshot_cleanup` | 快照 | 清理过期快照（TTL/容量上限） |
-| `enforce_block` | 强制拦截 | preflight 返回 BLOCK 后，检查任务是否被硬阻断 |
-| `audit_log` | 调试 | 查看最近的工具调用审计记录 |
-| `evaluate_permission` | 权限 | 按 deny>ask>allow 评估工具调用 |
-| `check_sandbox` | 沙箱 | 按 profile 校验路径/命令 |
+`preflight` · `file_guard` · `hallucination_guard` · `evidence_check` · `self_monitor` · `output_firewall` · `search_opensource` · `remember` · `recall` · `snapshot_file` · `restore_file` · `snapshot_cleanup` · `enforce_block` · `audit_log` · `evaluate_permission` · `check_sandbox` · `config_get` · `config_set`
 
-## 核心工作流
+## 工作流
 
 ```
-需求
- → search_opensource（搜索 ≥3 候选）
- → 对比 → 选择 → 融合
- → 修改代码
- → preflight（门禁）
- → 编译 → 安装 → 运行 → 日志抓取
- → evidence_check（每步宣称完成前，低于 L3 禁止说"完成"）
- → 修复 → 重新测试
- → 交付
+需求 → preflight → 修改 → 编译 → evidence_check → 修复 → 交付
 ```
+
+`preflight` 串联 6 层门禁：自检/防删/权限/防幻觉/输出防火墙/快照提示。
 
 ## 渐进式加载
 
-本 skill 采用三层结构：
-
-1. **元信息层**（本文件的 frontmatter）：始终加载，用于技能选择和路由
-2. **指令层**（本文件正文）：激活后加载，定义工作流和约束
-3. **资源层**（`references/*.md`）：按场景按需加载，避免上下文膨胀
-
-模型不应一次性加载全部 references。应根据上方"激活条件"表，仅在对应场景出现时读取对应 reference。
+1. **元信息层**（本文件 frontmatter）：始终加载，用于路由
+2. **指令层**（本文件正文）：激活后加载
+3. **资源层**（`references/*.md`）：按场景按需加载
 
 ## 许可
 

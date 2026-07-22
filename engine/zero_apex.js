@@ -118,66 +118,16 @@
 }*/
 
 // ==========================================================================
-// zero_apex engine — refactored with infrastructure layer.
-//
-// Architecture (9 audit categories addressed):
-//   1. Module coupling / global state    -> Dependency injection via deps object
-//   2. API exception granularity / retry -> RetryPolicy + ConcurrencyLimiter + ErrorCodes
-//   3. Path hardcoding / file lock       -> PathUtils + FileLock
-//   4. Shell injection / sandbox         -> FileGuard pattern registry + allowlist mode
-//   5. Vector store sharding / cache     -> LRUCache + sharded memory folder
-//   6. Config scatter / validation       -> ConfigRegistry with schema validation
-//   7. Task persistence / priority       -> TaskLedger persisted to Files
-//   8. Return format / base class / type -> ResultEnvelope unified shape
-//   9. Report template coupling / chunk  -> TemplateStore + OutputChunker
-//
-// Runtime: Operit Sandbox (QuickJS). No require(). Single self-contained module.
-// External hooks injected at call time: Network, Files, Tools, complete.
-//
-// ---------------------------------------------------------------------------
-// Module navigation (single-file by QuickJS constraint; sections delimited):
-//   §0  ErrorCodes & ResultEnvelope      (lines ~120-180)
-//   §1  ConfigRegistry                  (lines ~185-230)
-//   §2  PathUtils                       (lines ~235-290)
-//   §3  RetryPolicy + sleep              (lines ~295-330)
-//   §4  ConcurrencyLimiter              (lines ~335-370)
-//   §5  FileLock                        (lines ~375-410)
-//   §6  LRUCache                        (lines ~415-450)
-//   §7  TemplateStore                  (lines ~455-485)
-//   §8  OutputChunker                   (lines ~490-525)
-//   §9  TaskLedger                      (lines ~530-580)
-//   §10 nowStamp + safeString           (lines ~585-605)
-//   §11 FileGuard                       (lines ~610-705)
-//   §12 Hallucination                   (lines ~710-820)
-//   §13 EvidenceModule                  (lines ~825-940)
-//   §14 SelfMonitor                     (lines ~945-1015)
-//   §15 OutputFirewall                  (lines ~1020-1095)
-//   §16 OpenSourceModule                (lines ~1100-1190)
-//   §17 MemoryModule                   (lines ~1195-1290)
-//   §18 SnapshotModule                 (lines ~1295-1410)
-//   §19 Snapshot cleanup + restore     (lines ~1415-1520)
-//   §19b GateRegistry                   (lines ~1525-1595)
-//   §20 PreflightGate                  (lines ~1675-1750)
-//   §21 bootstrapConfig                (lines ~1755-1850)
-//   §21a AuditLogger                   (lines ~1920)
-//   §21b BlockEnforcer                 (lines ~1980)
-//   §21c ManifestLoader                (lines ~2040)
-//   §21d ShellGuard (D+E)              (lines ~2150)  [2.3.0]
-//   §21e SandboxProfile (B)            (lines ~2330)  [2.3.0]
-//   §21f PermissionRules (C)           (lines ~2460)  [2.3.0]
-//   §21d ShellGuard   §21e SandboxProfile   §21f PermissionRules   [2.3.0]
-//   §22 create() factory + tool layer  (lines ~2587)
-//   §23 Self-test (main)               (lines ~2905)
-//
-// Each section is independently readable. references/*.md documents each §11-§19
-// module's behavior contract for skill-layer routing.
+// zero_apex engine — Operit Sandbox (QuickJS) single-file module.
+// No require(). External hooks (Network, Files, Tools, complete) injected
+// at call time. Section map: see §0-§23 delimiters in body.
 // ==========================================================================
 
 const ZeroApex = (function () {
     "use strict";
 
     // ======================================================================
-    // §0 ErrorCodes — enumerated, stable error identifiers (audit #2, #8)
+    // §0 ErrorCodes — enumerated, stable error identifiers
     // ======================================================================
     var ErrorCode = Object.freeze({
         OK: "OK",
@@ -205,7 +155,7 @@ const ZeroApex = (function () {
     });
 
     // ======================================================================
-    // §2 ConfigRegistry — centralized config with validation (audit #6)
+    // §2 ConfigRegistry — centralized config with validation
     // ======================================================================
     var ConfigRegistry = (function () {
         var store = {};
@@ -245,7 +195,7 @@ const ZeroApex = (function () {
     })();
 
     // ======================================================================
-    // §3 PathUtils — cross-platform path handling, no string concat (audit #3)
+    // §3 PathUtils — cross-platform path handling, no string concat
     // ======================================================================
     var PathUtils = (function () {
         var SEP = "/";
@@ -308,7 +258,7 @@ const ZeroApex = (function () {
     })();
 
     // ======================================================================
-    // §4 RetryPolicy — exponential backoff + jitter (audit #2)
+    // §4 RetryPolicy — exponential backoff + jitter
     // ======================================================================
     function RetryPolicy(opts) {
         opts = opts || {};
@@ -345,7 +295,7 @@ const ZeroApex = (function () {
     }
 
     // ======================================================================
-    // §5 ConcurrencyLimiter — simple semaphore (audit #2)
+    // §5 ConcurrencyLimiter — simple semaphore
     // ======================================================================
     function ConcurrencyLimiter(max) {
         var capacity = max || 1;
@@ -387,7 +337,7 @@ const ZeroApex = (function () {
     }
 
     // ======================================================================
-    // §6 FileLock — in-memory per-path async mutex (audit #3)
+    // §6 FileLock — in-memory per-path async mutex
     // ======================================================================
     function FileLock() {
         var locks = {};
@@ -435,7 +385,7 @@ const ZeroApex = (function () {
     }
 
     // ======================================================================
-    // §7 LRUCache — bounded LRU for recall / search caching (audit #5)
+    // §7 LRUCache — bounded LRU for recall / search caching
     // ======================================================================
     function LRUCache(capacity) {
         var cap = capacity || 32;
@@ -472,7 +422,7 @@ const ZeroApex = (function () {
     }
 
     // ======================================================================
-    // §8 TemplateStore — externalized report templates (audit #9)
+    // §8 TemplateStore — externalized report templates
     // ======================================================================
     var TemplateStore = (function () {
         var templates = {};
@@ -505,7 +455,7 @@ const ZeroApex = (function () {
     })();
 
     // ======================================================================
-    // §9 OutputChunker — segment large outputs (audit #9)
+    // §9 OutputChunker — segment large outputs
     // ======================================================================
     var OutputChunker = (function () {
         function chunk(text, maxBytes) {
@@ -543,7 +493,7 @@ const ZeroApex = (function () {
     })();
 
     // ======================================================================
-    // §10 TaskLedger — priority task queue persisted to Files (audit #7)
+    // §10 TaskLedger — priority task queue persisted to Files
     // ======================================================================
     function TaskLedger(deps) {
         var ledger = [];
@@ -637,7 +587,7 @@ const ZeroApex = (function () {
     }
 
     // ======================================================================
-    // §12 FileGuard — delete/overwrite detection (audit #1, #4, #6)
+    // §12 FileGuard — delete/overwrite detection
     // Patterns sourced from ConfigRegistry; allowlist mode available.
     // ======================================================================
     var FileGuard = (function () {
@@ -799,7 +749,7 @@ const ZeroApex = (function () {
     })();
 
     // ======================================================================
-    // §13 Hallucination — confidence-label governance (audit #6)
+    // §13 Hallucination — confidence-label governance
     // ======================================================================
     var Hallucination = (function () {
         function factClaims() { return ConfigRegistry.get("hallucination.fact_claims", []); }
@@ -912,7 +862,7 @@ const ZeroApex = (function () {
     })();
 
     // ======================================================================
-    // §14 Evidence — L0-L6 classification with real fs check (audit #1)
+    // §14 Evidence — L0-L6 classification with real fs check
     // Files dependency injected.
     // ======================================================================
     function EvidenceModule(deps) {
@@ -1036,7 +986,7 @@ const ZeroApex = (function () {
     }
 
     // ======================================================================
-    // §15 SelfMonitor — 6-dim meta-state + cognitive bias (audit #6, #9)
+    // §15 SelfMonitor — 6-dim meta-state + cognitive bias
     // status_card rendered via TemplateStore.
     // ======================================================================
     var SelfMonitor = (function () {
@@ -1111,7 +1061,7 @@ const ZeroApex = (function () {
     })();
 
     // ======================================================================
-    // §16 OutputFirewall — six violation classes (audit #6, #9)
+    // §16 OutputFirewall — six violation classes
     // Uses OutputChunker for oversized-block detection.
     // ======================================================================
     var OutputFirewall = (function () {
@@ -1209,7 +1159,7 @@ const ZeroApex = (function () {
     })();
 
     // ======================================================================
-    // §17 OpenSource — GitHub API search with retry + concurrency (audit #2)
+    // §17 OpenSource — GitHub API search with retry + concurrency
     // Network dependency injected; RetryPolicy + ConcurrencyLimiter applied.
     // ======================================================================
     function OpenSourceModule(deps) {
@@ -1321,7 +1271,7 @@ const ZeroApex = (function () {
 
     // ======================================================================
     // §18 Memory — Operit persistent memory with LRU cache + sharding
-    // (audit #1, #5) Tools.Memory dependency injected.
+    // Tools.Memory dependency injected.
     // ======================================================================
     function MemoryModule(deps) {
         deps = deps || {};
@@ -1425,7 +1375,7 @@ const ZeroApex = (function () {
     }
 
     // ======================================================================
-    // §19 Snapshot — .trash backup/restore with file lock (audit #3)
+    // §19 Snapshot — .trash backup/restore with file lock
     // Files dependency injected; FileLock prevents concurrent writes.
     // ======================================================================
     function SnapshotModule(deps) {
@@ -1679,7 +1629,7 @@ const ZeroApex = (function () {
     });
 
     // ======================================================================
-    // §20 PreflightGate — orchestrator with TaskLedger (audit #7, #9)
+    // §20 PreflightGate — orchestrator with TaskLedger
     // Uses GateRegistry for extensibility.
     // ======================================================================
     function preflightGate(deps, goal, command, evidence, filesRead) {
@@ -1891,7 +1841,7 @@ const ZeroApex = (function () {
     bootstrapConfig();
 
     // ======================================================================
-    // §21b AuditLogger — append-only JSONL audit log (audit #8)
+    // §21b AuditLogger — append-only JSONL audit log
     // Every tool call writes a line: timestamp/tool/task_id/trigger/duration/result
     // ======================================================================
     function AuditLogger(deps) {
@@ -1959,7 +1909,7 @@ const ZeroApex = (function () {
 
     // ======================================================================
     // §21c BlockEnforcer — hard block subsequent tools after preflight BLOCK
-    // (audit #5). When preflight returns allowed=false, enforce_block
+    //. When preflight returns allowed=false, enforce_block
     // registers a block on that task_id; subsequent tool calls for the same
     // task_id are rejected by the engine layer, not by the model's choice.
     // ======================================================================
@@ -2015,7 +1965,7 @@ const ZeroApex = (function () {
     }
 
     // ======================================================================
-    // §21d ManifestLoader — read manifest.json and curtail by env (audit #7)
+    // §21d ManifestLoader — read manifest.json and curtail by env
     // ======================================================================
     function ManifestLoader(deps) {
         deps = deps || {};
@@ -2040,7 +1990,7 @@ const ZeroApex = (function () {
             return manifestCache;
         }
 
-        // Builtin minimal manifest for graceful degradation (audit #7)
+        // Builtin minimal manifest for graceful degradation
         function getBuiltinManifest() {
             return {
                 tools: [

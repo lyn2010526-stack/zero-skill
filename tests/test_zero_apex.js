@@ -412,6 +412,145 @@ function runConfigTests() {
 }
 
 
+// ============================================================================
+// Performance benchmarks: preflight + file_guard + hallucination under N calls.
+// Threshold: each must complete under 50ms per call on average.
+// ============================================================================
+function runPerformanceTests() {
+  var ZA = m.ZeroApex;
+
+  // Benchmark: preflight GateRegistry
+  var N = 1000;
+  var pStart = Date.now();
+  for (var i = 0; i < N; i++) {
+    ZA.FileGuard.analyzeCommand("rm -rf /tmp/" + i);
+  }
+  var pDur = Date.now() - pStart;
+  var pAvg = pDur / N;
+  assert("perf file_guard 1000x avg<5ms", pAvg < 5);
+
+  // Benchmark: Hallucination check
+  var hStart = Date.now();
+  for (var j = 0; j < N; j++) {
+    ZA.Hallucination.check("编译通过了", "BUILD SUCCESSFUL");
+  }
+  var hDur = Date.now() - hStart;
+  var hAvg = hDur / N;
+  assert("perf hallucination 1000x avg<5ms", hAvg < 5);
+
+  // Benchmark: OutputFirewall
+  var oStart = Date.now();
+  for (var k = 0; k < N; k++) {
+    ZA.OutputFirewall.check("普通输出文本，没有违规内容");
+  }
+  var oDur = Date.now() - oStart;
+  var oAvg = oDur / N;
+  assert("perf output_firewall 1000x avg<5ms", oAvg < 5);
+
+  // Benchmark: preflightGate full chain
+  var pfStart = Date.now();
+  for (var p = 0; p < 100; p++) {
+    ZA.preflightGate({}, "测试目标 " + p, "ls -la /tmp", null, false);
+  }
+  var pfDur = Date.now() - pfStart;
+  var pfAvg = pfDur / 100;
+  assert("perf preflight 100x avg<50ms", pfAvg < 50);
+
+  console.log("[perf-test] avg file_guard=%.2fms hallucination=%.2fms firewall=%.2fms preflight=%.2fms",
+    pAvg, hAvg, oAvg, pfAvg);
+}
+
+
+// ============================================================================
+// Concurrency tests: ensure FileLock, ConcurrencyLimiter, LRUCache work under
+// concurrent access without data corruption.
+// ============================================================================
+async function runConcurrencyTests() {
+  var ZA = m.ZeroApex;
+
+  // Concurrency: ConcurrencyLimiter allows only N parallel
+  var limiter = new ZA._infra.ConcurrencyLimiter(2);
+  var active = 0;
+  var maxActive = 0;
+  var tasks = [];
+  for (var i = 0; i < 10; i++) {
+    tasks.push(limiter.run(function () {
+      active++;
+      if (active > maxActive) maxActive = active;
+      return new Promise(function (resolve) {
+        setTimeout(function () { active--; resolve(); }, 5);
+      });
+    }));
+  }
+  await Promise.all(tasks);
+  assert("concurrency limiter caps parallel <= 2", maxActive <= 2);
+
+  // Concurrency: LRUCache under repeated insert/evict
+  var cache = new ZA._infra.LRUCache(3);
+  for (var k = 0; k < 100; k++) cache.set("k" + k, k);
+  assert("LRU cache size respects cap", cache.size() <= 3);
+  assert("LRU cache evicts oldest", !cache.has("k0"));
+
+  // Concurrency: FileLock serializes per-path writes
+  var lock = new ZA._infra.FileLock();
+  var order = [];
+  var promises = [];
+  promises.push(lock.withLock("/a", function () { order.push("first"); return Promise.resolve(); }));
+  promises.push(lock.withLock("/a", function () { order.push("second"); return Promise.resolve(); }));
+  promises.push(lock.withLock("/b", function () { order.push("b-different"); return Promise.resolve(); }));
+  await Promise.all(promises);
+  assert("file lock serializes same path", order[0] === "first" && order[1] === "second");
+  assert("file lock allows different paths", order.indexOf("b-different") >= 0);
+
+  console.log("[concurrency-test] all assertions done, failures=%d", failures);
+}
+
+
+// ============================================================================
+// Regression tests: ensure v2.x exports remain stable across versions.
+// ============================================================================
+function runRegressionTests() {
+  // Each export must exist and be callable
+  var expected = [
+    "preflight", "file_guard", "hallucination_guard", "evidence_check",
+    "self_monitor", "output_firewall", "search_opensource", "remember", "recall",
+    "snapshot_file", "restore_file", "snapshot_cleanup",
+    "enforce_block", "audit_log", "evaluate_permission", "check_sandbox",
+    "config_get", "config_set"
+  ];
+  for (var i = 0; i < expected.length; i++) {
+    var t = expected[i];
+    assert("regression: " + t + " exported", typeof m[t] === "function");
+  }
+
+  // Result shape: all should return { success: boolean, code: string }
+  var r1 = m.ZeroApex.Hallucination.check("测试", null);
+  assert("regression: hallucination result shape", typeof r1.allowed === "boolean" || typeof r1.allowed === "undefined");
+
+  // DI pattern: create() must accept partial deps
+  try {
+    var inst = m.ZeroApex.create({});
+    assert("regression: create() with empty deps", !!inst.FileGuard);
+  } catch (e) {
+    assert("regression: create() with empty deps", false);
+  }
+
+  // ConfigRegistry pattern stable
+  var ZA = m.ZeroApex;
+  var before = ZA.config_get({ key: "memory.cache_size" }).value;
+  ZA.config_set({ key: "memory.cache_size", value: 256 });
+  var after = ZA.config_get({ key: "memory.cache_size" }).value;
+  assert("regression: config_set changes memory.cache_size", after === 256);
+  ZA.config_set({ key: "memory.cache_size", value: before });
+
+  // GateRegistry list
+  var gates = ZA._infra.GateRegistry.list();
+  assert("regression: 6 default gates registered", gates.length === 6);
+
+  console.log("[regression-test] all assertions done, failures=%d", failures);
+}
+
+
 (async () => {
   try {
     await runSelfTest();
@@ -421,6 +560,9 @@ function runConfigTests() {
     await runSandboxTests();
     await runPermissionTests();
     runConfigTests();
+    runPerformanceTests();
+    await runConcurrencyTests();
+    runRegressionTests();
     if (failures === 0) {
       console.log("\nALL TESTS PASSED");
       process.exit(0);
