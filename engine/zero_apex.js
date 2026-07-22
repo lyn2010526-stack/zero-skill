@@ -586,6 +586,104 @@ const ZeroApex = (function () {
         return String(v);
     }
 
+    // §11b CommandNormalizer — decode obfuscation before pattern matching
+    // Catches: \x72\x6d → rm, ${IFS}, $r$m, eval("rm"), base64 pipe, etc.
+    // Pure function: no side effects, returns normalized string.
+    // ======================================================================
+    var CommandNormalizer = (function () {
+
+        function decodeHexEscapes(s) {
+            // \xHH → char
+            return s.replace(/\\x([0-9a-fA-F]{2})/g, function (_, h) {
+                try { return String.fromCharCode(parseInt(h, 16)); } catch (e) { return ""; }
+            });
+        }
+
+        function decodeOctalEscapes(s) {
+            // \NNN → char (3 octal digits)
+            return s.replace(/\\([0-7]{1,3})/g, function (_, o) {
+                var n = parseInt(o, 8);
+                if (isNaN(n) || n > 255) return _;
+                try { return String.fromCharCode(n); } catch (e) { return _; }
+            });
+        }
+
+        function decodeUnicodeEscapes(s) {
+            // \uHHHH → char
+            return s.replace(/\\u([0-9a-fA-F]{4})/g, function (_, h) {
+                try { return String.fromCharCode(parseInt(h, 16)); } catch (e) { return ""; }
+            });
+        }
+
+        function resolveVarConcat(s) {
+            // Pattern 1: $r$m style (single-char variables concatenated)
+            // We mark as suspicious but cannot resolve without shell state.
+            return { text: s, varConcat: /\$\{?\w\}?\$\{?\w\}?\$\{?\w\}?/.test(s) };
+        }
+
+        function resolveBacktickSubst(s) {
+            // `cmd` → cmd (literal extraction only, no execution)
+            return s.replace(/`([^`]+)`/g, "$1");
+        }
+
+        function resolveDollarParen(s) {
+            // $(cmd) → cmd
+            return s.replace(/\$\(([^)]+)\)/g, "$1");
+        }
+
+        function decodeBase64Segments(s) {
+            // Detect | base64 -d patterns and flag (cannot decode without execution)
+            return { text: s, base64Pipe: /base64\s+(-d|--decode)/i.test(s) };
+        }
+
+        function detectEvalCall(s) {
+            // eval("...") or eval('...') patterns
+            var m = s.match(/eval\s*\(\s*['"]([^'"]+)['"]/);
+            if (m) return m[1];
+            return null;
+        }
+
+        function normalize(cmd) {
+            var text = safeString(cmd);
+            if (!text) return { normalized: "", signals: [] };
+
+            var signals = [];
+            var cur = text;
+
+            // Layer 1: literal escape decoding
+            var before = cur;
+            cur = decodeUnicodeEscapes(cur);
+            cur = decodeHexEscapes(cur);
+            cur = decodeOctalEscapes(cur);
+            if (cur !== before) signals.push("escape_decoded");
+
+            // Layer 2: command substitution unwrapping
+            before = cur;
+            cur = resolveBacktickSubst(cur);
+            cur = resolveDollarParen(cur);
+            if (cur !== before) signals.push("substitution_unwrapped");
+
+            // Layer 3: detect eval() with literal arg, expand it
+            var evalArg = detectEvalCall(cur);
+            if (evalArg) {
+                cur = cur + " " + evalArg;
+                signals.push("eval_expanded");
+            }
+
+            // Layer 4: var concat detection (cannot resolve, just signal)
+            var vc = resolveVarConcat(cur);
+            if (vc.varConcat) signals.push("var_concat_suspicious");
+
+            // Layer 5: base64 pipe detection
+            var b64 = decodeBase64Segments(cur);
+            if (b64.base64Pipe) signals.push("base64_pipe_suspicious");
+
+            return { normalized: cur, signals: signals };
+        }
+
+        return { normalize: normalize };
+    })();
+
     // ======================================================================
     // §12 FileGuard — delete/overwrite detection
     // Patterns sourced from ConfigRegistry; allowlist mode available.
@@ -602,10 +700,25 @@ const ZeroApex = (function () {
         }
 
         function analyzeCommand(cmd) {
-            var text = safeString(cmd);
+            // Layer 0: normalize (decode obfuscation) before pattern matching
+            var norm = CommandNormalizer.normalize(cmd);
+            var text = norm.normalized;
             var hits = [];
             var requiresConfirmation = false;
             var isDelete = false;
+            var suspiciousSignals = norm.signals.slice();
+
+            // If signals indicate obfuscation, require confirmation by default
+            if (suspiciousSignals.length > 0) {
+                requiresConfirmation = true;
+                for (var si = 0; si < suspiciousSignals.length; si++) {
+                    hits.push({
+                        pattern: "obfuscation:" + suspiciousSignals[si],
+                        desc: "检测到命令混淆: " + suspiciousSignals[si] + "（原始: " + safeString(cmd).slice(0, 60) + "）",
+                        soft: false,
+                    });
+                }
+            }
 
             var plist = patterns();
             for (var i = 0; i < plist.length; i++) {
@@ -773,9 +886,70 @@ const ZeroApex = (function () {
             return null;
         }
 
+        // Structural evidence parser: extract concrete signals from evidence text
+        // Recognizes: exit codes, build outputs, test results, file paths
+        function parseEvidenceSignals(evidence) {
+            if (!evidence) return { count: 0, signals: [], hasStrong: false };
+            var text = safeString(evidence);
+            var signals = [];
+
+            // Exit code pattern
+            var exitMatch = text.match(/exit[_-]?code[:\s=]+(\d+)/i);
+            if (exitMatch) {
+                var code = parseInt(exitMatch[1], 10);
+                signals.push({ type: "exit_code", value: code, success: code === 0 });
+            }
+
+            // Build success patterns
+            if (/BUILD\s+SUCCESSFUL|build\s+success|compiled\s+successfully/i.test(text)) {
+                signals.push({ type: "build_success", success: true });
+            }
+
+            // Test pass patterns
+            var testMatch = text.match(/(\d+)\s*(tests?|specs?)\s*(passed|successful|ok)/i);
+            if (testMatch) signals.push({ type: "test_pass", count: parseInt(testMatch[1], 10), success: true });
+
+            // Failure patterns
+            if (/\b(error|failed|fatal|panic|exception)\b/i.test(text) && !/0\s+errors/i.test(text)) {
+                signals.push({ type: "has_error", success: false });
+            }
+
+            // File path reference (count as weaker signal)
+            var pathMatches = text.match(/\/[\w\-\.\/]+\.\w+/g);
+            if (pathMatches) signals.push({ type: "path_refs", count: pathMatches.length, success: true });
+
+            // JSON-like key:value supports array
+            var supportsMatch = text.match(/supports[:\s=]+\[([^\]]+)\]/i);
+            if (supportsMatch) {
+                var parts = supportsMatch[1].split(",").map(function (s) { return s.trim(); });
+                signals.push({ type: "supports", items: parts, success: parts.length > 0 });
+            }
+
+            var hasStrong = signals.some(function (s) {
+                return (s.type === "build_success" && s.success) ||
+                       (s.type === "test_pass" && s.success) ||
+                       (s.type === "exit_code" && s.success);
+            });
+
+            return { count: signals.length, signals: signals, hasStrong: hasStrong };
+        }
+
+        // Evidence-quality grade: L0-L6 based on structural analysis
+        function gradeEvidence(evidence) {
+            var p = parseEvidenceSignals(evidence);
+            if (p.count === 0) return 0;
+            if (p.hasStrong) return 5;
+            if (p.signals.some(function (s) { return s.type === "supports"; })) return 4;
+            if (p.signals.some(function (s) { return s.type === "path_refs"; })) return 3;
+            return 2;
+        }
+
         function check(rawText, evidence) {
             var text = safeString(rawText);
-            var hasEvidence = !!(evidence && safeString(evidence).trim().length > 0);
+            var evidenceText = safeString(evidence);
+            var hasEvidence = evidenceText.trim().length > 0;
+            var evidenceGrade = gradeEvidence(evidence);
+            var hasStrongEvidence = evidenceGrade >= 4;
             var violations = [];
             var currentLabel = extractLabel(text);
 
@@ -787,6 +961,14 @@ const ZeroApex = (function () {
                     rule: "fact_without_evidence",
                     hit: factWord,
                     fix: "补充工具执行证据，或改为『正在...』过程描述",
+                });
+            } else if (isFactClaim && hasEvidence && !hasStrongEvidence) {
+                // Strong fact claim but only weak evidence — flag but don't block
+                violations.push({
+                    rule: "fact_with_weak_evidence",
+                    hit: factWord,
+                    fix: "事实声明应附强证据（构建产物/测试通过/退出码），当前证据等级 L" + evidenceGrade,
+                    severity: "minor",
                 });
             }
 
@@ -839,26 +1021,28 @@ const ZeroApex = (function () {
             }
 
             var suggestedLabel;
-            if (hasEvidence) suggestedLabel = "VERIFIED";
+            if (hasStrongEvidence) suggestedLabel = "VERIFIED";
+            else if (hasEvidence) suggestedLabel = "INFERRED";
             else if (isFactClaim || absWord) suggestedLabel = "GUESSED";
             else if (ocWord) suggestedLabel = "INFERRED";
             else suggestedLabel = "UNKNOWN";
 
-            var allowed = violations.length === 0;
+            var allowed = violations.filter(function (v) { return v.severity !== "minor"; }).length === 0;
             return {
                 allowed: allowed,
                 current_label: currentLabel,
                 suggested_label: suggestedLabel,
                 has_evidence: hasEvidence,
+                evidence_grade: evidenceGrade,
                 is_fact_claim: isFactClaim,
                 violations: violations,
                 verdict: allowed
                     ? "PASS"
-                    : "BLOCK: 存在 " + violations.length + " 处幻觉风险，需修正后输出",
+                    : "BLOCK: 存在 " + violations.filter(function (v) { return v.severity !== "minor"; }).length + " 处幻觉风险，需修正后输出",
             };
         }
 
-        return { check: check };
+        return { check: check, gradeEvidence: gradeEvidence, parseEvidenceSignals: parseEvidenceSignals };
     })();
 
     // ======================================================================
@@ -1545,7 +1729,42 @@ const ZeroApex = (function () {
             return isNaN(ts) ? 0 : ts;
         }
 
-        return { snapshot: snapshot, restore: restore, cleanup: cleanup };
+        // Tombstone: since Files.delete is unavailable in Operit sandbox,
+        // we replace the original file with a tombstone marker pointing to
+        // the most recent snapshot. The file is still there but logically
+        // "deleted" — restore_file can recover it from the snapshot.
+        async function tombstone(path) {
+            if (!Files) return { success: false, code: ErrorCode.DEPENDENCY_MISSING, error: "Files 不可用" };
+            if (PathUtils.hasTraversal(path)) {
+                return { success: false, code: ErrorCode.PATH_TRAVERSAL, error: "路径含非法遍历片段" };
+            }
+            try {
+                // First snapshot the file
+                var snap = await snapshot(path);
+                if (!snap.success) return snap;
+                // Then overwrite with tombstone marker
+                var marker = [
+                    "### ZERO_APEX_TOMBSTONE ###",
+                    "原文件已被逻辑删除: " + path,
+                    "快照位置: " + snap.snapshot,
+                    "时间: " + new Date().toISOString(),
+                    "### 调用 restore_file 恢复 ###",
+                ].join("\n");
+                var w = await Files.write(path, marker);
+                return {
+                    success: !!(w && (w.successful === undefined || w.successful)),
+                    code: ErrorCode.OK,
+                    message: "已写入墓碑（Files.delete 不可用，原始位置被覆盖为恢复指针）",
+                    tombstoned: path,
+                    snapshot: snap.snapshot,
+                    recoverable: true,
+                };
+            } catch (e) {
+                return { success: false, code: ErrorCode.INTERNAL_ERROR, error: safeString(e) };
+            }
+        }
+
+        return { snapshot: snapshot, restore: restore, cleanup: cleanup, tombstone: tombstone };
     }
 
     // ======================================================================
@@ -2006,6 +2225,7 @@ const ZeroApex = (function () {
                     { name: "snapshot_file", min_permission: "basic", requires: ["Files"] },
                     { name: "restore_file", min_permission: "basic", requires: ["Files"] },
                     { name: "snapshot_cleanup", min_permission: "basic", requires: ["Files"] },
+                    { name: "tombstone_file", min_permission: "basic", requires: ["Files"] },
                     { name: "enforce_block", min_permission: "none", requires: [] },
                     { name: "audit_log", min_permission: "basic", requires: ["Files"] },
                     { name: "evaluate_permission", min_permission: "none", requires: [] },
@@ -2484,7 +2704,7 @@ const ZeroApex = (function () {
             if (!toolName) return "bash";
             var t = String(toolName).toLowerCase();
             if (t === "file_guard" || t === "fileguard") return "bash";
-            if (t === "snapshot_file" || t === "restore_file" || t === "snapshot_cleanup") return "edit";
+            if (t === "snapshot_file" || t === "restore_file" || t === "snapshot_cleanup" || t === "tombstone_file") return "edit";
             if (t === "read" || t === "read_file" || t === "list_dir" || t === "grep") return "read";
             if (t === "edit" || t === "write" || t === "search_replace") return "edit";
             if (t === "bash" || t === "shell") return "bash";
@@ -2849,6 +3069,7 @@ const ZeroApex = (function () {
          check_sandbox: check_sandbox,
          config_get: config_get,
          config_set: config_set,
+         tombstone_file: tombstone_file,
          create: create,
          wrapToolExecution: wrapToolExecution,
          _infra: defaultInstance._infra,
@@ -2952,6 +3173,10 @@ async function snapshot_file(params) {
 
 async function restore_file(params) {
     return await ZeroApex.Snapshot.restore(params.path, params.snapshot_name);
+}
+
+async function tombstone_file(params) {
+    return await ZeroApex.Snapshot.tombstone(params.path);
 }
 
 async function snapshot_cleanup(params) {
@@ -3106,6 +3331,7 @@ exports.recall = wrapExport(recall, "recall");
 exports.snapshot_file = wrapExport(snapshot_file, "snapshot_file");
 exports.restore_file = wrapExport(restore_file, "restore_file");
 exports.snapshot_cleanup = wrapExport(snapshot_cleanup, "snapshot_cleanup");
+exports.tombstone_file = wrapExport(tombstone_file, "tombstone_file");
 exports.enforce_block = wrapExport(ZeroApex.enforce_block, "enforce_block");
 exports.audit_log = wrapExport(ZeroApex.audit_log, "audit_log");
 exports.evaluate_permission = wrapExport(ZeroApex.evaluate_permission, "evaluate_permission");

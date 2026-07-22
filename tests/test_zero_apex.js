@@ -507,6 +507,113 @@ async function runConcurrencyTests() {
 
 
 // ============================================================================
+// Obfuscation / Normalizer tests: verify that escape sequences,
+// command substitution, eval literals, var concat are caught.
+// ============================================================================
+function runNormalizerTests() {
+  var FG = m.ZeroApex.FileGuard;
+
+  // Hex escape: \x72\x6d should be normalized to "rm"
+  var t1 = FG.analyzeCommand("\\x72\\x6d -rf /tmp/test");
+  assert("normalizer: hex escape caught", t1.requires_confirmation && t1.is_delete);
+
+  // Unicode escape: \u0072\u006d → rm
+  var t2 = FG.analyzeCommand("\\u0072\\u006d -rf /tmp/test");
+  assert("normalizer: unicode escape caught", t2.requires_confirmation && t2.is_delete);
+
+  // Backtick command substitution
+  var t3 = FG.analyzeCommand("`rm` -rf /tmp/test");
+  assert("normalizer: backtick subst caught", t3.requires_confirmation && t3.is_delete);
+
+  // Dollar-paren substitution
+  var t4 = FG.analyzeCommand("$(rm) -rf /tmp/test");
+  assert("normalizer: dollar-paren subst caught", t4.requires_confirmation && t4.is_delete);
+
+  // Var concat (cannot resolve, but signal fires)
+  var t5 = FG.analyzeCommand("$r$m -rf /tmp/test");
+  assert("normalizer: var concat signals suspicious", t5.requires_confirmation);
+
+  // Eval literal: eval("rm -rf /tmp")
+  var t6 = FG.analyzeCommand('eval("rm -rf /tmp")');
+  assert("normalizer: eval literal expanded", t6.requires_confirmation && t6.is_delete);
+
+  // Base64 pipe
+  var t7 = FG.analyzeCommand("cat x | base64 -d | sh");
+  assert("normalizer: base64 pipe flagged", t7.requires_confirmation);
+
+  // Plain command (no obfuscation) should still work
+  var t8 = FG.analyzeCommand("ls -la /tmp");
+  assert("normalizer: plain command not over-flagged", !t8.requires_confirmation);
+
+  console.log("[normalizer-test] all assertions done, failures=%d", failures);
+}
+
+
+// ============================================================================
+// Structural evidence grading tests: verify L0-L5 evidence classification.
+// ============================================================================
+function runEvidenceGradeTests() {
+  var H = m.ZeroApex.Hallucination;
+
+  // L5: strong evidence (build success)
+  var g1 = H.gradeEvidence("exit_code:0, BUILD SUCCESSFUL");
+  assert("evidence grade: strong = L5", g1 === 5);
+
+  // L5: test pass count
+  var g2 = H.gradeEvidence("42 tests passed");
+  assert("evidence grade: tests passed = L5", g2 === 5);
+
+  // L4: supports array
+  var g3 = H.gradeEvidence("supports: [exit_code:0, stdout:success]");
+  assert("evidence grade: supports array = L4", g3 === 4);
+
+  // L3: file path references
+  var g4 = H.gradeEvidence("file created at /tmp/output.log");
+  assert("evidence grade: path refs = L3", g4 === 3);
+
+  // L0: no evidence
+  var g5 = H.gradeEvidence("");
+  assert("evidence grade: empty = L0", g5 === 0);
+
+  // Combined: fact claim + weak evidence should be allowed but flagged as minor
+  var r1 = H.check("已修复 bug", "see /tmp/output.log");
+  assert("hallucination: fact+weak evidence minor-only", r1.allowed && r1.evidence_grade === 3);
+
+  // Fact claim + strong evidence = clean
+  var r2 = H.check("已修复 bug", "BUILD SUCCESSFUL, 42 tests passed");
+  assert("hallucination: fact+strong evidence = PASS", r2.allowed && r2.evidence_grade === 5);
+
+  // Fact claim + no evidence = blocked
+  var r3 = H.check("已修复 bug", null);
+  assert("hallucination: fact+no evidence = BLOCK", !r3.allowed);
+
+  console.log("[evidence-grade-test] all assertions done, failures=%d", failures);
+}
+
+
+// ============================================================================
+// Tombstone tests: verify Files.delete substitute mechanism.
+// ============================================================================
+function runTombstoneTests() {
+  var ZA = m.ZeroApex;
+
+  // Tombstone function exists
+  assert("tombstone: function exists", typeof ZA.Snapshot.tombstone === "function");
+
+  // Tombstone returns DEPENDENCY_MISSING when Files is not injected
+  ZA.Snapshot.tombstone("/tmp/test.txt").then(function (r) {
+    if (ZA._infra.ErrorCode) {
+      assert("tombstone: dep missing when no Files", r.code === "E5002_DEPENDENCY_MISSING" || r.success === false);
+    } else {
+      assert("tombstone: returns error when no Files", r.success === false);
+    }
+  });
+
+  console.log("[tombstone-test] all assertions done, failures=%d", failures);
+}
+
+
+// ============================================================================
 // Regression tests: ensure v2.x exports remain stable across versions.
 // ============================================================================
 function runRegressionTests() {
@@ -562,6 +669,9 @@ function runRegressionTests() {
     runConfigTests();
     runPerformanceTests();
     await runConcurrencyTests();
+    runNormalizerTests();
+    runEvidenceGradeTests();
+    runTombstoneTests();
     runRegressionTests();
     if (failures === 0) {
       console.log("\nALL TESTS PASSED");

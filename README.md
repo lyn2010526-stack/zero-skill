@@ -49,14 +49,14 @@
 
 ## 能力层
 
-1. **防删代码层 (FileGuard)** — 14 种破坏命令正则匹配 + 9 种间接删除 + 7 类高风险路径 + 路径遍历检测
-2. **防幻觉层 (Hallucination)** — 5 类幻觉关键词检测（完成声明/绝对化词/无证据断言等）+ 自动置信度标签建议
+1. **防删代码层 (FileGuard)** — 14 种破坏命令正则匹配 + 9 种间接删除 + 7 类高风险路径 + **CommandNormalizer 混淆解码**（hex/unicode/octal 转义、反引号、$()、eval 字面量、base64 管道）
+2. **防幻觉层 (Hallucination)** — **结构化证据分级 L0-L5**（解析 exit_code、BUILD SUCCESSFUL、tests passed、supports 数组、文件路径）+ 5 类幻觉关键词检测
 3. **证据验证层 (Evidence)** — L0-L6 七级验证 + 真实产物存在性检查
-4. **自检层 (SelfMonitor)** — 评估目标清晰度、置信度、准备度评分（0-100）
-5. **输出防火墙 (OutputFirewall)** — 6 类违规检测：秘密泄露（GitHub Token/API Key/邮箱/私钥/JWT）、思考泄漏、工具泄漏、填充语、情绪化表达、超大代码块
+4. **自检层 (SelfMonitor)** — 评估目标清晰度、置信度、准备度评分（0-100）+ 因果链深度
+5. **输出防火墙 (OutputFirewall)** — 6 类违规检测：秘密泄露、思考泄漏、工具泄漏、填充语、情绪化表达、超大代码块
 6. **开源搜索层 (OpenSource)** — 真实 GitHub API + 重试 + 限流
 7. **记忆层 (Memory)** — Operit 持久化记忆 + 分片 + LRU 缓存
-8. **文件快照层 (Snapshot)** — .trash 备份/恢复 + 路径互斥 + 自动清理（TTL 24h / 上限 50 个）
+8. **文件快照层 (Snapshot)** — .trash 备份/恢复 + 路径互斥 + 自动清理（TTL/容量）+ **tombstone 墓碑机制**（Files.delete 不可用时用恢复指针替代）
 
 ## 工具数量
 
@@ -85,13 +85,13 @@ bash install.sh ~/custom-path            # 自定义路径
 
 安装时自动备份现有版本，失败时输出回滚命令。
 
-## 工具列表（18 个）
+## 工具列表（19 个）
 
 | 工具 | 层 | 用途 |
 |------|-----|------|
 | `preflight` | 综合 | 六层门禁串联 |
-| `file_guard` | 防删 | 命令/脚本/路径风险分析 |
-| `hallucination_guard` | 防幻觉 | 幻觉检测 + 标签建议 |
+| `file_guard` | 防删 | 命令/脚本/路径风险分析（含混淆解码） |
+| `hallucination_guard` | 防幻觉 | 结构化证据分级 L0-L5 |
 | `evidence_check` | 证据 | L0-L6 验证等级 |
 | `self_monitor` | 自检 | 准备度 + 置信度评分 |
 | `output_firewall` | 防火墙 | 六类违规检测 |
@@ -101,6 +101,7 @@ bash install.sh ~/custom-path            # 自定义路径
 | `snapshot_file` | 快照 | 备份到 .trash |
 | `restore_file` | 快照 | 从 .trash 恢复 |
 | `snapshot_cleanup` | 快照 | 清理过期快照（TTL/容量可配置） |
+| `tombstone_file` | 快照 | 逻辑删除（Files.delete 不可用时的墓碑机制） |
 | `enforce_block` | 强制拦截 | preflight BLOCK 后硬阻断后续工具调用 |
 | `audit_log` | 调试 | 查看最近的工具调用审计记录 |
 | `evaluate_permission` | 权限 | 按 deny>ask>allow 规则评估工具调用 |
