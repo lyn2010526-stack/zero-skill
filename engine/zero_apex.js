@@ -155,15 +155,17 @@
 //   §16 OpenSourceModule                (lines ~1100-1190)
 //   §17 MemoryModule                   (lines ~1195-1290)
 //   §18 SnapshotModule                 (lines ~1295-1410)
-//   §19 preflightGate                  (lines ~1415-1485)
-//   §20 bootstrapConfig                (lines ~1490-1575)
-//   §21b AuditLogger                   (lines ~1689)
-//   §21c BlockEnforcer                 (lines ~1754)
-//   §21d ManifestLoader                (lines ~1811)
-//   §21e ShellGuard (D+E)              (lines ~1918)  [2.3.0]
-//   §21f SandboxProfile (B)            (lines ~2094)  [2.3.0]
-//   §21g PermissionRules (C)           (lines ~2227)  [2.3.0]
-//   §21e ShellGuard   §21f SandboxProfile   §21g PermissionRules   [2.3.0]
+//   §19 Snapshot cleanup + restore     (lines ~1415-1520)
+//   §19b GateRegistry                   (lines ~1525-1595)
+//   §20 PreflightGate                  (lines ~1675-1750)
+//   §21 bootstrapConfig                (lines ~1755-1850)
+//   §21a AuditLogger                   (lines ~1920)
+//   §21b BlockEnforcer                 (lines ~1980)
+//   §21c ManifestLoader                (lines ~2040)
+//   §21d ShellGuard (D+E)              (lines ~2150)  [2.3.0]
+//   §21e SandboxProfile (B)            (lines ~2330)  [2.3.0]
+//   §21f PermissionRules (C)           (lines ~2460)  [2.3.0]
+//   §21d ShellGuard   §21e SandboxProfile   §21f PermissionRules   [2.3.0]
 //   §22 create() factory + tool layer  (lines ~2587)
 //   §23 Self-test (main)               (lines ~2905)
 //
@@ -1594,7 +1596,88 @@ const ZeroApex = (function () {
     }
 
     // ======================================================================
+    // §19b GateRegistry — extensible preflight gate chain
+    // ======================================================================
+    var GateRegistry = [];
+    function registerGate(name, fn) {
+        for (var i = 0; i < GateRegistry.length; i++) {
+            if (GateRegistry[i].name === name) { GateRegistry[i].fn = fn; return; }
+        }
+        GateRegistry.push({ name: name, fn: fn });
+    }
+    function runGates(ctx) {
+        var results = [];
+        for (var i = 0; i < GateRegistry.length; i++) {
+            var g = GateRegistry[i];
+            try {
+                var r = g.fn(ctx);
+                if (r) results.push({ gate: g.name, result: r });
+            } catch (e) {
+                results.push({ gate: g.name, error: safeString(e) });
+            }
+        }
+        return results;
+    }
+
+    // Register default gates
+    registerGate("self_awareness", function (ctx) {
+        var self = SelfMonitor.assess({
+            goal: ctx.goal,
+            files_read: ctx.filesRead,
+            evidence_ready: !!(ctx.evidence && safeString(ctx.evidence).trim()),
+        });
+        ctx.self = self;
+        if (self.cognitive_biases.length > 0) {
+            return { triggered: true, biases: self.cognitive_biases };
+        }
+        return { triggered: false };
+    });
+    registerGate("file_guard", function (ctx) {
+        if (!ctx.command) return null;
+        var risk = FileGuard.analyzeCommand(ctx.command);
+        if (risk.requires_confirmation) {
+            return { triggered: true, risk: risk, block: true };
+        }
+        return { triggered: false };
+    });
+    registerGate("permission", function (ctx) {
+        if (!ctx.command || !ctx.deps || !ctx.deps.permissions) return null;
+        var perm = ctx.deps.permissions.evaluate("bash", { command: ctx.command });
+        if (perm.verdict === "DENY") {
+            return { triggered: true, reason: perm.reason, block: true };
+        }
+        return { triggered: false };
+    });
+    registerGate("hallucination", function (ctx) {
+        var hallu = Hallucination.check(ctx.goal, ctx.evidence);
+        ctx.hallu = hallu;
+        if (!hallu.allowed) {
+            var shouldBlock = false;
+            for (var i = 0; i < hallu.violations.length; i++) {
+                if (hallu.violations[i].rule === "fact_without_evidence") { shouldBlock = true; break; }
+            }
+            return { triggered: true, violations: hallu.violations, block: shouldBlock };
+        }
+        return { triggered: false };
+    });
+    registerGate("output_firewall", function (ctx) {
+        var of = OutputFirewall.check(ctx.goal);
+        ctx.of = of;
+        if (of.severity === "SEVERE" || of.severity === "MAJOR") {
+            return { triggered: true, violations: of.violations, severity: of.severity, block: of.severity === "SEVERE" };
+        }
+        return { triggered: false };
+    });
+    registerGate("snapshot", function (ctx) {
+        if (ctx.command && FileGuard.analyzeCommand(ctx.command).is_delete && ctx.filesRead === true) {
+            return { triggered: true, advice: "执行破坏性命令前建议先调用 snapshot_file 备份目标文件" };
+        }
+        return { triggered: false };
+    });
+
+    // ======================================================================
     // §20 PreflightGate — orchestrator with TaskLedger (audit #7, #9)
+    // Uses GateRegistry for extensibility.
     // ======================================================================
     function preflightGate(deps, goal, command, evidence, filesRead) {
         var ledger = deps && deps.ledger ? deps.ledger : new TaskLedger(deps);
@@ -1606,66 +1689,61 @@ const ZeroApex = (function () {
         var allowed = true;
         var requiresConfirmation = false;
 
-        var self = SelfMonitor.assess({
+        var ctx = {
+            deps: deps,
             goal: goal,
-            files_read: filesRead,
-            evidence_ready: !!(evidence && safeString(evidence).trim()),
-        });
-        if (self.cognitive_biases.length > 0) {
-            gates.push("self_awareness");
-            for (var i = 0; i < self.cognitive_biases.length; i++) {
-                reasons.push("偏差[" + self.cognitive_biases[i].bias + "]: " + self.cognitive_biases[i].warn);
+            command: command,
+            evidence: evidence,
+            filesRead: filesRead,
+            self: null,
+            hallu: null,
+            of: null,
+        };
+
+        var gateResults = runGates(ctx);
+
+        for (var i = 0; i < gateResults.length; i++) {
+            var gr = gateResults[i];
+            if (gr.error) {
+                reasons.push("门控[" + gr.gate + "] 执行错误: " + gr.error);
+                continue;
+            }
+            var r = gr.result;
+            if (!r) continue;
+            gates.push(gr.gate);
+            if (gr.gate === "self_awareness" && r.triggered) {
+                for (var b = 0; b < r.biases.length; b++) {
+                    reasons.push("偏差[" + r.biases[b].bias + "]: " + r.biases[b].warn);
+                }
+            }
+            if (gr.gate === "file_guard" && r.triggered) {
+                for (var fr = 0; fr < r.risk.reasons.length; fr++) reasons.push(r.risk.reasons[fr]);
+                if (r.block) { allowed = false; requiresConfirmation = true; }
+            }
+            if (gr.gate === "permission" && r.triggered) {
+                reasons.push("权限拒绝: " + r.reason);
+                if (r.block) allowed = false;
+            }
+            if (gr.gate === "hallucination" && r.triggered) {
+                for (var hv = 0; hv < r.violations.length; hv++) {
+                    reasons.push("幻觉[" + r.violations[hv].rule + "]: " + r.violations[hv].fix);
+                }
+                if (r.block) allowed = false;
+            }
+            if (gr.gate === "output_firewall" && r.triggered) {
+                for (var ov = 0; ov < r.violations.length; ov++) {
+                    reasons.push("防火墙[" + r.violations[ov].type + "]: " + r.violations[ov].hit);
+                }
+                if (r.block) allowed = false;
+            }
+            if (gr.gate === "snapshot" && r.triggered) {
+                reasons.push("提示: " + r.advice);
             }
         }
 
-        if (command) {
-            var risk = FileGuard.analyzeCommand(command);
-            if (risk.requires_confirmation) {
-                gates.push("file_guard");
-                allowed = false;
-                requiresConfirmation = true;
-                for (var r = 0; r < risk.reasons.length; r++) reasons.push(risk.reasons[r]);
-            }
-        }
-
-        // §21g PermissionRules: deny rule as BLOCK reason
-        if (command && deps && deps.permissions) {
-            var perm = deps.permissions.evaluate("bash", { command: command });
-            if (perm.verdict === "DENY") {
-                gates.push("permission");
-                allowed = false;
-                reasons.push("权限拒绝: " + perm.reason);
-            }
-        }
-
-        var hallu = Hallucination.check(goal, evidence);
-        if (!hallu.allowed) {
-            gates.push("hallucination");
-            for (var v = 0; v < hallu.violations.length; v++) {
-                reasons.push("幻觉[" + hallu.violations[v].rule + "]: " + hallu.violations[v].fix);
-            }
-            var shouldBlock = false;
-            for (var v2 = 0; v2 < hallu.violations.length; v2++) {
-                if (hallu.violations[v2].rule === "fact_without_evidence") { shouldBlock = true; break; }
-            }
-            if (shouldBlock) allowed = false;
-        }
-
-        // OutputFirewall: check goal text for violations
-        var of = OutputFirewall.check(goal);
-        if (of.severity === "SEVERE" || of.severity === "MAJOR") {
-            gates.push("output_firewall");
-            for (var ov = 0; ov < of.violations.length; ov++) {
-                reasons.push("防火墙[" + of.violations[ov].type + "]: " + of.violations[ov].hit);
-            }
-            if (of.severity === "SEVERE") allowed = false;
-        }
-
-        // Snapshot awareness: destructive command on a task with file reads
-        if (command && FileGuard.analyzeCommand(command).is_delete && filesRead === true) {
-            gates.push("snapshot");
-            reasons.push("提示: 执行破坏性命令前建议先调用 snapshot_file 备份目标文件");
-        }
+        var self = ctx.self || { cognitive_biases: [], state: "READY", dimensions: { confidence: "INFERRED" }, readiness_score: 0, status_card: "" };
+        var hallu = ctx.hallu || { allowed: true, violations: [] };
+        var of = ctx.of || { severity: "CLEAN", violations: [] };
 
         var state;
         if (requiresConfirmation) state = "WAIT_CONFIRMATION";
@@ -1997,10 +2075,14 @@ const ZeroApex = (function () {
             var hasFiles = !!deps.Files;
             var hasNetwork = !!deps.Network;
             var hasMemory = !!(deps.Tools && deps.Tools.Memory);
+            var hasShizuku = !!(deps.Shizuku || (deps.Tools && deps.Tools.Shizuku));
+            var hasRoot = !!(deps.Root || (deps.Tools && deps.Tools.Root) || deps.su);
             if (!hasFiles && !hasNetwork && !hasMemory) return "none";
             if (hasFiles && !hasNetwork && !hasMemory) return "basic";
             if (hasFiles && hasNetwork && !hasMemory) return "network";
-            return "shell";  // all deps available
+            if (hasRoot) return "root";
+            if (hasShizuku) return "shizuku";
+            return "shell";
         }
 
         // Curtail: return list of tool names allowed in current env
@@ -2071,7 +2153,6 @@ const ZeroApex = (function () {
             "sudo", "su"
         ];
         var WRAPPERS = ["timeout", "nice", "ionice", "chrt", "stdbuf", "env"];
-        var UNSAFE_TOKENS = ["$(", "`", "&", ">", "<"];
 
         function splitChain(cmd) {
             var s = safeString(cmd);
@@ -2607,6 +2688,7 @@ const ZeroApex = (function () {
                 ShellGuard: ShellGuard,
                 SandboxProfile: SandboxProfile,
                 PermissionRules: PermissionRules,
+                GateRegistry: { register: registerGate, run: runGates, list: function () { var n = []; for (var i = 0; i < GateRegistry.length; i++) n.push(GateRegistry[i].name); return n; } },
             },
         };
     }
