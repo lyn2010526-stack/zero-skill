@@ -1,6 +1,6 @@
 ---
 name: 零
-version: "2.5.4"
+version: "2.5.5"
 description: |
   工程任务守护引擎。防删/防幻觉/证据验证/输出防火墙/记忆/快照全部为可执行 JS 代码，
   运行在 Operit QuickJS 沙箱。19 个工具，6 层 preflight 门禁串联。

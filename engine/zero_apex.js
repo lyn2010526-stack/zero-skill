@@ -1586,6 +1586,9 @@ const ZeroApex = (function () {
         deps = deps || {};
         var Files = deps.Files;
         var lock = new FileLock();
+        // Monotonic counter ensures same-second snapshots get distinct names.
+        // Format: "file.js.YYYYMMDD_HHMMSS_NNN" (NNN = 001, 002, ...)
+        var snapSeq = 0;
 
         async function snapshot(path) {
             if (!Files) {
@@ -1607,7 +1610,12 @@ const ZeroApex = (function () {
                 }
                 var td = PathUtils.trashDir(path);
                 try { await Files.write(PathUtils.join(td, ".keep"), ""); } catch (e) {}
-                var snapName = PathUtils.basename(path) + "." + nowStamp();
+                // Append per-snapshot counter to guarantee uniqueness even when
+                // two snapshots are taken in the same second (e.g. bulk scripts).
+                // The timestamp portion keeps the YYYYMMDD_HHMMSS shape so
+                // extractTimestamp() can still parse it for cleanup ordering.
+                var seq = (++snapSeq).toString().padStart(3, "0");
+                var snapName = PathUtils.basename(path) + "." + nowStamp() + "_" + seq;
                 var dest = PathUtils.join(td, snapName);
                 // Files.read may return string or {content, exists, error}
                 var contentStr = (typeof content === "string")
@@ -1749,9 +1757,10 @@ const ZeroApex = (function () {
 
         function extractTimestamp(name) {
             if (!name) return 0;
-            // Snapshot name format from nowStamp(): "YYYYMMDD_HHMMSS" or "YYYYMMDDHHMMSS"
-            // (defined in §11). Accept digits-with-optional-underscore in the last segment.
-            var m = String(name).match(/(\d{8})(?:[_]?(\d{6}))?$/);
+            // Snapshot name format: "file.YYYYMMDD_HHMMSS_NNN" (counter suffix
+            // added in v2.5.5 for same-second uniqueness). The timestamp portion
+            // is still YYYYMMDD[_HHMMSS]?; we ignore the trailing counter.
+            var m = String(name).match(/(\d{8})(?:[_]?(\d{6}))?(?:_\d+)?$/);
             if (!m) {
                 // Last-ditch: pure-digit tail
                 var dot = name.lastIndexOf(".");
@@ -1764,11 +1773,8 @@ const ZeroApex = (function () {
             var d = m[1] || "";
             var t = m[2] || "";
             if (t.length === 6) {
-                // YYYYMMDD_HHMMSS — pack as a single comparable number
-                // 8 + 6 = 14 digits, safe within Number.MAX_SAFE_INTEGER
                 return parseInt(d + t, 10);
             }
-            // Date only — use start-of-day to be conservative
             return parseInt(d + "000000", 10);
         }
 
@@ -2262,7 +2268,15 @@ const ZeroApex = (function () {
             }
             try {
                 var r = Files.read("manifest.json");
-                if (r && typeof r.then === "function") return null; // async
+                // If Files.read is async it returns a Promise; we cannot use it
+                // synchronously. Attach a no-op catch to avoid unhandled-rejection
+                // warnings, then return null and let the async path handle it.
+                if (r && typeof r.then === "function") {
+                    if (typeof r.catch === "function") {
+                        r.catch(function () {});
+                    }
+                    return null;
+                }
                 if (r) {
                     var content = (typeof r === "string") ? r : (r.content || "");
                     if (content) {
@@ -2270,7 +2284,9 @@ const ZeroApex = (function () {
                         return manifestCache;
                     }
                 }
-            } catch (e) {}
+            } catch (e) {
+                // Sync throw: file missing, no permission, etc. Fall through.
+            }
             return null;
         }
 
@@ -3026,6 +3042,12 @@ const ZeroApex = (function () {
         var p = params || {};
         var taskId = p.task_id || null;
         try {
+            // Ensure the manifest is loaded before consulting it for curtailment.
+            // Without this, the first tool call would see the builtin minimal
+            // manifest and either incorrectly allow or incorrectly deny.
+            if (defaultManifest && typeof defaultManifest.loadAsync === "function") {
+                try { await defaultManifest.loadAsync(); } catch (e) {}
+            }
             if (taskId && defaultEnforcer.isBlocked(taskId)) {
                 var blockResult = {
                     success: false,
@@ -3050,30 +3072,41 @@ const ZeroApex = (function () {
                 return curtResult;
             }
             if (defaultPermissions) {
-                var perm = defaultPermissions.evaluate(toolName, p);
-                if (perm.verdict === "DENY") {
-                    var permDenyResult = { success: false, code: "E4001_GUARD_BLOCK", error: "Permission 规则拒绝: " + perm.reason, blocked_by: "permission:deny" };
-                    defaultAudit.append({ tool: toolName || "unknown", task_id: taskId, trigger: "permission_deny", duration_ms: Date.now() - startTs, result_code: "E4001_GUARD_BLOCK", result_summary: perm.reason });
-                    defaultAudit.flush();
-                    complete(taskId, permDenyResult);
-                    return permDenyResult;
-                }
-                if (perm.verdict === "ASK") {
-                    var askResult = { success: false, code: "E4001_GUARD_BLOCK", error: "Permission 规则要求确认: " + perm.reason + "（无交互式 UI，按 deny 处理）", blocked_by: "permission:ask" };
-                    defaultAudit.append({ tool: toolName || "unknown", task_id: taskId, trigger: "permission_ask", duration_ms: Date.now() - startTs, result_code: "E4001_GUARD_BLOCK", result_summary: perm.reason });
-                    defaultAudit.flush();
-                    complete(taskId, askResult);
-                    return askResult;
+                // Meta-tools (the authority) bypass permission checks
+                // to avoid recursive self-blocking.
+                var META_TOOLS = { evaluate_permission: 1, check_sandbox: 1, audit_log: 1, config_get: 1 };
+                if (!META_TOOLS[toolName]) {
+                    var perm = defaultPermissions.evaluate(toolName, p);
+                    if (perm.verdict === "DENY") {
+                        var permDenyResult = { success: false, code: "E4001_GUARD_BLOCK", error: "Permission 规则拒绝: " + perm.reason, blocked_by: "permission:deny" };
+                        defaultAudit.append({ tool: toolName || "unknown", task_id: taskId, trigger: "permission_deny", duration_ms: Date.now() - startTs, result_code: "E4001_GUARD_BLOCK", result_summary: perm.reason });
+                        defaultAudit.flush();
+                        complete(taskId, permDenyResult);
+                        return permDenyResult;
+                    }
+                    if (perm.verdict === "ASK") {
+                        var askResult = { success: false, code: "E4001_GUARD_BLOCK", error: "Permission 规则要求确认: " + perm.reason + "（无交互式 UI，按 deny 处理）", blocked_by: "permission:ask" };
+                        defaultAudit.append({ tool: toolName || "unknown", task_id: taskId, trigger: "permission_ask", duration_ms: Date.now() - startTs, result_code: "E4001_GUARD_BLOCK", result_summary: perm.reason });
+                        defaultAudit.flush();
+                        complete(taskId, askResult);
+                        return askResult;
+                    }
                 }
             }
             if (defaultSandbox) {
                 var sandboxParams = null;
-                if (p.command) {
-                    sandboxParams = { command: p.command };
-                } else if (p.path) {
-                    sandboxParams = { path: p.path, action: "write" };
-                } else if (p.file_path) {
-                    sandboxParams = { path: p.file_path, action: "write" };
+                // Meta-tools that evaluate other tools must not be sandboxed
+                // (they are the authority, not the subject). Otherwise asking
+                // "would this command be allowed?" triggers its own denial.
+                var META_TOOLS = { evaluate_permission: 1, check_sandbox: 1, preflight: 1, audit_log: 1, config_get: 1 };
+                if (toolName && !META_TOOLS[toolName]) {
+                    if (p.command) {
+                        sandboxParams = { command: p.command };
+                    } else if (p.path) {
+                        sandboxParams = { path: p.path, action: "write" };
+                    } else if (p.file_path) {
+                        sandboxParams = { path: p.file_path, action: "write" };
+                    }
                 }
                 if (sandboxParams) {
                     var sandboxResult = defaultSandbox.check(sandboxParams);
@@ -3127,9 +3160,22 @@ const ZeroApex = (function () {
         if (!defaultPermissions) {
             return { success: false, code: "E5002_DEPENDENCY_MISSING", error: "PermissionRules 未初始化" };
         }
+        // Ensure the manifest is loaded before consulting it. Without this,
+        // a first-call evaluate_permission() would see the builtin minimal
+        // manifest (no permission rules) and silently return FALLTHROUGH.
+        if (defaultManifest && typeof defaultManifest.loadAsync === "function") {
+            try { await defaultManifest.loadAsync(); } catch (e) {}
+        }
+        // Accept both {tool, command/path} (primary) and {tool, pattern} (alias).
         var tool = params.tool || "bash";
-        var value = defaultPermissions.extractValue(defaultPermissions.normalizeTool(tool, params), params);
-        var result = defaultPermissions.evaluate(tool, params);
+        // Pattern is a friendly alias: map it to command/path based on tool.
+        var p = Object.assign({}, params);
+        if (p.pattern && !p.command && !p.path) {
+            if (tool === "read" || tool === "edit" || tool === "write") p.path = p.pattern;
+            else p.command = p.pattern;
+        }
+        var result = defaultPermissions.evaluate(tool, p);
+        var value = defaultPermissions.extractValue(defaultPermissions.normalizeTool(tool, p), p);
         return {
             success: true, code: "OK", tool: tool, value: value,
             verdict: result.verdict, reason: result.reason,
@@ -3140,6 +3186,12 @@ const ZeroApex = (function () {
     async function check_sandbox(params) {
         if (!defaultSandbox) {
             return { success: false, code: "E5002_DEPENDENCY_MISSING", error: "SandboxProfile 未初始化" };
+        }
+        // Ensure the manifest is loaded before consulting it. Without this,
+        // a first-call check_sandbox() would see the builtin minimal manifest
+        // (no profiles) and silently allow everything.
+        if (defaultManifest && typeof defaultManifest.loadAsync === "function") {
+            try { await defaultManifest.loadAsync(); } catch (e) {}
         }
         var result = defaultSandbox.check(params);
         return {
@@ -3201,14 +3253,21 @@ const ZeroApex = (function () {
 // Each tool wraps execution, catches exceptions, audits, enforces block.
 // ==========================================================================
 
-async function preflight(params) {
-    return await ZeroApex.preflightGate(
-        params.goal,
-        params.command,
-        params.evidence,
-        params.files_read
-    );
-}
+    async function preflight(params) {
+        params = params || {};
+        // Accept multiple input shapes for caller convenience:
+        //   { goal, command, evidence, files_read }   — primary
+        //   { action, command, files }                — backward-compat (action→goal, files→files_read)
+        //   { intent, ... }                           — alternate alias
+        var goal = params.goal || params.action || params.intent || null;
+        // If a destructive string is in goal, treat it as the command too
+        // so file_guard (which needs command) catches it.
+        var command = params.command || (typeof goal === "string" && /rm\s|chmod|kill|shutdown|reboot|drop|delete/i.test(goal) ? goal : null);
+        var evidence = params.evidence || null;
+        var filesRead = params.files_read;
+        if (filesRead === undefined) filesRead = params.files || [];
+        return await ZeroApex.preflightGate(goal, command, evidence, filesRead);
+    }
 
 async function file_guard(params) {
     if (params.script) return ZeroApex.FileGuard.scanScript(params.script);
@@ -3220,35 +3279,52 @@ async function hallucination_guard(params) {
     return ZeroApex.Hallucination.check(params.text, params.evidence);
 }
 
-async function evidence_check(params) {
-    var ctx = {
-        exit_code: params.exit_code,
-        stdout: params.stdout,
-        stderr: params.stderr,
-        artifact_path: params.artifact_path,
-    };
-    // Parse 'supports' array: ["exit_code:0", "stdout:build passed", "artifact:path", "stderr:error msg"]
-    if (params.supports && params.supports.length > 0) {
-        for (var i = 0; i < params.supports.length; i++) {
-            var s = String(params.supports[i]);
-            var colonIdx = s.indexOf(':');
-            if (colonIdx > 0) {
-                var key = s.slice(0, colonIdx);
-                var val = s.slice(colonIdx + 1);
-                if (key === 'exit_code') {
-                    ctx.exit_code = parseInt(val, 10);
-                } else if (key === 'stdout') {
-                    ctx.stdout = val;
-                } else if (key === 'stderr') {
-                    ctx.stderr = val;
-                } else if (key === 'artifact') {
-                    ctx.artifact_path = val;
+    async function evidence_check(params) {
+        params = params || {};
+        var ctx = {
+            exit_code: params.exit_code,
+            stdout: params.stdout,
+            stderr: params.stderr,
+            artifact_path: params.artifact_path,
+        };
+        // Parse 'supports' array: ["exit_code:0", "stdout:build passed", "artifact:path", "stderr:error msg"]
+        if (params.supports && params.supports.length > 0) {
+            for (var i = 0; i < params.supports.length; i++) {
+                var s = String(params.supports[i]);
+                var colonIdx = s.indexOf(':');
+                if (colonIdx > 0) {
+                    var key = s.slice(0, colonIdx);
+                    var val = s.slice(colonIdx + 1);
+                    if (key === 'exit_code') {
+                        ctx.exit_code = parseInt(val, 10);
+                    } else if (key === 'stdout') {
+                        ctx.stdout = val;
+                    } else if (key === 'stderr') {
+                        ctx.stderr = val;
+                    } else if (key === 'artifact') {
+                        ctx.artifact_path = val;
+                    }
                 }
             }
         }
+        var classified = await ZeroApex.Evidence.classify(params.claim || "", ctx);
+        // Normalize to the standard {success, code, ...} envelope used by all
+        // other exports. Without this, callers cannot use a single
+        // `if (r.success)` check across tools.
+        return {
+            success: true,
+            code: "OK",
+            claim: params.claim || "",
+            level: classified.level,
+            level_num: classified.level_num,
+            label: classified.label,
+            supports_claim: classified.supports_claim,
+            can_claim_done: classified.can_claim_done,
+            can_claim_delivered: classified.can_claim_delivered,
+            reasons: classified.reasons || [],
+            gate: classified.gate,
+        };
     }
-    return await ZeroApex.Evidence.classify(params.claim, ctx);
-}
 
 async function self_monitor(params) {
     return ZeroApex.SelfMonitor.assess({
@@ -3300,10 +3376,12 @@ async function tombstone_file(params) {
 }
 
 async function snapshot_cleanup(params) {
+    params = params || {};
     return await ZeroApex.Snapshot.cleanup({
-        base_path: (params && params.base_path) || "/workspace",
-        max_age_hours: (params && params.max_age_hours) || 24,
-        max_count: (params && params.max_count) || 50,
+        // Accept {path} (file path, derive trash dir) or {base_path} (explicit).
+        base_path: params.base_path || params.path || "/workspace",
+        max_age_hours: params.max_age_hours || 24,
+        max_count: params.max_count || 50,
     });
 }
 

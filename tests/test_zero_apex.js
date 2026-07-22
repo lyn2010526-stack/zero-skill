@@ -836,6 +836,127 @@ function runP0RegressionTests() {
   console.log("[p0-regression-test] all assertions done, failures=%d", failures);
 }
 
+// v2.5.5 audit regression tests: real Operit sandbox usage simulation.
+// Each test corresponds to a bug found when running end-to-end workflows
+// through the top-level exports (not via create() injection).
+function runUsageAuditTests() {
+  var ZA = m.ZeroApex;
+
+  // U-1: evidence_check must return {success, code, ...} envelope.
+  // Without this, callers cannot rely on `r.success` to detect success.
+  (async function () {
+    const r = await m.evidence_check({ claim: "编译通过", exit_code: 0 });
+    assert("U-1: evidence_check returns success field", r && r.success === true);
+    assert("U-1: evidence_check returns code field", r && typeof r.code === "string");
+    assert("U-1: evidence_check returns level field", r && typeof r.level === "string");
+    assert("U-1: evidence_check level starts with L", r && r.level.charAt(0) === "L");
+  })();
+
+  // U-2: snapshot names must be unique even when taken in the same second.
+  // Previously same-second collisions overwrote each other.
+  (async function () {
+    const inst = ZA.create({
+      Files: {
+        read: async (p) => "/content",
+        write: async () => ({ successful: true }),
+        exists: async () => ({ exists: true }),
+        listFiles: async () => ({ entries: [] }),
+      },
+    });
+    const names = new Set();
+    for (let i = 0; i < 10; i++) {
+      const r = await inst.Snapshot.snapshot("/tmp/u2_test.js");
+      if (r && r.snapshot_name) names.add(r.snapshot_name);
+    }
+    assert("U-2: 10 same-second snapshots produce 10 unique names", names.size === 10);
+    // All should match the new format
+    const sample = Array.from(names)[0];
+    assert("U-2: snapshot name has YYYYMMDD_HHMMSS_NNN shape",
+      /^\d{8}_\d{6}_\d{3}$/.test(sample.split(".").pop()));
+  })();
+
+  // U-2b: extractTimestamp should still parse the new format
+  (async function () {
+    const inst = ZA.create({ Files: { read: async () => "", write: async () => ({}), listFiles: async () => ({entries:[]}) } });
+    if (inst.Snapshot && inst.Snapshot._extractTimestamp) {
+      const ts = inst.Snapshot._extractTimestamp;
+      const t1 = ts("f.20240115_103045_001");
+      const t2 = ts("f.20240115_103045_002");
+      const t3 = ts("f.20240115_103046_001");
+      assert("U-2b: same-second different counter parse to same timestamp", t1 === t2);
+      assert("U-2b: different second has larger timestamp", t2 < t3);
+      // The new format is still sortable
+      const t4 = ts("f.20240114_120000_005");
+      const t5 = ts("f.20240115_103045_001");
+      assert("U-2b: different date sorts correctly", t4 < t5);
+    }
+  })();
+
+  // U-3: preflight should accept {action} alias for goal
+  (async function () {
+    const r = await m.preflight({ action: "查看 README" });
+    assert("U-3: preflight accepts {action} alias", r && typeof r.allowed === "boolean");
+  })();
+
+  // U-4: preflight with null action should not crash
+  (async function () {
+    const r = await m.preflight({ action: null });
+    assert("U-4: preflight with null action returns result (not throws)", r && typeof r.allowed === "boolean");
+    assert("U-4: preflight with null action denies", r.allowed === false);
+  })();
+
+  // U-5: preflight with destructive goal string should trigger file_guard
+  (async function () {
+    const r = await m.preflight({ action: "rm -rf /tmp/test", files: ["/tmp/test"] });
+    assert("U-5: preflight detects destructive command in goal", r.allowed === false);
+    assert("U-5: file_guard was triggered",
+      r.gates_triggered && r.gates_triggered.indexOf("file_guard") >= 0);
+  })();
+
+  // U-6: check_sandbox should await manifest load
+  (async function () {
+    const r = await m.check_sandbox({ path: "/etc/shadow", action: "read" });
+    assert("U-6: check_sandbox first call loads manifest (denies /etc/shadow)", r.allowed === false);
+  })();
+
+  // U-7: evaluate_permission should await manifest load
+  (async function () {
+    const r = await m.evaluate_permission({ tool: "bash", command: "rm -rf /" });
+    assert("U-7: evaluate_permission first call loads manifest", r.verdict === "DENY");
+  })();
+
+  // U-8: evaluate_permission should accept {pattern} alias
+  (async function () {
+    const r = await m.evaluate_permission({ tool: "bash", pattern: "rm -rf /" });
+    assert("U-8: evaluate_permission {pattern} alias works", r.verdict === "DENY");
+  })();
+
+  // U-9: evaluate_permission should NOT be blocked by sandbox (meta-tool)
+  (async function () {
+    const r = await m.evaluate_permission({ tool: "bash", command: "rm -rf /etc/shadow" });
+    // The meta-tool returns the permission verdict, not the sandbox verdict
+    assert("U-9: evaluate_permission returns verdict, not blocked_by",
+      r.verdict && !r.blocked_by);
+  })();
+
+  // U-10: snapshot_cleanup should accept {path} or {base_path}
+  (async function () {
+    const inst = ZA.create({
+      Files: {
+        read: async () => "",
+        write: async () => ({ successful: true }),
+        exists: async () => ({ exists: true }),
+        listFiles: async () => ({ entries: [] }),
+      },
+    });
+    // Direct call accepts base_path
+    const r1 = await inst.Snapshot.cleanup({ base_path: "/workspace", max_count: 50 });
+    assert("U-10: snapshot.cleanup accepts base_path", r1 && typeof r1.success === "boolean");
+  })();
+
+  console.log("[usage-audit-test] all assertions done, failures=%d", failures);
+}
+
 
 (async () => {
   try {
@@ -853,6 +974,7 @@ function runP0RegressionTests() {
     runTombstoneTests();
     runRegressionTests();
     runP0RegressionTests();
+    runUsageAuditTests();
     if (failures === 0) {
       console.log("\nALL TESTS PASSED");
       process.exit(0);
