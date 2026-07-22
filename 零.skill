@@ -1,9 +1,9 @@
 ---
 name: 零
-version: "2.5.3"
+version: "2.5.4"
 description: |
   工程任务守护引擎。防删/防幻觉/证据验证/输出防火墙/记忆/快照全部为可执行 JS 代码，
-  运行在 Operit QuickJS 沙箱。18 个工具，6 层 preflight 门禁串联。
+  运行在 Operit QuickJS 沙箱。19 个工具，6 层 preflight 门禁串联。
 compatibility: Operit AI
 type: skill
 engine: zero_apex
@@ -71,11 +71,11 @@ metadata:
 
 遇到上述场景，跳过所有门禁。
 
-## 工具（18 个）
+## 工具（19 个）
 
 工具定义在 `engine/zero_apex.js`，按需调用：
 
-`preflight` · `file_guard` · `hallucination_guard` · `evidence_check` · `self_monitor` · `output_firewall` · `search_opensource` · `remember` · `recall` · `snapshot_file` · `restore_file` · `snapshot_cleanup` · `enforce_block` · `audit_log` · `evaluate_permission` · `check_sandbox` · `config_get` · `config_set`
+`preflight` · `file_guard` · `hallucination_guard` · `evidence_check` · `self_monitor` · `output_firewall` · `search_opensource` · `remember` · `recall` · `snapshot_file` · `restore_file` · `snapshot_cleanup` · `tombstone_file` · `enforce_block` · `audit_log` · `evaluate_permission` · `check_sandbox` · `config_get` · `config_set`
 
 ## 工作流
 

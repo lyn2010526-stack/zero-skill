@@ -425,7 +425,7 @@ function testManifestCurtail() {
 // ---------------------------------------------------------------------------
 // Scenario 17: AuditLogger records tool calls (#8)
 // ---------------------------------------------------------------------------
-function testAuditLogger() {
+async function testAuditLogger() {
   console.log("[scenario 17] audit logger records tool calls");
   const AuditLogger = m._infra.AuditLogger;
 
@@ -442,7 +442,7 @@ function testAuditLogger() {
   logger.append({ tool: "preflight", task_id: "T2", trigger: "编译", result_code: "ALLOW" });
   assert(logger.snapshot().length === 2, "2 entries in buffer");
 
-  logger.flush();
+  await logger.flush();
   assert(logger.snapshot().length === 0, "buffer cleared after flush");
   const logPath = ".zero_apex/audit_log.jsonl";
   assert(stored[logPath] && stored[logPath].indexOf("E4001_GUARD_BLOCK") >= 0, "log contains block entry");

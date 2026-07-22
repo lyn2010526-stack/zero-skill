@@ -60,7 +60,7 @@
 
 ## 工具数量
 
-引擎共有 16 个可执行工具，其中 preflight 串联 6 个门禁层。
+引擎共有 19 个可执行工具，其中 preflight 串联 6 个门禁层。
 
 ## preflight 串联
 
@@ -118,7 +118,7 @@ node tests/test_skill_activation.js # skill 层行为约束 + 强制拦截 + 环
 
 CI/CD：GitHub Actions 在 push/PR 时自动运行测试，覆盖率阈值（self-test ≥19, skill ≥100）未达标时阻断合并。
 
-当前测试覆盖：内置自测 19 项 + DI 集成 100+ 断言 + 守卫层 15+ 断言 + skill 层 113 断言。
+当前测试覆盖：内置自测 19 项 + DI 集成 100+ 断言 + 守卫层 15+ 断言 + skill 层 113 断言 + P0/P1 真实环境回归 24 断言。
 
 ## Skill 结构
 

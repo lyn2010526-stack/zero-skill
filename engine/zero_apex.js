@@ -1060,9 +1060,25 @@ const ZeroApex = (function () {
         async function fileExists(path) {
             if (!path) return false;
             if (!Files) return false;
+            // Prefer Files.exists when available (Operit operational_tools provides it)
+            if (typeof Files.exists === "function") {
+                try {
+                    var r = await Files.exists(path);
+                    if (typeof r === "boolean") return r;
+                    if (r && typeof r === "object" && typeof r.exists === "boolean") return r.exists;
+                    // Some impls return 1/0
+                    if (r === 1 || r === 0) return r === 1;
+                } catch (e) {}
+            }
+            // Fallback: read with low cost and treat ENOENT as false
             try {
-                var r = await Files.read(path);
-                return !!(r && (r.content !== undefined || r.exists));
+                var r2 = await Files.read(path);
+                if (!r2) return false;
+                if (typeof r2 === "string") return r2.length > 0;
+                if (typeof r2.exists === "boolean") return r2.exists;
+                if (r2.content !== undefined && r2.content !== null) return true;
+                if (r2.error || r2.code) return false;
+                return false;
             } catch (e) {
                 return false;
             }
@@ -1381,25 +1397,29 @@ const ZeroApex = (function () {
                     error: "keyword 为必填",
                 };
             }
-            if (!Network || typeof Network.httpGet !== "function") {
+            if (!Network || (typeof Network.httpGet !== "function" && typeof Network.get !== "function")) {
                 return {
                     success: false,
                     code: ErrorCode.DEPENDENCY_MISSING,
                     error: "Network 依赖不可用",
                 };
             }
+            // Operit exposes both httpGet and get; pick whichever is available
+            var httpCall = (typeof Network.httpGet === "function")
+                ? Network.httpGet.bind(Network)
+                : Network.get.bind(Network);
 
             var url = buildUrl(keyword, language, minStars, limit);
             var kw = keyword;
 
             return limiter.run(function () {
-                return attemptSearch(kw, url, 1, limit);
+                return attemptSearch(kw, url, 1, limit, httpCall);
             });
         }
 
-        async function attemptSearch(kw, url, attempt, limit) {
+        async function attemptSearch(kw, url, attempt, limit, httpCall) {
             try {
-                var resp = await Network.httpGet(url);
+                var resp = await httpCall(url);
                 var body = resp && resp.content ? resp.content : resp;
                 var json;
                 if (typeof body === "string") {
@@ -1437,7 +1457,7 @@ const ZeroApex = (function () {
                 if (retry.shouldRetry(attempt, err)) {
                     var delay = retry.delayFor(attempt);
                     await sleep(delay);
-                    return attemptSearch(kw, url, attempt + 1, limit);
+                    return attemptSearch(kw, url, attempt + 1, limit, httpCall);
                 }
                 return {
                     success: false,
@@ -1589,7 +1609,11 @@ const ZeroApex = (function () {
                 try { await Files.write(PathUtils.join(td, ".keep"), ""); } catch (e) {}
                 var snapName = PathUtils.basename(path) + "." + nowStamp();
                 var dest = PathUtils.join(td, snapName);
-                var w = await Files.write(dest, (content && content.content) || "");
+                // Files.read may return string or {content, exists, error}
+                var contentStr = (typeof content === "string")
+                    ? content
+                    : ((content && content.content) || "");
+                var w = await Files.write(dest, contentStr);
                 return {
                     success: !!(w && (w.successful === undefined || w.successful)),
                     code: ErrorCode.OK,
@@ -1642,7 +1666,10 @@ const ZeroApex = (function () {
                     src = PathUtils.join(td, cands[cands.length - 1]);
                 }
                 var content = await Files.read(src);
-                var w = await Files.write(path, (content && content.content) || "");
+                var contentStr = (typeof content === "string")
+                    ? content
+                    : ((content && content.content) || "");
+                var w = await Files.write(path, contentStr);
                 return {
                     success: !!(w && (w.successful === undefined || w.successful)),
                     code: ErrorCode.OK,
@@ -1721,12 +1748,28 @@ const ZeroApex = (function () {
         }
 
         function extractTimestamp(name) {
-            var dot = name.lastIndexOf(".");
-            if (dot < 0) return 0;
-            var tail = name.substring(dot + 1);
-            if (!/^\d+$/.test(tail)) return 0;
-            var ts = parseInt(tail, 10);
-            return isNaN(ts) ? 0 : ts;
+            if (!name) return 0;
+            // Snapshot name format from nowStamp(): "YYYYMMDD_HHMMSS" or "YYYYMMDDHHMMSS"
+            // (defined in §11). Accept digits-with-optional-underscore in the last segment.
+            var m = String(name).match(/(\d{8})(?:[_]?(\d{6}))?$/);
+            if (!m) {
+                // Last-ditch: pure-digit tail
+                var dot = name.lastIndexOf(".");
+                if (dot < 0) return 0;
+                var tail = name.substring(dot + 1);
+                if (!/^\d+$/.test(tail)) return 0;
+                var ts = parseInt(tail, 10);
+                return isNaN(ts) ? 0 : ts;
+            }
+            var d = m[1] || "";
+            var t = m[2] || "";
+            if (t.length === 6) {
+                // YYYYMMDD_HHMMSS — pack as a single comparable number
+                // 8 + 6 = 14 digits, safe within Number.MAX_SAFE_INTEGER
+                return parseInt(d + t, 10);
+            }
+            // Date only — use start-of-day to be conservative
+            return parseInt(d + "000000", 10);
         }
 
         // Tombstone: since Files.delete is unavailable in Operit sandbox,
@@ -1764,7 +1807,7 @@ const ZeroApex = (function () {
             }
         }
 
-        return { snapshot: snapshot, restore: restore, cleanup: cleanup, tombstone: tombstone };
+        return { snapshot: snapshot, restore: restore, cleanup: cleanup, tombstone: tombstone, _extractTimestamp: extractTimestamp };
     }
 
     // ======================================================================
@@ -1882,7 +1925,9 @@ const ZeroApex = (function () {
             }
             var r = gr.result;
             if (!r) continue;
-            gates.push(gr.gate);
+            // gates_triggered: only count gates that actually fired (triggered=true).
+            // Gates that ran but did not fire are reported in gates_evaluated.
+            if (r.triggered) gates.push(gr.gate);
             if (gr.gate === "self_awareness" && r.triggered) {
                 for (var b = 0; b < r.biases.length; b++) {
                     reasons.push("偏差[" + r.biases[b].bias + "]: " + r.biases[b].warn);
@@ -1929,6 +1974,13 @@ const ZeroApex = (function () {
             if (!seen[reasons[u]]) { seen[reasons[u]] = true; uniqReasons.push(reasons[u]); }
         }
 
+        // Build gates_evaluated (all gates that ran, regardless of whether they fired)
+        var gatesEvaluated = [];
+        for (var ge = 0; ge < gateResults.length; ge++) {
+            var ger = gateResults[ge];
+            if (ger && ger.gate) gatesEvaluated.push(ger.gate);
+        }
+
         var result = {
             allowed: allowed && self.state === "READY",
             state: state,
@@ -1936,6 +1988,7 @@ const ZeroApex = (function () {
             confidence: self.dimensions.confidence,
             readiness_score: self.readiness_score,
             gates_triggered: gates,
+            gates_evaluated: gatesEvaluated,
             reasons: uniqReasons,
             self_awareness: self,
             hallucination: hallu,
@@ -2084,11 +2137,13 @@ const ZeroApex = (function () {
             };
             buffer.push(line);
             if (buffer.length >= flushSize) {
-                flush();
+                // Fire-and-forget: flush is async but append() is sync
+                var p = flush();
+                if (p && typeof p.catch === "function") p.catch(function () {});
             }
         }
 
-        function flush() {
+        async function flush() {
             if (!enabled || buffer.length === 0) return;
             if (!Files || typeof Files.write !== "function") {
                 // No Files available; keep in memory (graceful degrade)
@@ -2102,10 +2157,11 @@ const ZeroApex = (function () {
                 // QuickJS sandbox has no append API, so read-merge-write.
                 var existing = "";
                 try {
-                    var r = Files.read(logPath);
-                    if (r && r.content) existing = r.content;
+                    var r = await Files.read(logPath);
+                    if (typeof r === "string") existing = r;
+                    else if (r && r.content) existing = r.content;
                 } catch (e) {}
-                Files.write(logPath, existing + payload);
+                await Files.write(logPath, existing + payload);
             } catch (e) {
                 // On IO error, re-queue entries so they're not silently lost
                 buffer = toWrite.concat(buffer);
@@ -2190,23 +2246,81 @@ const ZeroApex = (function () {
         deps = deps || {};
         var Files = deps.Files;
         var manifestCache = null;
+        var loadAttempted = false;
+        var pendingAsync = null;
 
-        function load() {
+        // Eagerly try to populate the cache synchronously. The Operit sandbox
+        // is async, but the test environment and some legacy integrations use
+        // a synchronous Files.read. By attempting a sync read on construction,
+        // we get a populated cache for sandbox/permission lookups that happen
+        // before the first await.
+        function trySyncLoad() {
             if (manifestCache) return manifestCache;
             if (!Files || typeof Files.read !== "function") {
-                return getBuiltinManifest();
+                manifestCache = getBuiltinManifest();
+                return manifestCache;
             }
             try {
                 var r = Files.read("manifest.json");
-                if (r && r.content) {
-                    manifestCache = JSON.parse(r.content);
-                    return manifestCache;
+                if (r && typeof r.then === "function") return null; // async
+                if (r) {
+                    var content = (typeof r === "string") ? r : (r.content || "");
+                    if (content) {
+                        manifestCache = JSON.parse(content);
+                        return manifestCache;
+                    }
                 }
-            } catch (e) {
-                // File missing or corrupt: fall back to builtin
+            } catch (e) {}
+            return null;
+        }
+
+        // Read manifest.json asynchronously. Returns a Promise.
+        function loadAsync() {
+            if (manifestCache) return Promise.resolve(manifestCache);
+            if (loadAttempted) {
+                if (pendingAsync) return pendingAsync;
+                return Promise.resolve(manifestCache || getBuiltinManifest());
             }
-            manifestCache = getBuiltinManifest();
-            return manifestCache;
+            loadAttempted = true;
+            // Try sync first (covers sync-Files test environments)
+            if (trySyncLoad() && manifestCache) {
+                return Promise.resolve(manifestCache);
+            }
+            if (!Files || typeof Files.read !== "function") {
+                manifestCache = getBuiltinManifest();
+                return Promise.resolve(manifestCache);
+            }
+            pendingAsync = (function () {
+                var p = Promise.resolve(Files.read("manifest.json"));
+                return p.then(function (r) {
+                    if (r) {
+                        var content = (typeof r === "string") ? r : (r.content || "");
+                        if (content) {
+                            try {
+                                manifestCache = JSON.parse(content);
+                                return manifestCache;
+                            } catch (e) {}
+                        }
+                    }
+                    manifestCache = getBuiltinManifest();
+                    return manifestCache;
+                }).catch(function () {
+                    manifestCache = getBuiltinManifest();
+                    return manifestCache;
+                });
+            })();
+            return pendingAsync;
+        }
+
+        // Sync accessor: returns cache, or builtin if not yet loaded.
+        // In async environments callers should use loadAsync() first.
+        function load() {
+            if (manifestCache) return manifestCache;
+            var sync = trySyncLoad();
+            if (sync) return sync;
+            // Kick off async load for next time
+            loadAsync();
+            return getBuiltinManifest();
         }
 
         // Builtin minimal manifest for graceful degradation
@@ -2299,7 +2413,7 @@ const ZeroApex = (function () {
             return c.allowed.indexOf(toolName) >= 0;
         }
 
-        return { load: load, detectLevel: detectLevel, curtail: curtail, isToolAllowed: isToolAllowed };
+        return { load: load, loadAsync: loadAsync, detectLevel: detectLevel, curtail: curtail, isToolAllowed: isToolAllowed };
     }
 
     // ======================================================================
@@ -2393,8 +2507,14 @@ const ZeroApex = (function () {
         function isDangerous(segment) {
             var s = peelWrapper(segment);
             if (!s) return false;
-            var first = (s.split(/\s+/)[0] || "");
+            // Tokenize: handles "rm -rf", "rm-rf", "rm\t-rf", "rm   -rf"
+            // Split on whitespace OR a hyphen-prefixed flag (rm-rf → [rm, -rf])
+            var tokens = s.split(/[\s]+|(?=-)/);
+            var first = (tokens[0] || "");
+            // Normalize "rm-rf" → "rm -rf" so hyphen-fused variants match
+            var firstBase = first.replace(/^([a-z]+)-/i, "$1 ");
             if (DANGEROUS_CMDS.indexOf(first) >= 0) return true;
+            if (firstBase !== first && DANGEROUS_CMDS.indexOf(firstBase.split(/\s+/)[0]) >= 0) return true;
             for (var i = 0; i < DANGEROUS_CMDS.length; i++) {
                 var pat = DANGEROUS_CMDS[i];
                 if (pat.indexOf(" ") >= 0 && (s === pat || s.indexOf(pat + " ") === 0)) return true;

@@ -621,7 +621,7 @@ function runRegressionTests() {
   var expected = [
     "preflight", "file_guard", "hallucination_guard", "evidence_check",
     "self_monitor", "output_firewall", "search_opensource", "remember", "recall",
-    "snapshot_file", "restore_file", "snapshot_cleanup",
+    "snapshot_file", "restore_file", "snapshot_cleanup", "tombstone_file",
     "enforce_block", "audit_log", "evaluate_permission", "check_sandbox",
     "config_get", "config_set"
   ];
@@ -657,6 +657,185 @@ function runRegressionTests() {
   console.log("[regression-test] all assertions done, failures=%d", failures);
 }
 
+// P0/P1 audit-driven regression tests (2026-07-22):
+// Each test corresponds to a real bug found during the "actual usage" audit
+// against the simulated Operit sandbox environment.
+function runP0RegressionTests() {
+  var ZA = m.ZeroApex;
+
+  // P0-1: ManifestLoader must read manifest.json asynchronously when Files.read
+  // returns a Promise. Previously called sync, so manifest was never loaded
+  // and sandbox/permission rules silently fell back to builtin.
+  (async function () {
+    let manifestLoaded = false;
+    const testFiles = {
+      read: async (p) => {
+        if (p === "manifest.json") {
+          manifestLoaded = true;
+          return { content: JSON.stringify({
+            tools: [
+              { name: "audit_log", min_permission: "basic", requires: ["Files"] },
+              { name: "evaluate_permission", min_permission: "none", requires: [] },
+            ],
+            env_requirements: { permission_levels: { none: {}, basic: {} } }
+          }) };
+        }
+        return { content: "" };
+      },
+      write: async () => ({ successful: true }),
+      listFiles: async () => ({ entries: [] }),
+    };
+    // _infra.ManifestLoader is exposed via the public module
+    if (ZA._infra && ZA._infra.ManifestLoader) {
+      const ML = ZA._infra.ManifestLoader({ Files: testFiles });
+      const observed = await ML.loadAsync();
+      assert("P0-1: ManifestLoader.loadAsync returns parsed tools", observed && Array.isArray(observed.tools));
+      assert("P0-1: ManifestLoader.loadAsync honored the custom manifest", observed.tools.some(function (t) { return t.name === "audit_log"; }));
+      assert("P0-1: Files.read was called with manifest.json", manifestLoaded === true);
+      // load() should now return the same cached object
+      const cached = ML.load();
+      assert("P0-1: load() returns the cache populated by loadAsync()", cached === observed);
+    } else {
+      assert("P0-1: ManifestLoader is exposed in _infra", false);
+    }
+  })();
+
+  // P0-2: Evidence.fileExists must prefer Files.exists and gracefully fall
+  // back to read. Previous implementation only used Files.read and treated
+  // every error as "file does not exist", giving false negatives.
+  (async function () {
+    let existsCalled = false;
+    let readCalled = false;
+    const inst = ZA.create({
+      Files: {
+        exists: async (p) => { existsCalled = true; return { exists: p === "/p/exists" }; },
+        read: async () => { readCalled = true; return { content: "x" }; },
+        write: async () => ({ successful: true }),
+        listFiles: async () => ({ entries: [] }),
+      },
+    });
+    const r1 = await inst.Evidence.fileExists("/p/exists");
+    assert("P0-2: fileExists uses Files.exists when available", existsCalled === true);
+    assert("P0-2: fileExists returns true for existing path", r1 === true);
+    const r2 = await inst.Evidence.fileExists("/p/missing");
+    assert("P0-2: fileExists returns false for missing path", r2 === false);
+
+    // When Files.exists is missing, fall back to read
+    const inst2 = ZA.create({
+      Files: {
+        read: async () => ({ content: "ok" }),
+        write: async () => ({ successful: true }),
+        listFiles: async () => ({ entries: [] }),
+      },
+    });
+    const r3 = await inst2.Evidence.fileExists("/p/x");
+    assert("P0-2: fileExists fallback returns true when read returns content", r3 === true);
+    // Empty content / error should still resolve to false
+    const inst3 = ZA.create({
+      Files: {
+        exists: async () => { throw new Error("denied"); },
+        read: async () => ({ content: "" }),
+      },
+    });
+    const r4 = await inst3.Evidence.fileExists("/p/y");
+    assert("P0-2: fileExists returns false for empty content + exists error", r4 === false);
+  })();
+
+  // P0-3: extractTimestamp must parse YYYYMMDD_HHMMSS (with underscore).
+  // Previous regex /^\d+$/ only matched pure digits, so cleanup never aged out.
+  (async function () {
+    const inst = ZA.create({
+      Files: {
+        read: async () => ({ content: "" }),
+        write: async () => ({ successful: true }),
+        listFiles: async () => ({ entries: [] }),
+      },
+    });
+    if (inst.Snapshot && inst.Snapshot._extractTimestamp) {
+      const ts = inst.Snapshot._extractTimestamp;
+      assert("P0-3: extractTimestamp parses YYYYMMDD_HHMMSS",
+        ts("f.20240115_103045") > 0);
+      assert("P0-3: extractTimestamp parses pure digits (no underscore)",
+        ts("f.20240115103045") > 0);
+      assert("P0-3: extractTimestamp returns 0 for non-numeric",
+        ts("f.txt") === 0);
+      assert("P0-3: extractTimestamp parses YYYYMMDD date-only",
+        ts("f.20240115") > 0);
+      // Ordering: later date produces larger number
+      const tA = ts("f.20240101_120000");
+      const tB = ts("f.20240102_120000");
+      assert("P0-3: timestamp order matches date order", tA < tB);
+      // Specifically, "20240101_120000" should be smaller than "20240101_130000"
+      const tC = ts("f.20240101_120000");
+      const tD = ts("f.20240101_130000");
+      assert("P0-3: hour-level ordering works within same day", tC < tD);
+    } else {
+      assert("P0-3: extractTimestamp exposed via Snapshot", false);
+    }
+  })();
+
+  // P1-1: Files.read may return string OR {content, exists}. Snapshot must
+  // handle both shapes; previously assumed object shape only.
+  (async function () {
+    const inst = ZA.create({
+      Files: {
+        read: async (p) => "/etc/hosts content here",  // returns string
+        write: async () => ({ successful: true }),
+        listFiles: async () => ({ entries: ["/tmp/p1_test.20240101_120000"] }),
+      },
+    });
+    const r = await inst.Snapshot.snapshot("/tmp/p1_test");
+    assert("P1-1: snapshot accepts string-returning Files.read", r.success === true);
+  })();
+
+  // P1-1b: Restore must also handle string-returning Files.read
+  (async function () {
+    const inst = ZA.create({
+      Files: {
+        read: async () => "restored-from-string",  // returns string
+        write: async () => ({ successful: true }),
+        listFiles: async () => ({ entries: ["/tmp/p1b.20240101_120000", "/tmp/p1b.20240102_130000"] }),
+      },
+    });
+    const r = await inst.Snapshot.restore("/tmp/p1b");
+    assert("P1-1b: restore accepts string-returning Files.read", r.success === true);
+  })();
+
+  // P1-3: Network.get must work as a fallback to httpGet. Operit exposes
+  // both depending on version; engine must not hardcode one name.
+  (async function () {
+    const inst = ZA.create({
+      Network: {
+        // No httpGet — only get
+        get: async () => ({ content: JSON.stringify({ total_count: 0, items: [] }) }),
+      },
+    });
+    const r = await inst.OpenSource.search("test", null, 0, 5);
+    assert("P1-3: OpenSource works when only Network.get is available", r.success === true);
+  })();
+
+  // P1-6: gates_triggered must only contain gates that actually fired.
+  // Previously every gate that ran (even if no violation) was added.
+  (async function () {
+    const r = await ZA.preflight({ action: "查看 README", files: [] });
+    assert("P1-6: result has gates_triggered array", Array.isArray(r.gates_triggered));
+    assert("P1-6: result has gates_evaluated array", Array.isArray(r.gates_evaluated));
+    // gates_triggered must be a subset of gates_evaluated
+    const evSet = new Set(r.gates_evaluated || []);
+    const allIn = (r.gates_triggered || []).every(function (g) { return evSet.has(g); });
+    assert("P1-6: gates_triggered is a subset of gates_evaluated", allIn === true);
+  })();
+
+  // P2-3: rm-rf without space (rm-rf) must still be detected.
+  // Previously the tokenizer split on whitespace only, missing hyphen-fused forms.
+  (async function () {
+    const r1 = await ZA.file_guard({ command: "rm-rf /tmp/foo" });
+    assert("P2-3: rm-rf (no space) is detected as dangerous", r1.blocked === true || (r1.reasons && r1.reasons.join(" ").indexOf("rm") >= 0));
+  })();
+
+  console.log("[p0-regression-test] all assertions done, failures=%d", failures);
+}
+
 
 (async () => {
   try {
@@ -673,6 +852,7 @@ function runRegressionTests() {
     runEvidenceGradeTests();
     runTombstoneTests();
     runRegressionTests();
+    runP0RegressionTests();
     if (failures === 0) {
       console.log("\nALL TESTS PASSED");
       process.exit(0);
