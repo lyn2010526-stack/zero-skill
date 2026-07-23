@@ -1279,6 +1279,7 @@ async function runFileGuardV2Tests() {
     await runHallucinationV2Tests();
     await runFileGuardV2Tests();
     await runV256HardeningTests();
+    await runV258FeatureTests();
     if (failures === 0) {
       console.log("\nALL TESTS PASSED");
       process.exit(0);
@@ -1533,4 +1534,108 @@ async function runV256HardeningTests() {
     memObjResult === "mem-id-99");
 
   console.log("[v2.5.6-hardening-test] all assertions done, failures=%d", failures);
+}
+
+async function runV258FeatureTests() {
+  console.log("[v2.5.8-feature-test] running...");
+
+  var RC = m.ZeroApex._infra.ReasoningChain;
+  var TP = m.ZeroApex._infra.TaskPlanner;
+  var RF = m.ZeroApex._infra.Reflexion;
+
+  // ---- ReasoningChain ----
+  var chain = RC.create("修复登录 bug");
+  assert("RC-1: chain created with goal", chain && chain.goal === "修复登录 bug" && chain.status === "active");
+
+  RC.thought(chain, "需要先看日志");
+  assert("RC-2: thought step added", chain.steps.length === 1 && chain.steps[0].type === "thought");
+
+  RC.action(chain, "file_guard", { command: "cat /var/log/app.log" });
+  assert("RC-3: action step added", chain.steps.length === 2 && chain.steps[1].type === "action");
+
+  RC.observation(chain, "发现 NullPointerException at line 42", true);
+  assert("RC-4: observation step added", chain.steps.length === 3 && chain.steps[2].type === "observation");
+
+  RC.reflection(chain, "应该先检查 null 再调用方法");
+  assert("RC-5: reflection step added", chain.steps.length === 4 && chain.steps[3].type === "reflection");
+
+  RC.conclude(chain, "已定位到 bug 位置", true);
+  assert("RC-6: chain concluded as done", chain.status === "done" && chain.conclusion.length > 0);
+
+  var summary = RC.summarize(chain);
+  assert("RC-7: summary contains goal and steps", summary.indexOf("修复登录 bug") >= 0 && summary.indexOf("THOUGHT") >= 0);
+
+  // failed action detection
+  var chain2 = RC.create("测试失败路径");
+  RC.action(chain2, "recall", { query: "test" });
+  RC.observation(chain2, "工具不可用", false);
+  var failed = RC.failedActions(chain2);
+  assert("RC-8: failedActions detects failed observation", failed.length === 1 && failed[0].action === "recall");
+
+  var ev = RC.latestEvidence(chain, 2);
+  assert("RC-9: latestEvidence returns observations", ev.indexOf("NullPointerException") >= 0);
+
+  // ---- TaskPlanner ----
+  var plan = TP.createPlan("完整发布流程");
+  assert("TP-1: plan created", plan && plan.status === "pending" && plan.goal === "完整发布流程");
+
+  var buildId = TP.addTask(plan, null, { name: "构建", goal: "编译项目", tool: "file_guard", priority: 2 });
+  assert("TP-2: root task added", buildId !== null && plan.roots.indexOf(buildId) >= 0);
+
+  var testId = TP.addTask(plan, null, { name: "测试", goal: "运行测试套件", requires: [buildId], priority: 1 });
+  assert("TP-3: dependent task added", testId !== null);
+
+  var deployId = TP.addTask(plan, null, { name: "部署", goal: "推送到生产", requires: [testId], priority: 0 });
+  assert("TP-4: deploy task added with dep chain", deployId !== null);
+
+  var ready = TP.readyNodes(plan);
+  assert("TP-5: only build is ready initially", ready.length === 1 && ready[0].id === buildId);
+
+  TP.completeNode(plan, buildId, { ok: true }, true);
+  var ready2 = TP.readyNodes(plan);
+  assert("TP-6: test is ready after build done", ready2.length === 1 && ready2[0].id === testId);
+
+  TP.completeNode(plan, testId, { ok: false }, false);
+  var ready3 = TP.readyNodes(plan);
+  assert("TP-7: no nodes ready after test failed", ready3.length === 0);
+  assert("TP-8: deploy skipped after test failure", plan.nodes[deployId].status === "skipped");
+  assert("TP-9: plan status is failed", plan.status === "failed");
+
+  var sumText = TP.summary(plan);
+  assert("TP-10: summary contains plan goal", sumText.indexOf("完整发布流程") >= 0);
+
+  // topoSort
+  var plan2 = TP.createPlan("topo test");
+  var a = TP.addTask(plan2, null, { name: "A" });
+  var b = TP.addTask(plan2, null, { name: "B", requires: [a] });
+  var c = TP.addTask(plan2, null, { name: "C", requires: [b] });
+  var order = TP.topoSort(plan2);
+  assert("TP-11: topoSort A before B before C",
+    order.findIndex(function(n){ return n.id === a; }) <
+    order.findIndex(function(n){ return n.id === b; }) &&
+    order.findIndex(function(n){ return n.id === b; }) <
+    order.findIndex(function(n){ return n.id === c; }));
+
+  // ---- Reflexion ----
+  RF.clear();
+  var entry = RF.reflect({ goal: "编译项目", tool: "file_guard", error: "permission denied", severity: RF.SEVERITY.HIGH });
+  assert("RF-1: reflection entry created", entry && entry.id && entry.rule.length > 0);
+  assert("RF-2: rule extracted from permission error", entry.rule.indexOf("权限") >= 0 || entry.rule.indexOf("permission") >= 0 || entry.rule.indexOf("检查") >= 0);
+  assert("RF-3: size incremented", RF.size() === 1);
+
+  RF.reflect({ goal: "编译项目", tool: "file_guard", error: "path traversal detected", severity: RF.SEVERITY.CRITICAL });
+  var results = RF.query("编译项目", "file_guard", 5);
+  assert("RF-4: query returns relevant reflections", results.length === 2);
+
+  var hint = RF.contextHint("编译项目", "file_guard");
+  assert("RF-5: contextHint contains rule text", hint.length > 0 && hint.indexOf("CRITICAL") >= 0);
+
+  var snap = RF.snapshot();
+  assert("RF-6: snapshot returns all entries", snap.length === 2);
+
+  // path traversal rule extraction
+  var e2 = RF.reflect({ goal: "读取配置", tool: "file_guard", error: "path traversal ../etc/passwd" });
+  assert("RF-7: traversal rule extracted", e2.rule.indexOf("..") >= 0 || e2.rule.indexOf("遍历") >= 0);
+
+  console.log("[v2.5.8-feature-test] all assertions done, failures=%d", failures);
 }

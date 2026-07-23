@@ -150,6 +150,7 @@ const ZeroApex = (function () {
         HALLUCINATION_BLOCK: "E4002_HALLUCINATION_BLOCK",
         EVIDENCE_INSUFFICIENT: "E4003_EVIDENCE_INSUFFICIENT",
         TOOL_CURTAILED: "E4004_TOOL_CURTAILED",  // tool removed by manifest/env curtailment
+        CONFIRMATION_REQUIRED: "E4005_CONFIRMATION_REQUIRED",  // risky op needs user confirmation
         // 5xxx — internal
         INTERNAL_ERROR: "E5001_INTERNAL_ERROR",
         DEPENDENCY_MISSING: "E5002_DEPENDENCY_MISSING",
@@ -175,6 +176,7 @@ const ZeroApex = (function () {
         E4002_HALLUCINATION_BLOCK: "幻觉检测拦截",
         E4003_EVIDENCE_INSUFFICIENT: "证据不足以支撑声明",
         E4004_TOOL_CURTAILED: "工具在当前环境权限下不可用（被 manifest 裁剪）",
+        E4005_CONFIRMATION_REQUIRED: "高风险操作需要用户确认后才可执行",
         E5001_INTERNAL_ERROR: "引擎内部错误",
         E5002_DEPENDENCY_MISSING: "缺少运行依赖（被 manifest 裁剪）",
     });
@@ -2605,6 +2607,7 @@ const ZeroApex = (function () {
         // Audit config (#8)
         ConfigRegistry.register("audit.enabled", true);
         ConfigRegistry.register("audit.log_path", ".zero_apex/audit_log.jsonl");
+        ConfigRegistry.register("audit.flush_size", 1);  // 1 = flush every append (crash-safe)
     }
 
     // Bootstrap config at module load, then lock security-critical keys
@@ -2621,7 +2624,11 @@ const ZeroApex = (function () {
         var logPath = ConfigRegistry.get("audit.log_path", ".zero_apex/audit_log.jsonl");
         var enabled = ConfigRegistry.get("audit.enabled", true);
         var buffer = [];
-        var flushSize = 10;
+        // flushSize=1: flush on every append so no entries are lost on crash.
+        // Can be raised via config for high-throughput scenarios.
+        var flushSize = ConfigRegistry.has("audit.flush_size")
+            ? ConfigRegistry.get("audit.flush_size")
+            : 1;
 
         function append(entry) {
             if (!enabled) return;
@@ -3557,7 +3564,353 @@ const ZeroApex = (function () {
 
 
     // ======================================================================
-    // §22 Module factory — instantiate modules with injected dependencies
+    // §21h ReasoningChain — ReAct-style Thought/Action/Observation loop
+    // Inspired by: Yao et al. "ReAct: Synergizing Reasoning and Acting" (2022)
+    // Core idea: interleave reasoning traces with tool actions so each step
+    // is grounded in observable evidence rather than pure language generation.
+    // ======================================================================
+    var ReasoningChain = (function () {
+        var STEP_TYPES = Object.freeze({ THOUGHT: "thought", ACTION: "action", OBSERVATION: "observation", REFLECTION: "reflection" });
+        var MAX_STEPS = 64;
+
+        function create(goal) {
+            return {
+                goal: String(goal || ""),
+                steps: [],
+                created_at: new Date().toISOString(),
+                status: "active",  // active | done | failed
+                conclusion: null,
+            };
+        }
+
+        function addStep(chain, type, content, meta) {
+            if (!chain || chain.steps.length >= MAX_STEPS) return false;
+            if (!STEP_TYPES[type.toUpperCase()]) return false;
+            chain.steps.push({
+                seq: chain.steps.length + 1,
+                type: type,
+                content: String(content || ""),
+                ts: new Date().toISOString(),
+                meta: meta || {},
+            });
+            return true;
+        }
+
+        function thought(chain, text) { return addStep(chain, STEP_TYPES.THOUGHT, text); }
+        function action(chain, toolName, params) {
+            return addStep(chain, STEP_TYPES.ACTION, toolName, { params: params || {} });
+        }
+        function observation(chain, result, success) {
+            return addStep(chain, STEP_TYPES.OBSERVATION, typeof result === "string" ? result : JSON.stringify(result), { success: !!success });
+        }
+        function reflection(chain, text) { return addStep(chain, STEP_TYPES.REFLECTION, text); }
+
+        function conclude(chain, conclusion, success) {
+            chain.conclusion = String(conclusion || "");
+            chain.status = success ? "done" : "failed";
+            chain.completed_at = new Date().toISOString();
+        }
+
+        // Summarize the chain for injection into preflight context
+        function summarize(chain) {
+            if (!chain || chain.steps.length === 0) return "";
+            var lines = ["[ReAct Chain] goal: " + chain.goal];
+            for (var i = 0; i < chain.steps.length; i++) {
+                var s = chain.steps[i];
+                var prefix = s.seq + ". [" + s.type.toUpperCase() + "]";
+                var body = s.content.length > 200 ? s.content.slice(0, 200) + "…" : s.content;
+                lines.push(prefix + " " + body);
+            }
+            if (chain.conclusion) lines.push("[CONCLUSION] " + chain.conclusion);
+            return lines.join("\n");
+        }
+
+        // Extract all observations with success=false (failed actions)
+        function failedActions(chain) {
+            var out = [];
+            for (var i = 0; i < chain.steps.length; i++) {
+                var s = chain.steps[i];
+                if (s.type === STEP_TYPES.ACTION) {
+                    // Look ahead for paired observation
+                    if (i + 1 < chain.steps.length) {
+                        var obs = chain.steps[i + 1];
+                        if (obs.type === STEP_TYPES.OBSERVATION && obs.meta.success === false) {
+                            out.push({ action: s.content, params: s.meta.params, observation: obs.content });
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+
+        // Build a compact evidence context from the latest N observations
+        function latestEvidence(chain, n) {
+            n = n || 3;
+            var obs = [];
+            for (var i = chain.steps.length - 1; i >= 0 && obs.length < n; i--) {
+                if (chain.steps[i].type === STEP_TYPES.OBSERVATION) obs.unshift(chain.steps[i]);
+            }
+            return obs.map(function (o) { return o.content; }).join("\n---\n");
+        }
+
+        return { create: create, thought: thought, action: action, observation: observation, reflection: reflection, conclude: conclude, summarize: summarize, failedActions: failedActions, latestEvidence: latestEvidence, STEP_TYPES: STEP_TYPES };
+    })();
+
+    // ======================================================================
+    // §21i TaskPlanner — hierarchical task decomposition
+    // Inspired by: HuggingGPT (Shen et al. 2023), TaskWeaver (Microsoft 2023)
+    // Core idea: decompose a complex goal into a dependency DAG of sub-tasks,
+    // each with its own preflight + evidence requirements.
+    // ======================================================================
+    var TaskPlanner = (function () {
+        var MAX_DEPTH = 6;
+        var MAX_NODES = 128;
+        var nodeSeq = 0;
+
+        function createPlan(goal) {
+            return {
+                goal: String(goal || ""),
+                nodes: {},       // id -> node
+                roots: [],       // top-level node ids
+                created_at: new Date().toISOString(),
+                status: "pending",
+            };
+        }
+
+        function addTask(plan, parentId, task) {
+            if (Object.keys(plan.nodes).length >= MAX_NODES) return null;
+            var depth = 0;
+            var p = parentId;
+            while (p && plan.nodes[p]) { depth++; p = plan.nodes[p].parentId; }
+            if (depth >= MAX_DEPTH) return null;
+
+            var id = "N" + (++nodeSeq) + "_" + (task.name || "task").replace(/\s+/g, "_").slice(0, 20);
+            plan.nodes[id] = {
+                id: id,
+                parentId: parentId || null,
+                name: String(task.name || ""),
+                goal: String(task.goal || task.name || ""),
+                tool: task.tool || null,       // optional: bound tool name
+                params: task.params || {},
+                requires: task.requires || [],  // ids of prerequisite nodes
+                status: "pending",             // pending|running|done|failed|skipped
+                result: null,
+                chain: null,                   // ReasoningChain for this node
+                priority: task.priority || 0,
+            };
+            if (!parentId) plan.roots.push(id);
+            else {
+                var parent = plan.nodes[parentId];
+                if (parent) {
+                    parent.children = parent.children || [];
+                    parent.children.push(id);
+                }
+            }
+            return id;
+        }
+
+        // Returns nodes whose prerequisites are all done and status is pending
+        function readyNodes(plan) {
+            var ready = [];
+            var ids = Object.keys(plan.nodes);
+            for (var i = 0; i < ids.length; i++) {
+                var node = plan.nodes[ids[i]];
+                if (node.status !== "pending") continue;
+                var reqs = node.requires || [];
+                var allDone = true;
+                for (var j = 0; j < reqs.length; j++) {
+                    var dep = plan.nodes[reqs[j]];
+                    if (!dep || dep.status !== "done") { allDone = false; break; }
+                }
+                if (allDone) ready.push(node);
+            }
+            // Sort by priority descending
+            ready.sort(function (a, b) { return (b.priority || 0) - (a.priority || 0); });
+            return ready;
+        }
+
+        function completeNode(plan, nodeId, result, success) {
+            var node = plan.nodes[nodeId];
+            if (!node) return false;
+            node.status = success ? "done" : "failed";
+            node.result = result;
+            node.completed_at = new Date().toISOString();
+            // Propagate failure: skip all descendants of a failed node
+            if (!success) _skipDescendants(plan, nodeId);
+            // Check overall plan status
+            _updatePlanStatus(plan);
+            return true;
+        }
+
+        function _skipDescendants(plan, nodeId) {
+            var node = plan.nodes[nodeId];
+            if (!node || !node.children) return;
+            for (var i = 0; i < node.children.length; i++) {
+                var child = plan.nodes[node.children[i]];
+                if (child && child.status === "pending") {
+                    child.status = "skipped";
+                    _skipDescendants(plan, child.id);
+                }
+            }
+        }
+
+        function _updatePlanStatus(plan) {
+            var ids = Object.keys(plan.nodes);
+            var allDone = true;
+            var anyFailed = false;
+            for (var i = 0; i < ids.length; i++) {
+                var s = plan.nodes[ids[i]].status;
+                if (s === "pending" || s === "running") { allDone = false; }
+                if (s === "failed") anyFailed = true;
+            }
+            if (allDone) plan.status = anyFailed ? "failed" : "done";
+        }
+
+        // Flatten plan to ordered execution list (topological sort)
+        function topoSort(plan) {
+            var visited = {};
+            var order = [];
+            function visit(id) {
+                if (visited[id]) return;
+                visited[id] = true;
+                var node = plan.nodes[id];
+                if (!node) return;
+                var reqs = node.requires || [];
+                for (var i = 0; i < reqs.length; i++) visit(reqs[i]);
+                order.push(node);
+            }
+            var ids = Object.keys(plan.nodes);
+            for (var i = 0; i < ids.length; i++) visit(ids[i]);
+            return order;
+        }
+
+        function summary(plan) {
+            var lines = ["[Plan] " + plan.goal + " (" + plan.status + ")"];
+            var ordered = topoSort(plan);
+            for (var i = 0; i < ordered.length; i++) {
+                var n = ordered[i];
+                var indent = "";
+                var p = n.parentId;
+                while (p) { indent += "  "; p = plan.nodes[p] && plan.nodes[p].parentId; }
+                lines.push(indent + "- [" + n.status.toUpperCase() + "] " + n.name + (n.tool ? " (" + n.tool + ")" : ""));
+            }
+            return lines.join("\n");
+        }
+
+        return { createPlan: createPlan, addTask: addTask, readyNodes: readyNodes, completeNode: completeNode, topoSort: topoSort, summary: summary };
+    })();
+
+    // ======================================================================
+    // §21j Reflexion — failure reflection and rule extraction
+    // Inspired by: Shinn et al. "Reflexion" (2023), Self-Refine (Madaan 2023)
+    // Core idea: after a failure, generate a structured reflection that is
+    // stored in memory and injected into subsequent preflight context,
+    // preventing the same mistake from recurring.
+    // ======================================================================
+    var Reflexion = (function () {
+        var MAX_REFLECTIONS = 200;
+        var SEVERITY = Object.freeze({ LOW: "low", MEDIUM: "medium", HIGH: "high", CRITICAL: "critical" });
+        var store = [];  // in-memory; persisted via Memory module when available
+
+        function reflect(failure) {
+            // failure: { goal, tool, error, evidence, chain_summary }
+            if (store.length >= MAX_REFLECTIONS) store.shift();  // rolling window
+            var entry = {
+                id: "R" + Date.now() + "_" + Math.floor(Math.random() * 1000),
+                ts: new Date().toISOString(),
+                goal: String(failure.goal || ""),
+                tool: String(failure.tool || ""),
+                error: String(failure.error || ""),
+                evidence: String(failure.evidence || ""),
+                chain_summary: String(failure.chain_summary || ""),
+                severity: failure.severity || SEVERITY.MEDIUM,
+                rule: _extractRule(failure),
+                applied_count: 0,
+            };
+            store.push(entry);
+            return entry;
+        }
+
+        // Derive a short actionable rule from the failure
+        function _extractRule(failure) {
+            var err = String(failure.error || "").toLowerCase();
+            var tool = String(failure.tool || "");
+            // Pattern-based rule extraction — mirrors common agent failure modes
+            if (/path.*traversal|\.\.\//.test(err)) return "避免在路径中使用 '..' 遍历片段";
+            if (/not found|no such file/.test(err)) return "操作文件前先验证路径存在";
+            if (/permission|forbidden|denied/.test(err)) return "检查权限级别后再调用 " + (tool || "工具");
+            if (/timeout|timed out/.test(err)) return "网络操作设置超时，失败后走缓存";
+            if (/hallucin|unverified|guessed/.test(err)) return "声明完成前必须提供 L3+ 证据";
+            if (/curtail|not available/.test(err)) return "先查询 manifest 确认工具在当前环境可用";
+            if (/memory|out of/.test(err)) return "对大文件分批处理，避免单次读入";
+            if (failure.goal && failure.goal.length > 0) {
+                return "执行「" + failure.goal.slice(0, 40) + "」时避免重复错误：" + String(failure.error || "").slice(0, 60);
+            }
+            return "记录失败模式，下次同类任务前先验证前提条件";
+        }
+
+        // Find reflections relevant to a given goal/tool context
+        function query(goal, tool, limit) {
+            limit = limit || 5;
+            var scored = [];
+            for (var i = 0; i < store.length; i++) {
+                var r = store[i];
+                var score = 0;
+                if (tool && r.tool === tool) score += 3;
+                // Simple keyword overlap between goals
+                var gWords = String(goal || "").split(/\s+/);
+                for (var j = 0; j < gWords.length; j++) {
+                    if (gWords[j].length > 2 && r.goal.indexOf(gWords[j]) >= 0) score += 1;
+                }
+                if (r.severity === SEVERITY.CRITICAL) score += 2;
+                if (r.severity === SEVERITY.HIGH) score += 1;
+                if (score > 0) scored.push({ entry: r, score: score });
+            }
+            scored.sort(function (a, b) { return b.score - a.score; });
+            return scored.slice(0, limit).map(function (s) { return s.entry; });
+        }
+
+        // Format relevant reflections as a context hint for preflight
+        function contextHint(goal, tool) {
+            var relevant = query(goal, tool, 3);
+            if (relevant.length === 0) return "";
+            var lines = ["[过往反思 — 请避免重复以下错误]"];
+            for (var i = 0; i < relevant.length; i++) {
+                var r = relevant[i];
+                r.applied_count++;
+                lines.push("• [" + r.severity.toUpperCase() + "] " + r.rule);
+                if (r.error) lines.push("  原因: " + r.error.slice(0, 80));
+            }
+            return lines.join("\n");
+        }
+
+        // Persist reflections to Memory module (async, fire-and-forget)
+        async function persist(Memory) {
+            if (!Memory || typeof Memory.create !== "function") return;
+            var recent = store.slice(-10);
+            for (var i = 0; i < recent.length; i++) {
+                var r = recent[i];
+                try {
+                    await Memory.create({
+                        title: "[Reflexion] " + r.goal.slice(0, 40),
+                        content: "规则: " + r.rule + "\n错误: " + r.error + "\n证据: " + r.evidence,
+                        source: "zero_apex_reflexion",
+                        folderPath: "reflexion",
+                        tags: "reflexion," + r.severity + "," + r.tool,
+                    });
+                } catch (e) { /* non-fatal */ }
+            }
+        }
+
+        function snapshot() { return store.slice(); }
+        function clear() { store = []; }
+        function size() { return store.length; }
+
+        return { reflect: reflect, query: query, contextHint: contextHint, persist: persist, snapshot: snapshot, clear: clear, size: size, SEVERITY: SEVERITY };
+    })();
+
+
+
     // ======================================================================
     function create(deps) {
         deps = deps || {};
@@ -3629,6 +3982,9 @@ const ZeroApex = (function () {
             OpenSource: OpenSource,
             Memory: Memory,
             Snapshot: Snapshot,
+            ReasoningChain: ReasoningChain,
+            TaskPlanner: TaskPlanner,
+            Reflexion: Reflexion,
             preflight: preflight,
             ledger: ledger,
             audit: audit,
@@ -3656,6 +4012,9 @@ const ZeroApex = (function () {
                 ShellGuard: ShellGuard,
                 SandboxProfile: SandboxProfile,
                 PermissionRules: PermissionRules,
+                ReasoningChain: ReasoningChain,
+                TaskPlanner: TaskPlanner,
+                Reflexion: Reflexion,
                 GateRegistry: { register: registerGate, run: runGates, list: function () { var n = []; for (var i = 0; i < GateRegistry.length; i++) n.push(GateRegistry[i].name); return n; } },
             },
         };
@@ -3664,9 +4023,19 @@ const ZeroApex = (function () {
     // Default instance using ambient globals (QuickJS sandbox hooks).
     // These are resolved lazily so the module can be loaded for self-test
     // even when the sandbox has not yet provided the hooks.
+    // Fallback chain: globalThis → global → window → QuickJS scriptArgs[0] context
     function ambient(name) {
-        try { return (typeof this !== "undefined" && this[name]) || (typeof globalThis !== "undefined" && globalThis[name]); }
-        catch (e) { return undefined; }
+        try {
+            // Standard: globalThis (Node.js, modern QuickJS)
+            if (typeof globalThis !== "undefined" && globalThis[name]) return globalThis[name];
+            // CommonJS environments
+            if (typeof global !== "undefined" && global[name]) return global[name];
+            // Browser / older runtimes
+            if (typeof window !== "undefined" && window[name]) return window[name];
+            // QuickJS: top-level this in non-strict module context
+            if (typeof this !== "undefined" && this !== null && this[name]) return this[name];
+            return undefined;
+        } catch (e) { return undefined; }
     }
 
     var defaultInstance = create({
@@ -3687,7 +4056,13 @@ const ZeroApex = (function () {
 
     function complete(taskId, result) {
         if (taskId && defaultInstance.ledger) {
-            try { defaultInstance.ledger.complete(taskId, result); } catch (e) {}
+            try {
+                defaultInstance.ledger.complete(taskId, result);
+                // Returns false if task not found or invalid transition — non-fatal,
+                // task may live in the caller's own ledger instance
+            } catch (e) {
+                defaultAudit.append({ tool: "wrapToolExecution", task_id: taskId, trigger: "ledger_complete_error", duration_ms: 0, result_code: ErrorCode.INTERNAL_ERROR, result_summary: safeString(e).slice(0, 80) });
+            }
         }
     }
 
@@ -3700,7 +4075,10 @@ const ZeroApex = (function () {
             // Without this, the first tool call would see the builtin minimal
             // manifest and either incorrectly allow or incorrectly deny.
             if (defaultManifest && typeof defaultManifest.loadAsync === "function") {
-                try { await defaultManifest.loadAsync(); } catch (e) {}
+                try { await defaultManifest.loadAsync(); } catch (e) {
+                    // Non-fatal: log and continue with cached/builtin manifest
+                    defaultAudit.append({ tool: toolName || "unknown", task_id: taskId, trigger: "manifest_load_error", duration_ms: 0, result_code: ErrorCode.INTERNAL_ERROR, result_summary: safeString(e).slice(0, 120) });
+                }
             }
             if (taskId && defaultEnforcer.isBlocked(taskId)) {
                 var blockResult = {
@@ -3963,13 +4341,29 @@ const ZeroApex = (function () {
     }
 
 async function file_guard(params) {
-    if (params.script) return ZeroApex.FileGuard.scanScript(params.script);
-    if (params.path && !params.command) return ZeroApex.FileGuard.pathRisk(params.path);
-    return ZeroApex.FileGuard.analyzeCommand(params.command || "");
+    var result;
+    if (params.script) {
+        result = ZeroApex.FileGuard.scanScript(params.script);
+    } else if (params.path && !params.command) {
+        // SE2: pass operation so writeOnly entries work correctly
+        result = ZeroApex.FileGuard.pathRisk(params.path, params.operation || "unknown");
+    } else {
+        result = ZeroApex.FileGuard.analyzeCommand(params.command || "");
+    }
+    // A1: normalize to unified {success, code, ...} protocol
+    result.success = !result.requires_confirmation;
+    result.code = result.requires_confirmation
+        ? (result.is_delete ? ErrorCode.GUARD_BLOCK : ErrorCode.CONFIRMATION_REQUIRED)
+        : ErrorCode.OK;
+    return result;
 }
 
 async function hallucination_guard(params) {
-    return ZeroApex.Hallucination.check(params.text, params.evidence);
+    var result = ZeroApex.Hallucination.check(params.text, params.evidence);
+    // A1: normalize to unified {success, code, ...} protocol
+    result.success = !result.block;
+    result.code = result.block ? ErrorCode.HALLUCINATION_BLOCK : ErrorCode.OK;
+    return result;
 }
 
     async function evidence_check(params) {
@@ -4054,6 +4448,123 @@ async function remember(params) {
 
 async function recall(params) {
     return await ZeroApex.Memory.recall(params.query, params.kind, params.limit);
+}
+
+// §NEW reasoning_chain — start/step/conclude a ReAct reasoning chain
+async function reasoning_chain(params) {
+    params = params || {};
+    var RC = ZeroApex.ReasoningChain;
+    var action = params.action || "create";
+    if (action === "create") {
+        var chain = RC.create(params.goal || "");
+        return { success: true, code: "OK", chain: chain };
+    }
+    if (action === "thought") {
+        var ch = params.chain;
+        if (!ch) return { success: false, code: "E1002_MISSING_REQUIRED", error: "chain 参数必填" };
+        RC.thought(ch, params.text || "");
+        return { success: true, code: "OK", chain: ch };
+    }
+    if (action === "action") {
+        var ch = params.chain;
+        if (!ch) return { success: false, code: "E1002_MISSING_REQUIRED", error: "chain 参数必填" };
+        RC.action(ch, params.tool || "", params.params || {});
+        return { success: true, code: "OK", chain: ch };
+    }
+    if (action === "observation") {
+        var ch = params.chain;
+        if (!ch) return { success: false, code: "E1002_MISSING_REQUIRED", error: "chain 参数必填" };
+        RC.observation(ch, params.result || "", params.success !== false);
+        return { success: true, code: "OK", chain: ch };
+    }
+    if (action === "conclude") {
+        var ch = params.chain;
+        if (!ch) return { success: false, code: "E1002_MISSING_REQUIRED", error: "chain 参数必填" };
+        RC.conclude(ch, params.conclusion || "", params.success !== false);
+        return { success: true, code: "OK", chain: ch, summary: RC.summarize(ch) };
+    }
+    if (action === "summarize") {
+        var ch = params.chain;
+        if (!ch) return { success: false, code: "E1002_MISSING_REQUIRED", error: "chain 参数必填" };
+        return { success: true, code: "OK", summary: RC.summarize(ch) };
+    }
+    return { success: false, code: "E1001_INVALID_PARAMS", error: "未知 action: " + action };
+}
+
+// §NEW task_plan — create and manage hierarchical task decomposition
+async function task_plan(params) {
+    params = params || {};
+    var TP = ZeroApex.TaskPlanner;
+    var action = params.action || "create";
+    if (action === "create") {
+        var plan = TP.createPlan(params.goal || "");
+        return { success: true, code: "OK", plan: plan };
+    }
+    if (action === "add_task") {
+        var plan = params.plan;
+        if (!plan) return { success: false, code: "E1002_MISSING_REQUIRED", error: "plan 参数必填" };
+        var id = TP.addTask(plan, params.parent_id || null, {
+            name: params.name || "",
+            goal: params.goal || params.name || "",
+            tool: params.tool || null,
+            params: params.task_params || {},
+            requires: params.requires || [],
+            priority: params.priority || 0,
+        });
+        return { success: !!id, code: id ? "OK" : "E1001_INVALID_PARAMS", node_id: id, plan: plan };
+    }
+    if (action === "ready") {
+        var plan = params.plan;
+        if (!plan) return { success: false, code: "E1002_MISSING_REQUIRED", error: "plan 参数必填" };
+        return { success: true, code: "OK", ready: TP.readyNodes(plan) };
+    }
+    if (action === "complete_node") {
+        var plan = params.plan;
+        if (!plan || !params.node_id) return { success: false, code: "E1002_MISSING_REQUIRED", error: "plan/node_id 必填" };
+        TP.completeNode(plan, params.node_id, params.result || null, params.success !== false);
+        return { success: true, code: "OK", plan: plan, summary: TP.summary(plan) };
+    }
+    if (action === "summary") {
+        var plan = params.plan;
+        if (!plan) return { success: false, code: "E1002_MISSING_REQUIRED", error: "plan 参数必填" };
+        return { success: true, code: "OK", summary: TP.summary(plan) };
+    }
+    return { success: false, code: "E1001_INVALID_PARAMS", error: "未知 action: " + action };
+}
+
+// §NEW reflexion — record failures and query past reflections
+async function reflexion(params) {
+    params = params || {};
+    var RF = ZeroApex.Reflexion;
+    var action = params.action || "reflect";
+    if (action === "reflect") {
+        var entry = RF.reflect({
+            goal: params.goal || "",
+            tool: params.tool || "",
+            error: params.error || "",
+            evidence: params.evidence || "",
+            chain_summary: params.chain_summary || "",
+            severity: params.severity || RF.SEVERITY.MEDIUM,
+        });
+        // Persist to Memory async (fire-and-forget)
+        if (ZeroApex.Memory) {
+            var p2 = RF.persist(ZeroApex.Memory._raw || null);
+            if (p2 && typeof p2.catch === "function") p2.catch(function () {});
+        }
+        return { success: true, code: "OK", entry: entry, rule: entry.rule };
+    }
+    if (action === "query") {
+        var results = RF.query(params.goal || "", params.tool || "", params.limit || 5);
+        return { success: true, code: "OK", reflections: results, count: results.length };
+    }
+    if (action === "context_hint") {
+        var hint = RF.contextHint(params.goal || "", params.tool || "");
+        return { success: true, code: "OK", hint: hint, has_hint: hint.length > 0 };
+    }
+    if (action === "snapshot") {
+        return { success: true, code: "OK", reflections: RF.snapshot(), count: RF.size() };
+    }
+    return { success: false, code: "E1001_INVALID_PARAMS", error: "未知 action: " + action };
 }
 
 async function snapshot_file(params) {
@@ -4261,6 +4772,9 @@ exports.output_firewall = wrapExport(output_firewall, "output_firewall");
 exports.search_opensource = wrapExport(search_opensource, "search_opensource");
 exports.remember = wrapExport(remember, "remember");
 exports.recall = wrapExport(recall, "recall");
+exports.reasoning_chain = wrapExport(reasoning_chain, "reasoning_chain");
+exports.task_plan = wrapExport(task_plan, "task_plan");
+exports.reflexion = wrapExport(reflexion, "reflexion");
 exports.snapshot_file = wrapExport(snapshot_file, "snapshot_file");
 exports.restore_file = wrapExport(restore_file, "restore_file");
 exports.snapshot_cleanup = wrapExport(snapshot_cleanup, "snapshot_cleanup");
