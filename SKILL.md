@@ -1,6 +1,6 @@
 ---
 name: zero_apex
-version: "2.5.5"
+version: "2.5.6"
 description: |
   Engineering task guardian engine. Anti-delete / anti-hallucination / evidence
   verification / output firewall / memory / snapshot — all as executable JS
