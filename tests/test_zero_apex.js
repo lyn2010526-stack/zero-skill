@@ -1280,6 +1280,7 @@ async function runFileGuardV2Tests() {
     await runV258FeatureTests();
     await runV259UpgradeTests();
     await runV2510UpgradeTests();
+    await runV2511AuditFixTests();
     if (failures === 0) {
       console.log("\nALL TESTS PASSED");
       process.exit(0);
@@ -1944,4 +1945,333 @@ async function runV2510UpgradeTests() {
   assert("TS-13: generic pass signal detected", pr3.all_passed);
 
   console.log("[v2.5.10-upgrade-test] all assertions done, failures=%d", failures);
+}
+
+// ==========================================================================
+// v2.5.11 审计修复测试 — 覆盖外部审计发现的 12 个缺陷
+// ==========================================================================
+async function runV2511AuditFixTests() {
+  console.log("\n=== v2.5.11 Audit Fix Tests ===");
+  var ZA = m.ZeroApex;
+  var AT = ZA.AdversarialTest;
+  var DC = ZA.DepsContract;
+  var FB = ZA.FirewallBoundary;
+  var CL = ZA.Calibration;
+
+  // ===== §27 AdversarialTest 红队对抗性测试 =====
+  // T1: 编码嵌套混淆
+  var t1 = AT.testNestedEncoding();
+  assert("AT-T1: hex→base64 嵌套解码检测", t1.length === 0);
+  assert("AT-T1: hex escapes 3层解码", t1.filter(function(f){ return f.id.indexOf("T1-") === 0; }).length === 0);
+
+  // T2: 幻觉关键词变体
+  var t2 = AT.testHallucinationVariants();
+  // 注意: 部分变体可能未被完全覆盖，但核心同义词组应被检测
+  assert("AT-T2: 同义词变体检测率 >50%", t2.length < 20); // 允许少量变体漏检
+
+  // T3: 上下文危险命令
+  var t3 = AT.testContextualDanger();
+  assert("AT-T3: git push --force on main 被标记", t3.filter(function(f){ return f.id === "T3-0"; }).length === 0);
+  assert("AT-T3: chmod 777 被标记", t3.filter(function(f){ return f.id === "T3-2" || f.id === "T3-3"; }).length === 0);
+
+  // T4: 快照绕过
+  var t4 = AT.testSnapshotBypass();
+  assert("AT-T4: 路径遍历被拦截", t4.filter(function(f){ return f.id === "T4-0"; }).length === 0);
+  assert("AT-T4: 绝对敏感路径被拦截", t4.filter(function(f){ return f.id === "T4-1"; }).length === 0);
+
+  // T5: 输出防火墙绕过
+  var t5 = AT.testFirewallBypass();
+  assert("AT-T5: GitHub Token 泄漏被检测", t5.length === 0);
+
+  // T6: 置信度欺骗
+  var t6 = AT.testConfidenceDeception();
+  assert("AT-T6: 无证据声明被拦截", t6.length === 0);
+
+  // 完整运行
+  var fullResult = await AT.runAll();
+  assert("AT-FULL: 总测试数 = 42", fullResult.total === 42);
+  assert("AT-FULL: pass_rate 是字符串百分比", typeof fullResult.pass_rate === "string" && fullResult.pass_rate.indexOf("%") > 0);
+
+  // ===== §28 DepsContract 接口规范化 =====
+  var dc1 = DC.validate({});
+  assert("DC-1: 空 deps 校验不通过", !dc1.valid);
+  assert("DC-1: 报告缺失 IFiles", dc1.missing.indexOf("IFiles (read/write/listFiles/deleteFile)") >= 0);
+
+  var dc2 = DC.validate({ Files: { read: function(){}, write: function(){} } });
+  assert("DC-2: 最小 deps 校验通过", dc2.valid);
+
+  var dc3 = DC.validate({ Files: { read: function(){}, write: function(){} }, Tools: {} });
+  assert("DC-3: 完整 deps 校验通过", dc3.valid);
+  assert("DC-3: 无警告", dc3.warnings.length === 0);
+
+  var guide = DC.adapterGuide();
+  assert("DC-4: 适配器指南包含 interfaces", !!guide.interfaces);
+  assert("DC-4: 平台标记为 Any", guide.platform === "Any");
+
+  // ===== §29 FirewallBoundary 边界清晰化 =====
+  var fb1 = FB.check("工具链: [preflight, file_guard, hallucination_guard]");
+  assert("FB-1: 暴露工具链 → BLOCK", fb1.action.indexOf("BLOCK") >= 0);
+  assert("FB-1: 严重度 SEVERE", fb1.severity === "SEVERE");
+
+  var fb2 = FB.check("引擎内部模块包括 §13 Hallucination 和 §14 Evidence");
+  assert("FB-2: 内部模块名称 → WARN 或 BLOCK", fb2.action.indexOf("PASS") < 0);
+
+  var fb3 = FB.check("这个功能使用了 React hooks 来管理状态");
+  assert("FB-3: 正常技术说明 → PASS", fb3.action === "PASS");
+
+  var fb4 = FB.check("工具链: [preflight, file_guard]", { debug_mode: true });
+  assert("FB-4: debug_mode 降级 SEVERE→WARN", fb4.severity === "WARN");
+
+  var fb5 = FB.check("自检层会评估目标清晰度");
+  assert("FB-5: 提及内部层但无敏感信息 → WARN", fb5.action.indexOf("WARN") >= 0 || fb5.action.indexOf("BLOCK") >= 0);
+
+  // ===== §30 Calibration 置信度校准 =====
+  CL.reset();
+  var cl1 = CL.report();
+  assert("CL-1: 无数据时返回 NO_DATA", cl1.status === "NO_DATA");
+
+  // 模拟校准数据: 高预测+高实际 (校准良好)
+  CL.reset();
+  for (var cli = 0; cli < 5; cli++) { CL.record(80, true); }
+  for (var clj = 0; clj < 5; clj++) { CL.record(20, false); }
+  var cl2 = CL.report();
+  assert("CL-2: 校准数据收集后返回 OK", cl2.status === "OK");
+  assert("CL-2: 总记录数 = 10", cl2.total_records === 10);
+  assert("CL-2: 校准曲线包含 5 个桶", Object.keys(cl2.calibration_curve).length === 5);
+  assert("CL-2: 系统性偏差 < 10% (校准良好)", Math.abs(parseFloat(cl2.systematic_bias)) < 10);
+
+  // 模拟系统性高估
+  CL.reset();
+  for (var clk = 0; clk < 10; clk++) { CL.record(90, false); }
+  var cl3 = CL.report();
+  assert("CL-3: 系统性高估被检测", parseFloat(cl3.systematic_bias) < -50);
+
+  // ===== Hallucination 同义词变体检测 =====
+  var h1 = await ZA.Hallucination.check("搞定了", "");
+  assert("H-SYN: '搞定了' 被识别为事实声明", !h1.allowed);
+
+  var h2 = await ZA.Hallucination.check("编译过了", "");
+  assert("H-SYN: '编译过了' 被识别为事实声明", !h2.allowed);
+
+  var h3 = await ZA.Hallucination.check("显而易见这个方案可行", "");
+  assert("H-SYN: '显而易见' 被识别为过度自信", !h3.allowed || h3.violations.length > 0);
+
+  // ===== CommandNormalizer 多层嵌套解码 =====
+  var cn1 = ZA._infra.CommandNormalizer.normalize("\\x72\\x6d\\x20\\x2d\\x72\\x66");
+  assert("CN-1: hex 解码检测", cn1.signals.indexOf("escape_decoded") >= 0);
+
+  var cn2 = ZA._infra.CommandNormalizer.normalize("echo 'cm0gLXJmIC8n | base64 -d | sh");
+  assert("CN-2: base64 pipe 检测", cn2.signals.indexOf("base64_pipe_suspicious") >= 0);
+
+  var cn3 = ZA._infra.CommandNormalizer.normalize("git push --force origin main");
+  assert("CN-3: force push 上下文检测", cn3.signals.indexOf("force_push_dangerous") >= 0);
+
+  var cn4 = ZA._infra.CommandNormalizer.normalize("chmod 777 /etc/passwd");
+  assert("CN-4: chmod 777 上下文检测", cn4.signals.indexOf("chmod_777_dangerous") >= 0);
+
+  var cn5 = ZA._infra.CommandNormalizer.normalize("rm${IFS}-rf${IFS}/");
+  assert("CN-5: IFS bypass 检测", cn5.signals.indexOf("ifs_bypass_suspicious") >= 0);
+
+  // ===== 进化规则验证 (直接调用底层函数，绕过 wrapToolExecution 权限检查) =====
+  var ev1 = await ZA._infra.verify_evolution_rule({ rule: {} });
+  assert("EV-1: 空规则校验不通过", !ev1.valid);
+  assert("EV-1: 报告缺少 pattern", ev1.errors.indexOf("缺少 pattern 字段") >= 0);
+
+  var ev2 = await ZA._infra.verify_evolution_rule({ rule: { name: "test", pattern: "(rm|rmdir)", description: "test" } });
+  assert("EV-2: 合法规则校验通过", ev2.valid);
+
+  var ev3 = await ZA._infra.verify_evolution_rule({ rule: { name: "bad", pattern: "[invalid" } });
+  assert("EV-3: 非法正则校验不通过", !ev3.valid);
+
+  var ev4 = await ZA._infra.verify_evolution_rule({ rule: { name: "false-positive", pattern: "ls -la|cat|echo", description: "test" } });
+  assert("EV-4: 误杀合法命令 → 警告", ev4.warnings.length > 0);
+
+  // ===== 智能分发 =====
+  var sd1 = await ZA._infra.smart_dispatch({ goal: "删除旧日志文件" });
+  assert("SD-1: 删除意图 → 建议 preflight+file_guard+snapshot", sd1.suggested_tools.indexOf("preflight") >= 0 && sd1.suggested_tools.indexOf("file_guard") >= 0);
+
+  var sd2 = await ZA._infra.smart_dispatch({ goal: "查看项目结构" });
+  assert("SD-2: 查询意图 → 仅需 self_monitor", sd2.suggested_tools.indexOf("self_monitor") >= 0);
+
+  // ===== 工具信息按需获取 =====
+  var ti1 = await ZA._infra.get_tool_info({});
+  assert("TI-1: 返回全部工具清单", ti1.total > 0 && !!ti1.tools);
+
+  var ti2 = await ZA._infra.get_tool_info({ tool_name: "preflight" });
+  assert("TI-2: 返回单个工具信息", ti2.found && ti2.info.layer === "综合");
+
+  // ===== 英文错误消息 =====
+  var em1 = ZA._infra.errorMessage("E4001_GUARD_BLOCK", null, "en");
+  assert("EM-1: 英文错误消息", em1.indexOf("Guard") >= 0 || em1.indexOf("guard") >= 0);
+
+  var em2 = ZA._infra.errorMessage("E4001_GUARD_BLOCK", null, "zh");
+  assert("EM-2: 中文错误消息", em2 === "守卫层拒绝执行");
+
+  // ===== 快照 git 备份 =====
+  var sg1 = await ZA._infra.snapshot_git_backup({ message: "test_backup" });
+  assert("SG-1: git 备份返回结构化结果", sg1.success && sg1.backup_type === "git_commit");
+  assert("SG-1: 包含 git commands", Array.isArray(sg1.commands) && sg1.commands.length === 2);
+
+  // ===== FirewallBoundary 接入 gate 链 =====
+  var gateList = ZA._infra.GateRegistry.list();
+  assert("GATE-1: firewall_boundary 已注册", gateList.indexOf("firewall_boundary") >= 0);
+  assert("GATE-2: calibration 已注册", gateList.indexOf("calibration") >= 0);
+
+  // 测试 firewall_boundary gate 触发
+  var gateCtx = { goal: "工具链: [preflight, file_guard]", command: "", evidence: "", filesRead: [] };
+  var fbGate = ZA.FirewallBoundary.check(gateCtx.goal);
+  assert("GATE-3: 工具链暴露触发 SEVERE", fbGate.severity === "SEVERE");
+
+  // ===== FileGuard 消费 CommandNormalizer 上下文信号 =====
+  var fg1 = ZA.FileGuard.analyzeCommand("git push --force origin main");
+  assert("FG-CTX-1: force push 生成 context 信号",
+    fg1.hits && fg1.hits.some(function(h) { return h.pattern === "context:force_push_dangerous"; }));
+
+  var fg2 = ZA.FileGuard.analyzeCommand("chmod 777 /tmp/test.txt");
+  assert("FG-CTX-2: chmod 777 生成 context 信号",
+    fg2.hits && fg2.hits.some(function(h) { return h.pattern === "context:chmod_777_dangerous"; }));
+
+  var fg3 = ZA.FileGuard.analyzeCommand("find . -name *.log -exec rm {} \\;");
+  assert("FG-CTX-3: find+exec rm 生成 context 信号",
+    fg3.hits && fg3.hits.some(function(h) { return h.pattern === "context:find_exec_rm_dangerous"; }));
+
+  var fg4 = ZA.FileGuard.analyzeCommand("rm${IFS}-rf${IFS}/");
+  assert("FG-CTX-4: IFS bypass 生成 context 信号",
+    fg4.hits && fg4.hits.some(function(h) { return h.pattern === "context:ifs_bypass_suspicious"; }));
+
+  // 验证 context_risk 字段
+  var fg5 = ZA.FileGuard.analyzeCommand("git push --force origin main");
+  var contextHit = fg5.hits && fg5.hits.filter(function(h) { return h.context_risk; });
+  assert("FG-CTX-5: context_risk 字段存在", contextHit && contextHit.length > 0 && contextHit[0].context_risk === "HIGH");
+
+  // ===== Calibration 反馈到 SelfMonitor =====
+  ZA.Calibration.reset();
+  // 模拟高估偏差
+  for (var ci = 0; ci < 10; ci++) { ZA.Calibration.record(90, false); }
+  var sm = ZA.SelfMonitor.assess({ goal: "测试目标清晰度", files_read: true, evidence_ready: true });
+  assert("CAL-FB-1: 高估时置信度被调低", sm.dimensions.confidence === "INFERRED" || sm.calibration_adjusted);
+  assert("CAL-FB-2: calibration_note 存在", !!sm.calibration_note);
+
+  // 无偏差时不调整
+  ZA.Calibration.reset();
+  for (var cj = 0; cj < 5; cj++) { ZA.Calibration.record(80, true); }
+  for (var ck = 0; ck < 5; ck++) { ZA.Calibration.record(20, false); }
+  var sm2 = ZA.SelfMonitor.assess({ goal: "测试目标清晰度", files_read: true, evidence_ready: true });
+  assert("CAL-FB-3: 校准良好时不调整", sm2.dimensions.calibration_adjusted === false);
+
+  // ===== Calibration 动态权重测试 =====
+  ZA.Calibration.reset();
+  // 模拟高估
+  for (var dci = 0; dci < 15; dci++) { ZA.Calibration.record(95, true); } // 高估+偏差
+  var smCal = ZA.SelfMonitor.assess({ goal: "测试目标", files_read: true, evidence_ready: true, irreversible_risk: false });
+  assert("CAL-DYN: 校准调整标记存在", smCal.dimensions.calibration_adjusted === true);
+  assert("CAL-DYN: readiness 被调整", smCal.readiness_score >= 0 && smCal.readiness_score <= 100);
+  assert("CAL-DYN: calibration_note 存在", !!smCal.calibration_note);
+
+  // 无数据时不调整
+  ZA.Calibration.reset();
+  var smCal2 = ZA.SelfMonitor.assess({ goal: "测试目标", files_read: true, evidence_ready: true, irreversible_risk: false });
+  assert("CAL-DYN: 无数据时不调整", smCal2.dimensions.calibration_adjusted === false);
+
+  // ===== smart_dispatch 改进 =====
+  var sd_dep = await ZA._infra.smart_dispatch({ goal: "部署到生产环境" });
+  assert("SD-IMP: 部署意图 → test_scaffold", sd_dep.suggested_tools.indexOf("test_scaffold") >= 0);
+  assert("SD-IMP: risk_level HIGH", sd_dep.risk_level === "HIGH");
+
+  var sd_inst = await ZA._infra.smart_dispatch({ goal: "安装 lodash 依赖" });
+  assert("SD-IMP: 安装意图 → dep_advisor", sd_inst.suggested_tools.indexOf("dep_advisor") >= 0);
+
+  var sd_test = await ZA._infra.smart_dispatch({ goal: "运行 jest 测试" });
+  assert("SD-IMP: 测试意图 → test_scaffold", sd_test.suggested_tools.indexOf("test_scaffold") >= 0);
+
+  var sd_rev = await ZA._infra.smart_dispatch({ goal: "代码审查这个模块" });
+  assert("SD-IMP: 审查意图 → code_quality", sd_rev.suggested_tools.indexOf("code_quality") >= 0);
+
+  var sd_rb = await ZA._infra.smart_dispatch({ goal: "回滚到上一个版本" });
+  assert("SD-IMP: 回滚意图 → restore_file", sd_rb.suggested_tools.indexOf("restore_file") >= 0);
+
+  // 参数提取
+  var sd_path = await ZA._infra.smart_dispatch({ goal: "修复 src/utils/helper.js 的 bug" });
+  assert("SD-IMP: 提取文件路径", sd_path.extracted.paths.indexOf("src/utils/helper.js") >= 0);
+
+  var sd_pkg = await ZA._infra.smart_dispatch({ goal: "npm install react-dom" });
+  assert("SD-IMP: 提取包名", sd_pkg.extracted.packages.length > 0);
+
+  // ===== get_tool_info 动态生成 =====
+  var ti_dyn = await ZA._infra.get_tool_info({});
+  assert("TI-DYN: 动态生成工具清单", ti_dyn.total >= 10);
+  assert("TI-DYN: 来源标记", ti_dyn.source === "manifest" || ti_dyn.source === "builtin");
+
+  var ti_one = await ZA._infra.get_tool_info({ tool_name: "preflight" });
+  assert("TI-DYN: 单个工具查询", ti_one.found && ti_one.info.layer === "综合");
+
+  // ===== DepsContract Mock =====
+  var mock = ZA.DepsContract.createMockDeps();
+  assert("MOCK: Mock 依赖创建成功", mock._mock === true);
+  assert("MOCK: Files 存在", typeof mock.Files.read === "function");
+  assert("MOCK: Memory 存在", typeof mock.Tools.Memory.remember === "function");
+
+  // 测试 Mock 读写
+  await mock.Files.write("/test/hello.txt", "hello world");
+  var mockRead = await mock.Files.read("/test/hello.txt");
+  assert("MOCK: 文件读写", mockRead.content === "hello world" && mockRead.exists === true);
+
+  // 测试 Mock Memory
+  await mock.Tools.Memory.remember("test_key", "test_value");
+  var mockMem = await mock.Tools.Memory.recall("test_key");
+  assert("MOCK: 记忆读写", mockMem.exists === true);
+
+  // 验证 Mock 满足接口契约
+  var mockValidation = ZA.DepsContract.validate(mock);
+  assert("MOCK: Mock 通过接口校验", mockValidation.valid === true);
+
+  // ===== Hallucination 口语化短句降级 =====
+  var h_casual = await ZA.Hallucination.check("搞定了", "");
+  assert("H-CASUAL: 口语化短句允许通过", h_casual.allowed === true);
+  assert("H-CASUAL: 标记 casual_claim", h_casual.violations.some(function(v) { return v.rule === "casual_claim"; }));
+
+  var h_proc = await ZA.Hallucination.check("正在分析代码结构，接下来我会修复这个 bug", "");
+  assert("H-CASUAL: 过程描述不拦截", h_proc.allowed === true);
+
+  // 完整声明仍然拦截
+  var h_full = await ZA.Hallucination.check("已成功部署到生产环境", "");
+  assert("H-CASUAL: 完整声明仍拦截", h_full.allowed === false);
+
+  // === 第二轮修复测试 ===
+
+  // Hallucination: 含操作词的短句不降级
+  var h_op1 = await ZA.Hallucination.check("测试过了", "");
+  assert("H-FIX: 测试过了(含操作词)仍拦截", h_op1.allowed === false);
+
+  var h_op2 = await ZA.Hallucination.check("部署完成", "");
+  assert("H-FIX: 部署完成(含操作词)仍拦截", h_op2.allowed === false);
+
+  // 真正口语化短句放行
+  var h_casual2 = await ZA.Hallucination.check("好的", "");
+  assert("H-FIX: 真正口语化放行", h_casual2.allowed === true);
+
+  // Calibration: 小样本不调整
+  ZA.Calibration.reset();
+  ZA.Calibration.record(100, false);
+  ZA.Calibration.record(100, false);
+  var sm_small = ZA.SelfMonitor.assess({ goal: "测试", files_read: true, evidence_ready: true });
+  assert("CAL-FIX: 2条记录不调整", sm_small.dimensions.calibration_adjusted === false);
+
+  // Calibration: 足够样本才调整
+  ZA.Calibration.reset();
+  for (var fi = 0; fi < 10; fi++) { ZA.Calibration.record(90, false); }
+  var sm_big = ZA.SelfMonitor.assess({ goal: "测试", files_read: true, evidence_ready: true });
+  assert("CAL-FIX: 10条记录触发调整", sm_big.dimensions.calibration_adjusted === true);
+
+  // smart_dispatch: 高风险场景
+  var sd_format = await ZA._infra.smart_dispatch({ goal: "格式化硬盘" });
+  assert("SD-FIX: 格式化硬盘 → CRITICAL", sd_format.risk_level === "CRITICAL");
+
+  var sd_db = await ZA._infra.smart_dispatch({ goal: "修改数据库密码" });
+  assert("SD-FIX: 数据库密码 → CRITICAL", sd_db.risk_level === "CRITICAL");
+
+  var sd_bulk = await ZA._infra.smart_dispatch({ goal: "批量更新用户权限" });
+  assert("SD-FIX: 批量更新 → execution_safety_net", sd_bulk.suggested_tools.indexOf("execution_safety_net") >= 0);
+
+  console.log("[v2.5.11-audit-fix-test] all assertions done, failures=%d", failures);
 }

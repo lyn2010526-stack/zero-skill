@@ -18,7 +18,7 @@ rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR"
 
 # Copy needed files (no tests, no CI, no .trash, no node_modules)
-cp "skill.md" "${STAGE_DIR}/skill.md"
+cp "SKILL.md" "${STAGE_DIR}/skill.md"
 cp "零.skill" "${STAGE_DIR}/零.skill"
 cp "零.md" "${STAGE_DIR}/零.md"
 cp "manifest.json" "${STAGE_DIR}/manifest.json"

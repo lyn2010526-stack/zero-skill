@@ -34,6 +34,26 @@ jobs:
             exit 1
           fi
 
+      - name: Adversarial red-team tests
+        run: |
+          OUTPUT=$(node -e "
+            const m = require('./engine/zero_apex.js');
+            m.adversarial_test({}).then(r => {
+              console.log('Pass rate:', r.pass_rate);
+              console.log('Failed:', r.failed);
+              if (r.verdict !== 'ALL_PASS') {
+                console.log('FAILURES:', JSON.stringify(r.failures.slice(0, 5), null, 2));
+                process.exit(1);
+              }
+              console.log('Adversarial test: ALL_PASS');
+            });
+          " 2>&1)
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q "FAILURES"; then
+            echo "::error::Adversarial test detected bypasses"
+            exit 1
+          fi
+
       - name: Coverage gate (minimum assertions)
         run: |
           # Extract assertion counts from test output

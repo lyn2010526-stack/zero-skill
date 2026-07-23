@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "name": "zero_apex",
-  "version": "2.5.10",
-  "description": "首席工程师执行引擎。守护层为可执行 JS，运行在 Operit QuickJS 沙箱。",
+  "version": "2.5.12",
+  "description": "首席工程师执行引擎。守护层为可执行 JS，运行在 Operit QuickJS 沙箱。v2.5.12 修复 Hallucination 绕过、Calibration 小样本、smart_dispatch 盲区，清理冗余代码。",
   "compatibility": "Operit AI",
   "license": "Apache-2.0",
   "language": "zh-CN",
@@ -385,6 +385,107 @@
       "blocking": false,
       "description": "测试骨架生成 + 测试结果反馈解析：从函数签名自动生成 Jest/assert 测试骨架，解析 Jest/Mocha/TAP 测试输出为结构化结果，向 AI 返回明确的修复指引",
       "added_in": "2.5.10"
+    },
+    {
+      "name": "adversarial_test",
+      "layer": "审计",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": [
+        "manual",
+        "periodic"
+      ],
+      "blocking": false,
+      "description": "红队对抗性测试：编码嵌套混淆(T1)、幻觉关键词变体(T2)、上下文危险命令(T3)、快照绕过(T4)、防火墙绕过(T5)、置信度欺骗(T6) 六维测试，返回 pass_rate 和失败详情",
+      "added_in": "2.5.11"
+    },
+    {
+      "name": "deps_validate",
+      "layer": "架构",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": [
+        "manual"
+      ],
+      "blocking": false,
+      "description": "运行 deps 接口校验，检查 IFiles/IMemory/IEnv/ITools 四大接口契约是否满足，返回缺失方法和适配指南",
+      "added_in": "2.5.11"
+    },
+    {
+      "name": "firewall_boundary",
+      "layer": "防火墙",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": [
+        "before_user_output"
+      ],
+      "blocking": true,
+      "description": "输出防火墙边界清晰化：三级边界(BLOCK/WARN/PASS)，区分内部实现细节(硬拦截) vs 模块名称提及(软提醒) vs 正常技术说明(放行)，支持 debug_mode 降级",
+      "added_in": "2.5.11"
+    },
+    {
+      "name": "calibration_track",
+      "layer": "校准",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": [
+        "task_complete",
+        "manual"
+      ],
+      "blocking": false,
+      "description": "置信度校准追踪：记录 SelfMonitor 评分 vs 实际任务成功率，输出校准曲线和系统性偏差检测，确保评分与实际一致",
+      "added_in": "2.5.11"
+    },
+    {
+      "name": "snapshot_git_backup",
+      "layer": "快照",
+      "requires": [
+        "Files"
+      ],
+      "min_permission": "basic",
+      "triggers": [
+        "command_risk:destructive",
+        "manual"
+      ],
+      "blocking": false,
+      "description": "Git 本地 commit 异地备份：将当前改动创建为 git commit 作为异地备份机制，返回需执行的 git 命令序列（git add -A + git commit），不自动 push",
+      "added_in": "2.5.11"
+    },
+    {
+      "name": "verify_evolution_rule",
+      "layer": "进化",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": [
+        "manual"
+      ],
+      "blocking": false,
+      "description": "进化规则验证：新规则合并前的自动化校验，检查 pattern 合法性、误杀合法命令、匹配应有的恶意命令，返回 errors/warnings",
+      "added_in": "2.5.11"
+    },
+    {
+      "name": "smart_dispatch",
+      "layer": "分发",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": [
+        "task_start"
+      ],
+      "blocking": false,
+      "description": "智能工具分发：根据 goal/command 自动推断建议的工具链（如删除意图→preflight+file_guard+snapshot），降低工具数量认知负担",
+      "added_in": "2.5.11"
+    },
+    {
+      "name": "get_tool_info",
+      "layer": "上下文",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": [
+        "manual"
+      ],
+      "blocking": false,
+      "description": "按需工具信息获取：返回紧凑格式的工具定义（layer/description/params/blocking），减少上下文膨胀；支持查询单个工具或全部清单",
+      "added_in": "2.5.11"
     }
   ],
   "references": [
