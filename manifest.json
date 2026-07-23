@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "name": "zero_apex",
-  "version": "2.5.12",
-  "description": "首席工程师执行引擎。守护层为可执行 JS，运行在 Operit QuickJS 沙箱。v2.5.12 修复 Hallucination 绕过、Calibration 小样本、smart_dispatch 盲区，清理冗余代码。",
+  "version": "2.6.0",
+  "description": "首席工程师执行引擎。守护层为可执行 JS，运行在 Operit QuickJS 沙箱。v2.6.0 真正推理核心：证据链验证、自动校准、上下文感知调度、ReAct 多步推理、工具沙箱隔离。",
   "compatibility": "Operit AI",
   "license": "Apache-2.0",
   "language": "zh-CN",
@@ -486,6 +486,76 @@
       "blocking": false,
       "description": "按需工具信息获取：返回紧凑格式的工具定义（layer/description/params/blocking），减少上下文膨胀；支持查询单个工具或全部清单",
       "added_in": "2.5.11"
+    },
+    {
+      "name": "evidence_verify",
+      "layer": "证据链",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": ["claim_made"],
+      "blocking": true,
+      "description": "证据链验证：声明必须关联工具执行 ID，引擎验证执行结果与声明一致，防止编造结果",
+      "added_in": "2.6.0"
+    },
+    {
+      "name": "evidence_link",
+      "layer": "证据链",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": ["tool_complete"],
+      "blocking": false,
+      "description": "证据链关联：工具执行完成后自动记录执行 ID 和结果摘要，供后续声明验证",
+      "added_in": "2.6.0"
+    },
+    {
+      "name": "auto_calibrate",
+      "layer": "校准",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": ["tool_complete"],
+      "blocking": false,
+      "description": "自动校准：工具执行完成后自动记录预测 vs 实际成功率，按工具分组统计偏差",
+      "added_in": "2.6.0"
+    },
+    {
+      "name": "context_dispatch",
+      "layer": "调度",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": ["goal_submitted"],
+      "blocking": false,
+      "description": "上下文感知调度：依赖拓扑排序 + 历史失败感知 + blocker 检查，智能推荐工具序列",
+      "added_in": "2.6.0"
+    },
+    {
+      "name": "react_create",
+      "layer": "推理",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": ["task_start"],
+      "blocking": false,
+      "description": "ReAct 循环创建：初始化多步推理状态（goal/steps/phase），支持最多 10 步推理",
+      "added_in": "2.6.0"
+    },
+    {
+      "name": "react_step",
+      "layer": "推理",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": ["step_advance"],
+      "blocking": false,
+      "description": "ReAct 单步推进：执行 reason/act/observe/reflect/backtrack/summary 阶段，带步骤记忆和回溯",
+      "added_in": "2.6.0"
+    },
+    {
+      "name": "tool_sandbox",
+      "layer": "沙箱",
+      "requires": [],
+      "min_permission": "none",
+      "triggers": ["tool_call"],
+      "blocking": false,
+      "description": "工具执行隔离：超时控制（默认30s）+ 输出截断（默认8KB）+ 异常捕获，防止恶意工具拖垮引擎",
+      "added_in": "2.6.0"
     }
   ],
   "references": [

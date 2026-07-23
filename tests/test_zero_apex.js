@@ -2273,5 +2273,89 @@ async function runV2511AuditFixTests() {
   var sd_bulk = await ZA._infra.smart_dispatch({ goal: "批量更新用户权限" });
   assert("SD-FIX: 批量更新 → execution_safety_net", sd_bulk.suggested_tools.indexOf("execution_safety_net") >= 0);
 
-  console.log("[v2.5.11-audit-fix-test] all assertions done, failures=%d", failures);
+  // === v2.6.0 真正推理核心测试 ===
+  console.log("\n=== v2.6.0 Reasoning Core Tests ===");
+
+  // 获取 _infra 引用
+  var infra = m.create({})._infra;
+
+  // ToolSandbox
+  var sb1 = infra.ToolSandbox.execute(function (p) { return "ok"; }, {}, {});
+  assert("SB: 正常执行", sb1.success === true && sb1.result === "ok");
+
+  var sb2 = infra.ToolSandbox.execute(function (p) { throw new Error("boom"); }, {}, {});
+  assert("SB: 异常捕获", sb2.success === false && sb2.error !== null);
+
+  var sb3 = infra.ToolSandbox.execute(function (p) { return "x".repeat(10000); }, {}, { max_output: 100 });
+  assert("SB: 输出截断", sb3.truncated === true);
+
+  // EvidenceChain
+  infra.EvidenceChain.reset();
+  var execId = infra.EvidenceChain.nextExecutionId();
+  infra.EvidenceChain.link(execId, "build", "编译成功 0 errors");
+
+  var ev1 = infra.EvidenceChain.verify("编译通过", execId);
+  assert("EC: 证据链验证通过", ev1.valid === true);
+
+  var ev2 = infra.EvidenceChain.verify("编译通过", "nonexistent");
+  assert("EC: 不存在证据拒绝", ev2.valid === false);
+
+  var ev3 = infra.EvidenceChain.verify("部署成功", null);
+  assert("EC: 无证据引用拒绝", ev3.valid === false);
+
+  // 矛盾检测
+  infra.EvidenceChain.link("E_FAIL", "build", "BUILD FAILED error: undefined");
+  var ev4 = infra.EvidenceChain.verify("编译成功", "E_FAIL");
+  assert("EC: 声明与结果矛盾检测", ev4.valid === false);
+
+  // AutoCalibration
+  infra.Calibration.reset();
+  infra.AutoCalibration.onToolComplete("build", 90, true);
+  infra.AutoCalibration.onToolComplete("build", 90, false);
+  infra.AutoCalibration.onToolComplete("build", 90, true);
+  var acPredict = infra.AutoCalibration.predictSuccess("build");
+  assert("AC: 预测成功率", acPredict >= 0 && acPredict <= 100);
+
+  // ContextDispatch
+  var cd1 = infra.ContextDispatch.analyze("先构建再部署", {});
+  assert("CD: 依赖拓扑排序", cd1.steps.indexOf("build") >= 0);
+  assert("CD: 风险等级", cd1.risk === "HIGH");
+
+  var cd2 = infra.ContextDispatch.analyze("部署", { failed_tools: ["build"] });
+  assert("CD: 历史失败插入诊断", cd2.has_failures === true);
+
+  var cd3 = infra.ContextDispatch.analyze("部署", { blockers: ["无权限"] });
+  assert("CD: blocker 限制仅信息收集", cd3.has_blockers === true && cd3.steps.length <= 3);
+
+  // ReActLoop
+  var loop = infra.ReActLoop.create("修复编译错误", { max_steps: 5 });
+  assert("ReAct: 创建", loop.goal === "修复编译错误" && loop.current_phase === "reason");
+
+  infra.ReActLoop.reason(loop, "需要先看编译日志");
+  assert("ReAct: reason 阶段", loop.steps.length === 1);
+
+  infra.ReActLoop.act(loop, "build", { clean: true }, { code: "BUILD FAILED" });
+  assert("ReAct: act 阶段", loop.steps[0].tool_name === "build");
+
+  infra.ReActLoop.observe(loop, "编译失败：undefined variable");
+  assert("ReAct: observe 阶段", loop.steps[0].observation !== null);
+
+  infra.ReActLoop.reflect(loop, true, "需要检查变量声明");
+  assert("ReAct: reflect 继续循环", loop.done === false && loop.current_phase === "reason");
+
+  // 回溯
+  infra.ReActLoop.backtrack(loop, 0);
+  assert("ReAct: 回溯", loop.step_count === 1 && loop.done === false);
+
+  // 终止
+  infra.ReActLoop.reason(loop, "重新尝试");
+  infra.ReActLoop.act(loop, "build", {}, { code: "BUILD SUCCESS" });
+  infra.ReActLoop.observe(loop, "编译成功");
+  infra.ReActLoop.reflect(loop, false, "");
+  assert("ReAct: 正常终止", loop.done === true);
+
+  var summary = infra.ReActLoop.summary(loop);
+  assert("ReAct: 摘要", summary.total_steps > 0 && summary.done === true);
+
+  console.log("[v2.6.0-reasoning-core-test] all assertions done, failures=%d", failures);
 }

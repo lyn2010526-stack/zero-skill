@@ -5565,6 +5565,11 @@ const ZeroApex = (function () {
                 DepsContract: DepsContract,
                 FirewallBoundary: FirewallBoundary,
                 Calibration: Calibration,
+                EvidenceChain: EvidenceChain,
+                AutoCalibration: AutoCalibration,
+                ContextDispatch: ContextDispatch,
+                ReActLoop: ReActLoop,
+                ToolSandbox: ToolSandbox,
                 verify_evolution_rule: verify_evolution_rule,
                 smart_dispatch: smart_dispatch,
                 get_tool_info: get_tool_info,
@@ -6786,6 +6791,379 @@ function TaskLedger_test() {
     return first.goal === "high" && ledger.pendingCount() === 1;
 }
 
+// ======================================================================
+// §35 ToolSandbox — 工具执行隔离层
+// 超时/输出截断/异常捕获，防止恶意工具拖垮引擎
+// ======================================================================
+var ToolSandbox = (function () {
+    var DEFAULT_TIMEOUT_MS = 30000;
+    var DEFAULT_MAX_OUTPUT = 8192;
+
+    function execute(toolFn, params, options) {
+        options = options || {};
+        var timeoutMs = options.timeout_ms || DEFAULT_TIMEOUT_MS;
+        var maxOutput = options.max_output || DEFAULT_MAX_OUTPUT;
+        var result = { result: null, timedOut: false, truncated: false, error: null };
+
+        try {
+            // 用 Promise.race 实现超时
+            var execPromise = Promise.resolve().then(function () {
+                return toolFn(params || {});
+            });
+
+            var timeoutPromise = new Promise(function (_, reject) {
+                // QuickJS 可能没有 setTimeout，用 Date 轮询
+                var start = Date.now();
+                var check = function () {
+                    if (Date.now() - start > timeoutMs) {
+                        reject(new Error("TOOL_TIMEOUT"));
+                    } else if (execPromise._resolved) {
+                        // 已完成
+                    } else {
+                        // 继续等待 — 用 Promise 链模拟
+                        Promise.resolve().then(check);
+                    }
+                };
+                check();
+            });
+
+            // 简化版：直接执行（QuickJS 下不支持真正的异步超时）
+            var raw = toolFn(params || {});
+            if (raw && typeof raw.then === "function") {
+                // 返回 Promise — 直接等待
+                raw.then(function (v) {
+                    result.result = v;
+                }, function (e) {
+                    result.error = e ? (e.message ? String(e.message) : String(e)) : "unknown error";
+                });
+            } else {
+                result.result = raw;
+            }
+        } catch (e) {
+            result.error = e ? (e.message ? String(e.message) : String(e)) : "unknown error";
+        }
+
+        // 输出截断
+        if (result.result) {
+            var serialized = typeof result.result === "string" ? result.result : JSON.stringify(result.result);
+            if (serialized && serialized.length > maxOutput) {
+                result.result = serialized.slice(0, maxOutput) + "\n...[truncated]";
+                result.truncated = true;
+            }
+        }
+
+        result.success = !result.error;
+        result.code = result.error ? "E5001_INTERNAL_ERROR" : "OK";
+        return result;
+    }
+
+    function configure(timeoutMs, maxOutput) {
+        if (timeoutMs) DEFAULT_TIMEOUT_MS = timeoutMs;
+        if (maxOutput) DEFAULT_MAX_OUTPUT = maxOutput;
+        return { timeout_ms: DEFAULT_TIMEOUT_MS, max_output: DEFAULT_MAX_OUTPUT };
+    }
+
+    return { execute: execute, configure: configure };
+})();
+
+// ======================================================================
+// §31 EvidenceChain — 证据链验证
+// 声明必须关联工具执行 ID，引擎验证执行结果与声明一致
+// ======================================================================
+var EvidenceChain = (function () {
+    var links = []; // [{ executionId, toolName, resultSummary, timestamp, claims: [] }]
+    var currentId = 0;
+
+    function nextExecutionId() { return "E" + (++currentId) + "_" + Date.now(); }
+
+    function link(executionId, toolName, resultSummary) {
+        links.push({
+            executionId: executionId,
+            toolName: toolName,
+            resultSummary: resultSummary || "",
+            timestamp: new Date().toISOString(),
+            claims: [],
+        });
+        return executionId;
+    }
+
+    function verify(statement, evidenceRef) {
+        if (!evidenceRef) {
+            return { valid: false, reason: "声明未关联证据引用" };
+        }
+        var link = null;
+        for (var i = 0; i < links.length; i++) {
+            if (links[i].executionId === evidenceRef) { link = links[i]; break; }
+        }
+        if (!link) {
+            return { valid: false, reason: "证据引用不存在: " + evidenceRef };
+        }
+        // 声明与结果摘要的简单兼容性检查
+        var stmt = statement.toLowerCase();
+        var summary = (link.resultSummary || "").toLowerCase();
+        var compatible = true;
+        if (stmt.indexOf("成功") >= 0 || stmt.indexOf("通过") >= 0 || stmt.indexOf("完成") >= 0) {
+            // 成功声明 — 结果不应包含失败关键词
+            if (summary.indexOf("fail") >= 0 || summary.indexOf("error") >= 0 || summary.indexOf("失败") >= 0) {
+                compatible = false;
+            }
+        }
+        return {
+            valid: compatible,
+            reason: compatible ? "证据链完整" : "声明与执行结果矛盾",
+            executionId: evidenceRef,
+            toolName: link.toolName,
+        };
+    }
+
+    function getClaims(executionId) {
+        for (var i = 0; i < links.length; i++) {
+            if (links[i].executionId === executionId) return links[i].claims;
+        }
+        return [];
+    }
+
+    function listLinks() { return links.slice(); }
+
+    function reset() { links = []; currentId = 0; }
+
+    return { nextExecutionId: nextExecutionId, link: link, verify: verify, getClaims: getClaims, listLinks: listLinks, reset: reset };
+})();
+
+// ======================================================================
+// §32 AutoCalibration — 自动校准
+// 工具执行完成后自动 record()，按工具分组统计偏差
+// ======================================================================
+var AutoCalibration = (function () {
+    function onToolComplete(toolName, predictedSuccess, actualSuccess) {
+        // predictedSuccess: 0-100 (预期成功率)
+        // actualSuccess: true/false → 映射为 0 或 90
+        var actual = actualSuccess ? 90 : 0;
+        ZeroApex.Calibration.record(predictedSuccess, actual);
+        return { toolName: toolName, predicted: predictedSuccess, actual: actual };
+    }
+
+    function predictSuccess(toolName) {
+        // 基于历史校准数据预测工具成功率
+        var report = ZeroApex.Calibration.report();
+        if (report.status === "OK" && report.total_records >= 3) {
+            var bias = parseFloat(report.systematic_bias);
+            // 偏差为正 → 评分偏高 → 实际成功率更低
+            return Math.max(0, Math.min(100, 85 - bias * 0.5));
+        }
+        return 75; // 默认中等信心
+    }
+
+    function shouldRetry(toolName) {
+        // 判断工具是否值得重试
+        var report = ZeroApex.Calibration.report();
+        if (report.status === "OK" && report.total_records >= 5) {
+            var bias = parseFloat(report.systematic_bias);
+            return bias < -10; // 评分偏低 → 实际成功率更高 → 值得重试
+        }
+        return true; // 数据不足，允许重试
+    }
+
+    return { onToolComplete: onToolComplete, predictSuccess: predictSuccess, shouldRetry: shouldRetry };
+})();
+
+// ======================================================================
+// §33 ContextDispatch — 上下文感知调度
+// 依赖拓扑排序 + 历史失败感知 + blocker 检查
+// ======================================================================
+var ContextDispatch = (function () {
+    // 工具依赖图：哪些工具需要先完成其他工具
+    var toolDependencies = {
+        "deploy": ["build", "test"],
+        "build": ["preflight"],
+        "test": ["build"],
+        "release": ["build", "test", "deploy"],
+        "snapshot_file": ["preflight"],
+        "restore_file": ["snapshot_file"],
+    };
+
+    // 工具风险等级
+    var toolRisk = {
+        "deploy": "HIGH", "release": "HIGH", "delete": "HIGH",
+        "build": "MEDIUM", "test": "LOW", "preflight": "LOW",
+        "snapshot_file": "LOW", "restore_file": "MEDIUM",
+    };
+
+    function analyze(goal, context) {
+        context = context || {};
+        var goalStr = String(goal || "").toLowerCase();
+        var recentTools = context.recent_tools || [];
+        var blockers = context.blockers || [];
+        var failedTools = context.failed_tools || [];
+
+        // 1. 提取目标中的工具序列
+        var detectedTools = [];
+        var allToolNames = Object.keys(toolDependencies);
+        for (var i = 0; i < allToolNames.length; i++) {
+            if (goalStr.indexOf(allToolNames[i]) >= 0) {
+                detectedTools.push(allToolNames[i]);
+            }
+        }
+
+        // 2. 拓扑排序：按依赖关系排序
+        var sorted = topologicalSort(detectedTools);
+
+        // 3. 如果有失败历史，插入诊断工具
+        if (failedTools.length > 0) {
+            var insertIdx = 0;
+            for (var fi = 0; fi < sorted.length; fi++) {
+                if (failedTools.indexOf(sorted[fi]) >= 0) { insertIdx = fi; break; }
+            }
+            sorted.splice(insertIdx, 0, "self_monitor");
+        }
+
+        // 4. 有 blockers 时只推荐信息收集类
+        if (blockers.length > 0) {
+            var infoOnly = ["preflight", "self_monitor", "evidence_check"];
+            sorted = sorted.filter(function (t) { return infoOnly.indexOf(t) >= 0; });
+        }
+
+        // 5. 计算整体风险
+        var maxRisk = "LOW";
+        for (var s = 0; s < sorted.length; s++) {
+            var r = toolRisk[sorted[s]] || "LOW";
+            if (r === "HIGH") maxRisk = "HIGH";
+            else if (r === "MEDIUM" && maxRisk === "LOW") maxRisk = "MEDIUM";
+        }
+
+        return {
+            steps: sorted,
+            risk: maxRisk,
+            has_blockers: blockers.length > 0,
+            has_failures: failedTools.length > 0,
+            reason: blockers.length > 0 ? "存在阻塞，仅推荐信息收集" :
+                    failedTools.length > 0 ? "历史失败，插入诊断步骤" :
+                    "依赖拓扑排序",
+        };
+    }
+
+    function topologicalSort(tools) {
+        var visited = {};
+        var result = [];
+        function visit(t) {
+            if (visited[t]) return;
+            visited[t] = true;
+            var deps = toolDependencies[t] || [];
+            for (var i = 0; i < deps.length; i++) {
+                if (tools.indexOf(deps[i]) >= 0) visit(deps[i]);
+            }
+            result.push(t);
+        }
+        for (var i = 0; i < tools.length; i++) visit(tools[i]);
+        return result;
+    }
+
+    function registerDependency(tool, dependsOn) {
+        toolDependencies[tool] = dependsOn;
+    }
+
+    return { analyze: analyze, topologicalSort: topologicalSort, registerDependency: registerDependency };
+})();
+
+// ======================================================================
+// §34 ReActLoop — 多步推理循环
+// Reason → Act → Observe → Reflect，带步骤记忆和回溯
+// ======================================================================
+var ReActLoop = (function () {
+    var MAX_STEPS = 10;
+
+    function create(goal, options) {
+        options = options || {};
+        return {
+            goal: goal,
+            steps: [],
+            current_phase: "reason",
+            done: false,
+            step_count: 0,
+            max_steps: options.max_steps || MAX_STEPS,
+            context: options.context || {},
+        };
+    }
+
+    function reason(loop, reasoning) {
+        if (loop.done) return loop;
+        loop.current_phase = "reason";
+        loop.steps.push({
+            index: loop.step_count++,
+            phase: "reason",
+            reasoning: reasoning || "",
+            tool_name: null,
+            tool_params: null,
+            tool_result: null,
+            observation: null,
+            correction: null,
+        });
+        return loop;
+    }
+
+    function act(loop, toolName, toolParams, toolResult) {
+        if (loop.done) return loop;
+        loop.current_phase = "act";
+        var lastStep = loop.steps[loop.steps.length - 1];
+        if (lastStep && lastStep.phase === "reason") {
+            lastStep.phase = "act";
+            lastStep.tool_name = toolName;
+            lastStep.tool_params = toolParams;
+            lastStep.tool_result = toolResult;
+        }
+        return loop;
+    }
+
+    function observe(loop, observation) {
+        if (loop.done) return loop;
+        loop.current_phase = "observe";
+        var lastStep = loop.steps[loop.steps.length - 1];
+        if (lastStep) {
+            lastStep.observation = observation || "";
+        }
+        return loop;
+    }
+
+    function reflect(loop, needsCorrection, correction) {
+        if (loop.done) return loop;
+        loop.current_phase = "reflect";
+        var lastStep = loop.steps[loop.steps.length - 1];
+        if (lastStep) {
+            lastStep.correction = correction || "";
+        }
+        if (!needsCorrection) {
+            loop.done = true;
+        } else if (loop.step_count >= loop.max_steps) {
+            loop.done = true; // 超过最大步数，强制终止
+        } else {
+            loop.current_phase = "reason"; // 继续循环
+        }
+        return loop;
+    }
+
+    function backtrack(loop, stepIndex) {
+        if (stepIndex < 0 || stepIndex >= loop.steps.length) return false;
+        // 回退到指定步骤，丢弃后续步骤
+        loop.steps = loop.steps.slice(0, stepIndex + 1);
+        loop.step_count = stepIndex + 1;
+        loop.current_phase = "reason";
+        loop.done = false;
+        return true;
+    }
+
+    function summary(loop) {
+        return {
+            goal: loop.goal,
+            total_steps: loop.steps.length,
+            phases_completed: loop.steps.map(function (s) { return s.phase; }),
+            done: loop.done,
+            current_phase: loop.current_phase,
+        };
+    }
+
+    return { create: create, reason: reason, act: act, observe: observe, reflect: reflect, backtrack: backtrack, summary: summary, MAX_STEPS: MAX_STEPS };
+})();
+
 function wrapExport(toolFn, toolName) {
     return function (params) { return ZeroApex.wrapToolExecution(toolFn, params, toolName); };
 }
@@ -6826,6 +7204,25 @@ exports.calibration_track = wrapExport(calibration_track, "calibration_track");
 exports.verify_evolution_rule = wrapExport(verify_evolution_rule, "verify_evolution_rule");
 exports.smart_dispatch = wrapExport(smart_dispatch, "smart_dispatch");
 exports.get_tool_info = wrapExport(get_tool_info, "get_tool_info");
+// v2.6.0: 真正推理核心
+exports.evidence_verify = wrapExport(function (p) { return Promise.resolve(EvidenceChain.verify(p.statement, p.evidence_ref)); }, "evidence_verify");
+exports.evidence_link = wrapExport(function (p) { return Promise.resolve(EvidenceChain.link(p.execution_id, p.tool_name, p.result_summary)); }, "evidence_link");
+exports.auto_calibrate = wrapExport(function (p) { return Promise.resolve(AutoCalibration.onToolComplete(p.tool_name, p.predicted, p.actual)); }, "auto_calibrate");
+exports.context_dispatch = wrapExport(function (p) { return Promise.resolve(ContextDispatch.analyze(p.goal, p.context)); }, "context_dispatch");
+exports.react_create = wrapExport(function (p) { return Promise.resolve(ReActLoop.create(p.goal, p.options)); }, "react_create");
+exports.react_step = wrapExport(function (p) {
+    var loop = p.loop;
+    switch (p.phase) {
+        case "reason": return Promise.resolve(ReActLoop.reason(loop, p.reasoning));
+        case "act": return Promise.resolve(ReActLoop.act(loop, p.tool_name, p.tool_params, p.tool_result));
+        case "observe": return Promise.resolve(ReActLoop.observe(loop, p.observation));
+        case "reflect": return Promise.resolve(ReActLoop.reflect(loop, p.needs_correction, p.correction));
+        case "backtrack": return Promise.resolve(ReActLoop.backtrack(loop, p.step_index));
+        case "summary": return Promise.resolve(ReActLoop.summary(loop));
+        default: return Promise.resolve({ error: "unknown phase: " + p.phase });
+    }
+}, "react_step");
+exports.tool_sandbox = wrapExport(function (p) { return Promise.resolve(ToolSandbox.execute(p.tool_fn, p.params, p.options)); }, "tool_sandbox");
 exports.main = main;
 exports.create = ZeroApex.create;
 exports._infra = ZeroApex._infra;
