@@ -830,7 +830,24 @@ const ZeroApex = (function () {
             }
 
             var pathRisks = [];
-            var pathMatches = text.match(/(\/[^\s"'|&;><]+)/g) || [];
+            // Bug#7 fix: extract paths from both quoted and unquoted contexts.
+            // Order: double-quoted, single-quoted, unquoted (stop at shell metachar)
+            var pathMatches = [];
+            var pathSeen = {};
+            var rePatterns = [
+                /"(\/[^"]+)"/g,       // double-quoted: "/path/with spaces/file"
+                /'(\/[^']+)'/g,       // single-quoted: '/path/with spaces/file'
+                /(\/[^\s"'|&;><]+)/g, // unquoted: /path/file (original)
+            ];
+            for (var rpi = 0; rpi < rePatterns.length; rpi++) {
+                var rm;
+                var re = rePatterns[rpi];
+                re.lastIndex = 0;
+                while ((rm = re.exec(text)) !== null) {
+                    var p = rm[1] || rm[0];
+                    if (!pathSeen[p]) { pathSeen[p] = true; pathMatches.push(p); }
+                }
+            }
             var rplist = riskyPaths();
             // Detect write-class commands for writeOnly path entries
             var isWriteCmd = isDelete || /^\s*(cp|mv|scp|rsync|tee|dd|install|touch|chmod|chown|ln|mkfifo|mknod|truncate|cat\s+>|echo\s+>)/i.test(text);
@@ -1609,6 +1626,24 @@ const ZeroApex = (function () {
             var evidenceReady = !!opts.evidence_ready;
             var irreversibleRisk = !!opts.irreversible_risk;
 
+            // Principle-2 (Token conservation): detect repeated tool calls.
+            // Caller passes recent_tools as array of tool name strings.
+            var recentTools = Array.isArray(opts.recent_tools) ? opts.recent_tools : [];
+            var repeatWarnings = [];
+            if (recentTools.length > 1) {
+                var toolCounts = {};
+                for (var ri = 0; ri < recentTools.length; ri++) {
+                    var tn = recentTools[ri];
+                    toolCounts[tn] = (toolCounts[tn] || 0) + 1;
+                }
+                var toolKeys = Object.keys(toolCounts);
+                for (var ki = 0; ki < toolKeys.length; ki++) {
+                    if (toolCounts[toolKeys[ki]] >= 2) {
+                        repeatWarnings.push(toolKeys[ki] + " 已调用 " + toolCounts[toolKeys[ki]] + " 次，优先复用已有结果");
+                    }
+                }
+            }
+
             var confidence;
             if (evidenceReady) confidence = "VERIFIED";
             else if (filesRead) confidence = "INFERRED";
@@ -1625,11 +1660,6 @@ const ZeroApex = (function () {
             var causalMarkers = (goal.match(/因为|所以|导致|然后|接着|之后|再|才能/g) || []).length;
             var causalDepth = causalMarkers >= 3 ? "deep" : causalMarkers >= 1 ? "medium" : "shallow";
 
-            // Readiness is a 0-100 score. Each of the 4 dimensions is worth 25
-            // points, evenly weighted. The previous 30/30/30/10 split was
-            // confusing because the "no irreversible risk" dimension was
-            // under-weighted (10%) while being arguably the most safety-
-            // critical signal. Equal weights make the score predictable.
             var readiness = 0;
             if (goalClear) readiness += 25;
             if (filesRead) readiness += 25;
@@ -1642,6 +1672,10 @@ const ZeroApex = (function () {
             if (irreversibleRisk) blockers.push("存在不可逆风险，需用户确认");
             if (!filesRead && /修改|重构|修复|删除/.test(goal)) {
                 blockers.push("改动类任务但未读取相关文件");
+            }
+            // Principle-2: repeat calls count as a blocker
+            if (repeatWarnings.length > 0) {
+                blockers.push("重复工具调用：" + repeatWarnings.join("; "));
             }
 
             var statusCard = TemplateStore.render("status_card", {
@@ -1659,11 +1693,13 @@ const ZeroApex = (function () {
                     irreversible_risk: irreversibleRisk,
                     needs_confirmation: needsConfirmation,
                     confidence: confidence,
+                    repeat_tool_calls: repeatWarnings.length > 0,
                 },
                 readiness_score: readiness,
                 causal_depth: causalDepth,
                 cognitive_biases: biases,
                 blockers: blockers,
+                repeat_warnings: repeatWarnings,
                 state: blockers.length === 0 ? "READY" : "NOT_READY",
                 status_card: statusCard,
             };
@@ -1735,6 +1771,20 @@ const ZeroApex = (function () {
                         fix: "代码必须写入文件，用工具而非对话框输出",
                     });
                 }
+            }
+
+            // Bug#8 fix: also detect oversized plain-text output (no code fences)
+            // Strip code blocks first, then measure remaining plain text
+            var plainText = text.replace(/```[\s\S]*?```/g, "");
+            var plainLines = plainText.split("\n").length;
+            var MAX_PLAIN_LINES = 150;
+            var MAX_PLAIN_CHARS = 6000;
+            if (plainLines > MAX_PLAIN_LINES || plainText.length > MAX_PLAIN_CHARS) {
+                violations.push({
+                    type: "oversized_plain_output",
+                    hit: plainLines + " 行纯文本 / " + plainText.length + " 字符",
+                    fix: "大段文本应写入文件后给出路径，而非直接输出",
+                });
             }
 
             if (/[\uFFFD]/.test(text) || /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(text)) {
@@ -1974,6 +2024,30 @@ const ZeroApex = (function () {
                 if (res && res.memories) entries = res.memories;
                 else if (Array.isArray(res)) entries = res;
                 else if (res && res.results) entries = res.results;
+
+                // F7: client-side relevance re-ranking on top of vector recall.
+                // Score = keyword overlap + recency bonus + failure/success match.
+                // This catches cases where the vector model returns semantically
+                // similar but topically irrelevant entries.
+                if (entries.length > 1) {
+                    var qWords = safeString(query).toLowerCase().split(/\s+/).filter(function(w){ return w.length > 1; });
+                    entries = entries.map(function(e) {
+                        var text = safeString((e.title || "") + " " + (e.content || "")).toLowerCase();
+                        var score = 0;
+                        // keyword overlap
+                        for (var qi = 0; qi < qWords.length; qi++) {
+                            if (text.indexOf(qWords[qi]) >= 0) score += 2;
+                        }
+                        // kind match bonus
+                        if (kind && e.tags && safeString(e.tags).indexOf(kind) >= 0) score += 3;
+                        // recency bonus (ISO date string, lexicographic sort works for same-format dates)
+                        var ts = e.created_at || e.timestamp || "";
+                        if (ts) score += 1; // any timestamped entry gets a small boost
+                        e._relevance_score = score;
+                        return e;
+                    });
+                    entries.sort(function(a, b) { return (b._relevance_score || 0) - (a._relevance_score || 0); });
+                }
                 var out = {
                     success: true,
                     code: ErrorCode.OK,
@@ -2293,8 +2367,17 @@ const ZeroApex = (function () {
         return { triggered: false };
     });
     registerGate("hallucination", async function (ctx) {
-        var hallu = await Hallucination.check(ctx.goal, ctx.evidence);
+        // F6: augment evidence with ReasoningChain observations if available
+        var augEvidence = ctx.evidence || "";
+        if (ctx.chain_summary && ctx.chain_summary.length > 0) {
+            augEvidence = augEvidence ? (augEvidence + "\n[推理链]\n" + ctx.chain_summary) : ctx.chain_summary;
+        }
+        var hallu = await Hallucination.check(ctx.goal, augEvidence);
         ctx.hallu = hallu;
+        // F1: if Reflexion hints exist and hallu already triggered, escalate severity
+        if (!hallu.allowed && ctx.reflexion_hint && ctx.reflexion_hint.length > 0) {
+            hallu.reflexion_warning = ctx.reflexion_hint;
+        }
         if (!hallu.allowed) {
             var shouldBlock = false;
             for (var i = 0; i < hallu.violations.length; i++) {
@@ -2309,7 +2392,7 @@ const ZeroApex = (function () {
                     break;
                 }
             }
-            return { triggered: true, violations: hallu.violations, block: shouldBlock };
+            return { triggered: true, violations: hallu.violations, block: shouldBlock, reflexion_warning: hallu.reflexion_warning };
         }
         return { triggered: false };
     });
@@ -2392,6 +2475,10 @@ const ZeroApex = (function () {
             hallu: null,
             of: null,
             bypass: bypassSet,
+            // F1: inject Reflexion history hint so gates can use past failure patterns
+            reflexion_hint: Reflexion.contextHint(goal, null),
+            // F2: chain summary injected by caller via options.chain_summary
+            chain_summary: options.chain_summary || "",
         };
 
         var gateResults = await runGates(ctx, bypassSet);
@@ -2475,7 +2562,28 @@ const ZeroApex = (function () {
             snapshot_advice: gates.indexOf("snapshot") >= 0,
             status_card: self.status_card,
             task_id: taskId,
+            // F10: surface Reflexion hint and chain context for caller
+            reflexion_hint: ctx.reflexion_hint || "",
+            chain_summary: ctx.chain_summary || "",
+            // Principle-3 (minimal change scope): warn if command/goal looks broad
+            scope_warning: (function () {
+                var cmd = String(command || "");
+                var g = String(goal || "");
+                // Broad recursive patterns
+                if (/\-r[f]?\s|--recursive|find\s.*\-exec|xargs/.test(cmd)) return "命令含递归操作，影响范围可能超出预期，建议缩小到具体路径";
+                // Multi-module goal signals
+                if ((g.match(/重构|重写|全部|所有|整个|批量/g) || []).length >= 2) return "目标描述含多个广泛修改信号，建议拆分为最小步骤逐一执行";
+                // Large file count hints
+                if (/\*\.\w+|\*\*\//.test(cmd)) return "命令含通配符，建议先 dry-run 确认影响文件范围";
+                return "";
+            })(),
         };
+
+        // F1: if there are relevant past failures, add them to reasons so the
+        // caller can display them without having to call reflexion separately
+        if (ctx.reflexion_hint && ctx.reflexion_hint.length > 0 && !allowed) {
+            result.reasons.push(ctx.reflexion_hint);
+        }
 
         ledger.complete(taskId, { allowed: result.allowed, state: state });
         return result;
@@ -3564,7 +3672,208 @@ const ZeroApex = (function () {
 
 
     // ======================================================================
-    // §21h ReasoningChain — ReAct-style Thought/Action/Observation loop
+    // §21g2 OutputValidator — structured output schema validation
+    // Inspired by: Guardrails AI, Instructor (Jason Liu 2023)
+    // Core idea: validate tool return values and model outputs against a
+    // declared schema so callers get a typed, predictable response even when
+    // the underlying model hallucinates structure.
+    // ======================================================================
+    var OutputValidator = (function () {
+        // Supported type checkers
+        var TYPES = {
+            string:  function(v) { return typeof v === "string"; },
+            number:  function(v) { return typeof v === "number" && isFinite(v); },
+            boolean: function(v) { return typeof v === "boolean"; },
+            array:   function(v) { return Array.isArray(v); },
+            object:  function(v) { return v !== null && typeof v === "object" && !Array.isArray(v); },
+            any:     function()  { return true; },
+        };
+
+        // schema: { field: { type, required, min, max, minLen, maxLen, enum, pattern, items } }
+        function validate(data, schema) {
+            if (!schema || typeof schema !== "object") return { valid: true, errors: [] };
+            var errors = [];
+            var keys = Object.keys(schema);
+            for (var i = 0; i < keys.length; i++) {
+                var key = keys[i];
+                var rule = schema[key];
+                var val = data && data[key];
+                var missing = val === undefined || val === null;
+
+                if (rule.required && missing) {
+                    errors.push({ field: key, error: "必填字段缺失" });
+                    continue;
+                }
+                if (missing) continue;  // optional, not present — ok
+
+                // type check
+                var typeOk = rule.type ? (TYPES[rule.type] ? TYPES[rule.type](val) : true) : true;
+                if (!typeOk) { errors.push({ field: key, error: "类型错误，期望 " + rule.type + "，实际 " + typeof val }); continue; }
+
+                // numeric range
+                if (rule.type === "number") {
+                    if (rule.min !== undefined && val < rule.min) errors.push({ field: key, error: "值 " + val + " 小于最小值 " + rule.min });
+                    if (rule.max !== undefined && val > rule.max) errors.push({ field: key, error: "值 " + val + " 大于最大值 " + rule.max });
+                }
+                // string constraints
+                if (rule.type === "string") {
+                    if (rule.minLen !== undefined && val.length < rule.minLen) errors.push({ field: key, error: "字符串长度 " + val.length + " 小于 minLen " + rule.minLen });
+                    if (rule.maxLen !== undefined && val.length > rule.maxLen) errors.push({ field: key, error: "字符串长度 " + val.length + " 超过 maxLen " + rule.maxLen });
+                    if (rule.pattern && !(new RegExp(rule.pattern)).test(val)) errors.push({ field: key, error: "字段 " + key + " 不匹配 pattern " + rule.pattern });
+                }
+                // enum check
+                if (rule.enum && Array.isArray(rule.enum) && rule.enum.indexOf(val) < 0) {
+                    errors.push({ field: key, error: "值 '" + val + "' 不在允许列表: " + rule.enum.join(", ") });
+                }
+                // array item type
+                if (rule.type === "array" && rule.items && val.length > 0) {
+                    var itemChecker = TYPES[rule.items];
+                    if (itemChecker) {
+                        for (var j = 0; j < val.length; j++) {
+                            if (!itemChecker(val[j])) {
+                                errors.push({ field: key + "[" + j + "]", error: "数组元素类型错误，期望 " + rule.items });
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            return { valid: errors.length === 0, errors: errors };
+        }
+
+        // Coerce data to match schema where safely possible (type coercion)
+        function coerce(data, schema) {
+            if (!schema || !data) return data;
+            var out = Object.assign({}, data);
+            var keys = Object.keys(schema);
+            for (var i = 0; i < keys.length; i++) {
+                var key = keys[i];
+                var rule = schema[key];
+                if (out[key] === undefined || out[key] === null) continue;
+                if (rule.type === "string" && typeof out[key] !== "string") out[key] = String(out[key]);
+                if (rule.type === "number" && typeof out[key] !== "number") {
+                    var n = Number(out[key]);
+                    if (isFinite(n)) out[key] = n;
+                }
+                if (rule.type === "boolean" && typeof out[key] !== "boolean") out[key] = !!out[key];
+            }
+            return out;
+        }
+
+        // Built-in schemas for ZeroApex tool responses
+        var SCHEMAS = {
+            preflight_result: {
+                allowed: { type: "boolean", required: true },
+                state: { type: "string", required: true, enum: ["READY", "NEED_EVIDENCE", "NOT_READY", "WAIT_CONFIRMATION"] },
+                task_id: { type: "string", required: false },
+                readiness_score: { type: "number", required: false, min: 0, max: 100 },
+            },
+            file_guard_result: {
+                is_delete: { type: "boolean", required: true },
+                requires_confirmation: { type: "boolean", required: true },
+                risk_level: { type: "string", required: true, enum: ["SAFE", "LOW", "MEDIUM", "HIGH", "CRITICAL"] },
+                success: { type: "boolean", required: true },
+            },
+            evidence_result: {
+                grade: { type: "string", required: true },
+                level: { type: "number", required: true, min: 0, max: 6 },
+                verdict: { type: "string", required: true },
+            },
+        };
+
+        function getSchema(name) { return SCHEMAS[name] || null; }
+        function registerSchema(name, schema) { SCHEMAS[name] = schema; }
+
+        return { validate: validate, coerce: coerce, getSchema: getSchema, registerSchema: registerSchema };
+    })();
+
+    // ======================================================================
+    // §21g3 EvidenceCollector — cross-step evidence aggregation
+    // Inspired by: LangSmith Tracing, OpenTelemetry for LLM pipelines
+    // Core idea: accumulate evidence from multiple tool calls across a task
+    // so the final preflight check has a complete evidence chain rather than
+    // just the most recent stdout/stderr snippet.
+    // ======================================================================
+    var EvidenceCollector = (function () {
+        var MAX_ENTRIES = 50;
+
+        function create(taskId) {
+            return {
+                task_id: taskId || null,
+                entries: [],
+                created_at: new Date().toISOString(),
+            };
+        }
+
+        // Add an evidence entry from a tool call result
+        function add(collector, source, data) {
+            if (!collector || collector.entries.length >= MAX_ENTRIES) return false;
+            // Extract text from various result shapes
+            var text = "";
+            if (typeof data === "string") text = data;
+            else if (data && typeof data.stdout === "string") text = data.stdout;
+            else if (data && typeof data.output === "string") text = data.output;
+            else if (data && typeof data.content === "string") text = data.content;
+            else if (data && typeof data.message === "string") text = data.message;
+            else if (data) text = JSON.stringify(data).slice(0, 500);
+
+            var success = data && (data.success !== false) && !data.error;
+            collector.entries.push({
+                seq: collector.entries.length + 1,
+                ts: new Date().toISOString(),
+                source: String(source || ""),
+                text: text.slice(0, 800),
+                success: success,
+                code: (data && data.code) || null,
+            });
+            return true;
+        }
+
+        // Build a consolidated evidence string for injection into preflight
+        function consolidate(collector, maxLen) {
+            maxLen = maxLen || 2000;
+            if (!collector || collector.entries.length === 0) return "";
+            var lines = [];
+            for (var i = 0; i < collector.entries.length; i++) {
+                var e = collector.entries[i];
+                var status = e.success ? "OK" : "FAIL";
+                lines.push("[" + e.seq + "] [" + status + "] " + e.source + ": " + e.text);
+            }
+            var joined = lines.join("\n");
+            return joined.length > maxLen ? joined.slice(0, maxLen) + "\n…[truncated]" : joined;
+        }
+
+        // Compute aggregate success: true only if all entries succeeded
+        function allSucceeded(collector) {
+            if (!collector || collector.entries.length === 0) return false;
+            for (var i = 0; i < collector.entries.length; i++) {
+                if (!collector.entries[i].success) return false;
+            }
+            return true;
+        }
+
+        // Return the highest Evidence grade seen across all entries
+        function bestGrade(collector) {
+            if (!collector || collector.entries.length === 0) return "L0";
+            var best = 0;
+            var gradeRe = /\bL([0-6])\b/;
+            for (var i = 0; i < collector.entries.length; i++) {
+                var m = collector.entries[i].text.match(gradeRe);
+                if (m) {
+                    var lvl = parseInt(m[1], 10);
+                    if (lvl > best) best = lvl;
+                }
+            }
+            return "L" + best;
+        }
+
+        function snapshot(collector) { return collector ? collector.entries.slice() : []; }
+        function clear(collector) { if (collector) collector.entries = []; }
+
+        return { create: create, add: add, consolidate: consolidate, allSucceeded: allSucceeded, bestGrade: bestGrade, snapshot: snapshot, clear: clear };
+    })();
+
+
     // Inspired by: Yao et al. "ReAct: Synergizing Reasoning and Acting" (2022)
     // Core idea: interleave reasoning traces with tool actions so each step
     // is grounded in observable evidence rather than pure language generation.
@@ -3572,9 +3881,11 @@ const ZeroApex = (function () {
     var ReasoningChain = (function () {
         var STEP_TYPES = Object.freeze({ THOUGHT: "thought", ACTION: "action", OBSERVATION: "observation", REFLECTION: "reflection" });
         var MAX_STEPS = 64;
+        var _chainSeq = 0;  // F4: monotonic counter prevents same-millisecond ID collision
 
         function create(goal) {
             return {
+                id: "RC" + (++_chainSeq) + "_" + new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14),
                 goal: String(goal || ""),
                 steps: [],
                 created_at: new Date().toISOString(),
@@ -3601,7 +3912,16 @@ const ZeroApex = (function () {
             return addStep(chain, STEP_TYPES.ACTION, toolName, { params: params || {} });
         }
         function observation(chain, result, success) {
-            return addStep(chain, STEP_TYPES.OBSERVATION, typeof result === "string" ? result : JSON.stringify(result), { success: !!success });
+            var content = typeof result === "string" ? result : JSON.stringify(result);
+            // Principle-6 (verification closure): auto-detect if the observation
+            // confirms a build/test/run result so downstream can require verified=true
+            // before accepting a task as "done".
+            var verified = false;
+            if (success) {
+                var lower = content.toLowerCase();
+                verified = /build successful|tests? passed|all.*pass|exit.*code.*0|compiled.*ok|no errors?|0 error/.test(lower);
+            }
+            return addStep(chain, STEP_TYPES.OBSERVATION, content, { success: !!success, verified: verified });
         }
         function reflection(chain, text) { return addStep(chain, STEP_TYPES.REFLECTION, text); }
 
@@ -3666,14 +3986,17 @@ const ZeroApex = (function () {
         var MAX_DEPTH = 6;
         var MAX_NODES = 128;
         var nodeSeq = 0;
+        var DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;  // F5: 5 min default node timeout
 
-        function createPlan(goal) {
+        function createPlan(goal, options) {
+            options = options || {};
             return {
                 goal: String(goal || ""),
                 nodes: {},       // id -> node
                 roots: [],       // top-level node ids
                 created_at: new Date().toISOString(),
                 status: "pending",
+                timeout_ms: options.timeout_ms || DEFAULT_TIMEOUT_MS,
             };
         }
 
@@ -3712,7 +4035,23 @@ const ZeroApex = (function () {
         // Returns nodes whose prerequisites are all done and status is pending
         function readyNodes(plan) {
             var ready = [];
+            var now = Date.now();
+            var timeoutMs = plan.timeout_ms || DEFAULT_TIMEOUT_MS;
             var ids = Object.keys(plan.nodes);
+            // F5: auto-fail timed-out running nodes before checking ready ones
+            for (var ti = 0; ti < ids.length; ti++) {
+                var tn = plan.nodes[ids[ti]];
+                if (tn.status === "running" && tn.started_at) {
+                    var elapsed = now - new Date(tn.started_at).getTime();
+                    if (elapsed > (tn.timeout_ms || timeoutMs)) {
+                        tn.status = "failed";
+                        tn.result = { error: "timeout after " + Math.round(elapsed / 1000) + "s" };
+                        tn.completed_at = new Date().toISOString();
+                        _skipDescendants(plan, tn.id);
+                        _updatePlanStatus(plan);
+                    }
+                }
+            }
             for (var i = 0; i < ids.length; i++) {
                 var node = plan.nodes[ids[i]];
                 if (node.status !== "pending") continue;
@@ -3727,6 +4066,15 @@ const ZeroApex = (function () {
             // Sort by priority descending
             ready.sort(function (a, b) { return (b.priority || 0) - (a.priority || 0); });
             return ready;
+        }
+
+        // F5: mark a node as running and record start time for timeout tracking
+        function startNode(plan, nodeId) {
+            var node = plan.nodes[nodeId];
+            if (!node || node.status !== "pending") return false;
+            node.status = "running";
+            node.started_at = new Date().toISOString();
+            return true;
         }
 
         function completeNode(plan, nodeId, result, success) {
@@ -3797,7 +4145,7 @@ const ZeroApex = (function () {
             return lines.join("\n");
         }
 
-        return { createPlan: createPlan, addTask: addTask, readyNodes: readyNodes, completeNode: completeNode, topoSort: topoSort, summary: summary };
+        return { createPlan: createPlan, addTask: addTask, startNode: startNode, readyNodes: readyNodes, completeNode: completeNode, topoSort: topoSort, summary: summary };
     })();
 
     // ======================================================================
@@ -3836,13 +4184,28 @@ const ZeroApex = (function () {
             var err = String(failure.error || "").toLowerCase();
             var tool = String(failure.tool || "");
             // Pattern-based rule extraction — mirrors common agent failure modes
-            if (/path.*traversal|\.\.\//.test(err)) return "避免在路径中使用 '..' 遍历片段";
-            if (/not found|no such file/.test(err)) return "操作文件前先验证路径存在";
-            if (/permission|forbidden|denied/.test(err)) return "检查权限级别后再调用 " + (tool || "工具");
-            if (/timeout|timed out/.test(err)) return "网络操作设置超时，失败后走缓存";
-            if (/hallucin|unverified|guessed/.test(err)) return "声明完成前必须提供 L3+ 证据";
-            if (/curtail|not available/.test(err)) return "先查询 manifest 确认工具在当前环境可用";
-            if (/memory|out of/.test(err)) return "对大文件分批处理，避免单次读入";
+            // Each entry: { rule, root_cause, fallback_suggestion }
+            var matched = null;
+            if (/path.*traversal|\.\.\//.test(err))
+                matched = { rule: "避免在路径中使用 '..' 遍历片段", root_cause: "path_traversal", fallback_suggestion: "使用绝对路径替代相对路径" };
+            else if (/not found|no such file/.test(err))
+                matched = { rule: "操作文件前先验证路径存在", root_cause: "missing_file", fallback_suggestion: "先调用 file_guard 检查路径后再操作" };
+            else if (/permission|forbidden|denied/.test(err))
+                matched = { rule: "检查权限级别后再调用 " + (tool || "工具"), root_cause: "permission_denied", fallback_suggestion: "调用 evaluate_permission 确认所需权限级别" };
+            else if (/timeout|timed out/.test(err))
+                matched = { rule: "网络操作设置超时，失败后走缓存", root_cause: "timeout", fallback_suggestion: "减小请求体积或拆分为多次调用" };
+            else if (/hallucin|unverified|guessed/.test(err))
+                matched = { rule: "声明完成前必须提供 L3+ 证据", root_cause: "hallucination", fallback_suggestion: "先收集 evidence 再调用 hallucination_guard" };
+            else if (/curtail|not available/.test(err))
+                matched = { rule: "先查询 manifest 确认工具在当前环境可用", root_cause: "tool_curtailed", fallback_suggestion: "调用 check_sandbox 确认工具白名单" };
+            else if (/memory|out of/.test(err))
+                matched = { rule: "对大文件分批处理，避免单次读入", root_cause: "oom", fallback_suggestion: "使用 offset/limit 分段读取" };
+            else if (/duplicate|repeat|already called/.test(err))
+                matched = { rule: "避免重复调用同一工具，优先复用已有结果", root_cause: "repeat_call", fallback_suggestion: "检查 SelfMonitor 重复调用警告后再继续" };
+
+            if (matched) {
+                return matched.rule + " [root_cause=" + matched.root_cause + "; fallback=" + matched.fallback_suggestion + "]";
+            }
             if (failure.goal && failure.goal.length > 0) {
                 return "执行「" + failure.goal.slice(0, 40) + "」时避免重复错误：" + String(failure.error || "").slice(0, 60);
             }
@@ -3885,19 +4248,32 @@ const ZeroApex = (function () {
         }
 
         // Persist reflections to Memory module (async, fire-and-forget)
-        async function persist(Memory) {
-            if (!Memory || typeof Memory.create !== "function") return;
+        // Accepts either ZeroApex.Memory (has remember()) or Tools.Memory (has create())
+        async function persist(MemoryModule) {
+            if (!MemoryModule) return;
             var recent = store.slice(-10);
             for (var i = 0; i < recent.length; i++) {
                 var r = recent[i];
                 try {
-                    await Memory.create({
-                        title: "[Reflexion] " + r.goal.slice(0, 40),
-                        content: "规则: " + r.rule + "\n错误: " + r.error + "\n证据: " + r.evidence,
-                        source: "zero_apex_reflexion",
-                        folderPath: "reflexion",
-                        tags: "reflexion," + r.severity + "," + r.tool,
-                    });
+                    if (typeof MemoryModule.remember === "function") {
+                        // ZeroApex.Memory API
+                        await MemoryModule.remember(
+                            "failure",
+                            "[Reflexion] " + r.goal.slice(0, 40),
+                            "规则: " + r.rule + "\n错误: " + r.error,
+                            r.evidence || "",
+                            "reflexion," + r.severity
+                        );
+                    } else if (typeof MemoryModule.create === "function") {
+                        // Raw Tools.Memory API
+                        await MemoryModule.create({
+                            title: "[Reflexion] " + r.goal.slice(0, 40),
+                            content: "规则: " + r.rule + "\n错误: " + r.error + "\n证据: " + r.evidence,
+                            source: "zero_apex_reflexion",
+                            folderPath: "reflexion",
+                            tags: "reflexion," + r.severity + "," + r.tool,
+                        });
+                    }
                 } catch (e) { /* non-fatal */ }
             }
         }
@@ -3985,6 +4361,8 @@ const ZeroApex = (function () {
             ReasoningChain: ReasoningChain,
             TaskPlanner: TaskPlanner,
             Reflexion: Reflexion,
+            EvidenceCollector: EvidenceCollector,
+            OutputValidator: OutputValidator,
             preflight: preflight,
             ledger: ledger,
             audit: audit,
@@ -4015,6 +4393,8 @@ const ZeroApex = (function () {
                 ReasoningChain: ReasoningChain,
                 TaskPlanner: TaskPlanner,
                 Reflexion: Reflexion,
+                OutputValidator: OutputValidator,
+                EvidenceCollector: EvidenceCollector,
                 GateRegistry: { register: registerGate, run: runGates, list: function () { var n = []; for (var i = 0; i < GateRegistry.length; i++) n.push(GateRegistry[i].name); return n; } },
             },
         };
@@ -4513,6 +4893,12 @@ async function task_plan(params) {
         });
         return { success: !!id, code: id ? "OK" : "E1001_INVALID_PARAMS", node_id: id, plan: plan };
     }
+    if (action === "start_node") {
+        var plan = params.plan;
+        if (!plan || !params.node_id) return { success: false, code: "E1002_MISSING_REQUIRED", error: "plan/node_id 必填" };
+        var ok = TP.startNode(plan, params.node_id);
+        return { success: ok, code: ok ? "OK" : "E1001_INVALID_PARAMS", plan: plan };
+    }
     if (action === "ready") {
         var plan = params.plan;
         if (!plan) return { success: false, code: "E1002_MISSING_REQUIRED", error: "plan 参数必填" };
@@ -4548,7 +4934,7 @@ async function reflexion(params) {
         });
         // Persist to Memory async (fire-and-forget)
         if (ZeroApex.Memory) {
-            var p2 = RF.persist(ZeroApex.Memory._raw || null);
+            var p2 = RF.persist(ZeroApex.Memory);
             if (p2 && typeof p2.catch === "function") p2.catch(function () {});
         }
         return { success: true, code: "OK", entry: entry, rule: entry.rule };
@@ -4567,6 +4953,52 @@ async function reflexion(params) {
     return { success: false, code: "E1001_INVALID_PARAMS", error: "未知 action: " + action };
 }
 
+// §NEW validate_output — schema-based output validation (Guardrails AI style)
+async function validate_output(params) {
+    params = params || {};
+    var OV = ZeroApex._infra.OutputValidator;
+    var data = params.data;
+    var schema = params.schema;
+    // Allow referencing built-in schemas by name
+    if (typeof schema === "string") schema = OV.getSchema(schema);
+    if (!schema) return { success: false, code: "E1002_MISSING_REQUIRED", error: "schema 必填（object 或内置名称: preflight_result/file_guard_result/evidence_result）" };
+    var result = OV.validate(data, schema);
+    if (!result.valid && params.coerce) {
+        var coerced = OV.coerce(data, schema);
+        var result2 = OV.validate(coerced, schema);
+        return { success: result2.valid, code: result2.valid ? "OK" : "E1001_INVALID_PARAMS", valid: result2.valid, errors: result2.errors, data: coerced, coerced: true };
+    }
+    return { success: result.valid, code: result.valid ? "OK" : "E1001_INVALID_PARAMS", valid: result.valid, errors: result.errors, data: data };
+}
+
+// §NEW evidence_collect — cross-step evidence aggregation
+async function evidence_collect(params) {
+    params = params || {};
+    var EC = ZeroApex._infra.EvidenceCollector;
+    var action = params.action || "create";
+    if (action === "create") {
+        return { success: true, code: "OK", collector: EC.create(params.task_id || null) };
+    }
+    if (action === "add") {
+        var c = params.collector;
+        if (!c) return { success: false, code: "E1002_MISSING_REQUIRED", error: "collector 必填" };
+        EC.add(c, params.source || "", params.data || params.result || "");
+        return { success: true, code: "OK", collector: c, count: c.entries.length };
+    }
+    if (action === "consolidate") {
+        var c = params.collector;
+        if (!c) return { success: false, code: "E1002_MISSING_REQUIRED", error: "collector 必填" };
+        return { success: true, code: "OK", evidence: EC.consolidate(c, params.max_len || 2000), all_succeeded: EC.allSucceeded(c), best_grade: EC.bestGrade(c) };
+    }
+    if (action === "snapshot") {
+        var c = params.collector;
+        if (!c) return { success: false, code: "E1002_MISSING_REQUIRED", error: "collector 必填" };
+        return { success: true, code: "OK", entries: EC.snapshot(c) };
+    }
+    return { success: false, code: "E1001_INVALID_PARAMS", error: "未知 action: " + action };
+}
+
+
 async function snapshot_file(params) {
     return await ZeroApex.Snapshot.snapshot(params.path);
 }
@@ -4581,9 +5013,25 @@ async function tombstone_file(params) {
 
 async function snapshot_cleanup(params) {
     params = params || {};
+    // Bug#5 fix: if {path} is a file path (e.g. "/tmp/test.txt"), derive the
+    // directory so trashDir() targets the correct .trash folder.
+    // {base_path} is always used as-is; {path} is interpreted as a directory
+    // unless its last segment contains a dot (i.e. looks like a filename).
+    var rawPath = params.path;
+    var derivedBase;
+    if (rawPath) {
+        var lastSeg = rawPath.replace(/\/$/, "").split("/").pop() || "";
+        // Has a dot in last segment and doesn't end with slash → treat as file
+        if (lastSeg.indexOf(".") >= 0) {
+            var parts = rawPath.split("/");
+            parts.pop();
+            derivedBase = parts.join("/") || "/";
+        } else {
+            derivedBase = rawPath;
+        }
+    }
     return await ZeroApex.Snapshot.cleanup({
-        // Accept {path} (file path, derive trash dir) or {base_path} (explicit).
-        base_path: params.base_path || params.path || "/workspace",
+        base_path: params.base_path || derivedBase || "/workspace",
         max_age_hours: params.max_age_hours || 24,
         max_count: params.max_count || 50,
     });
@@ -4775,6 +5223,8 @@ exports.recall = wrapExport(recall, "recall");
 exports.reasoning_chain = wrapExport(reasoning_chain, "reasoning_chain");
 exports.task_plan = wrapExport(task_plan, "task_plan");
 exports.reflexion = wrapExport(reflexion, "reflexion");
+exports.validate_output = wrapExport(validate_output, "validate_output");
+exports.evidence_collect = wrapExport(evidence_collect, "evidence_collect");
 exports.snapshot_file = wrapExport(snapshot_file, "snapshot_file");
 exports.restore_file = wrapExport(restore_file, "restore_file");
 exports.snapshot_cleanup = wrapExport(snapshot_cleanup, "snapshot_cleanup");

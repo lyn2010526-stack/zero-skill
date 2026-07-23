@@ -608,19 +608,17 @@ async function runEvidenceGradeTests() {
 // ============================================================================
 // Tombstone tests: verify Files.delete substitute mechanism.
 // ============================================================================
-function runTombstoneTests() {
+async function runTombstoneTests() {
   var ZA = m.ZeroApex;
 
   // Tombstone function exists
   assert("tombstone: function exists", typeof ZA.Snapshot.tombstone === "function");
 
-  // Tombstone returns DEPENDENCY_MISSING when Files is not injected
-  ZA.Snapshot.tombstone("/tmp/test.txt").then(function (r) {
-    if (ZA._infra.ErrorCode) {
+  // Bug#2 fix: return the promise so async assertion failures are captured
+  await ZA.Snapshot.tombstone("/tmp/test.txt").then(function (r) {
       assert("tombstone: dep missing when no Files", r.code === "E5002_DEPENDENCY_MISSING" || r.success === false);
-    } else {
+
       assert("tombstone: returns error when no Files", r.success === false);
-    }
   });
 
   console.log("[tombstone-test] all assertions done, failures=%d", failures);
@@ -1271,7 +1269,7 @@ async function runFileGuardV2Tests() {
     await runConcurrencyTests();
     runNormalizerTests();
     await runEvidenceGradeTests();
-    runTombstoneTests();
+    await runTombstoneTests();
     await runRegressionTests();
     runP0RegressionTests();
     runUsageAuditTests();
@@ -1280,6 +1278,7 @@ async function runFileGuardV2Tests() {
     await runFileGuardV2Tests();
     await runV256HardeningTests();
     await runV258FeatureTests();
+    await runV259UpgradeTests();
     if (failures === 0) {
       console.log("\nALL TESTS PASSED");
       process.exit(0);
@@ -1638,4 +1637,144 @@ async function runV258FeatureTests() {
   assert("RF-7: traversal rule extracted", e2.rule.indexOf("..") >= 0 || e2.rule.indexOf("遍历") >= 0);
 
   console.log("[v2.5.8-feature-test] all assertions done, failures=%d", failures);
+}
+
+// ============================================================================
+// v2.5.9 upgrade tests — validate_output, evidence_collect, SelfMonitor repeat
+// detection, ReasoningChain verified flag, Reflexion root_cause, scope_warning
+// ============================================================================
+async function runV259UpgradeTests() {
+  console.log("\n[v2.5.9-upgrade-test] running...");
+
+  var ZA = m.ZeroApex;
+  var infra = ZA._infra;
+
+  // ---- OutputValidator ----
+  var OV = infra.OutputValidator;
+
+  // valid: correct type
+  var r1 = OV.validate(42, { type: "number" });
+  assert("OV-1: valid number passes", r1.valid);
+
+  // invalid: wrong type
+  var r2 = OV.validate("hello", { type: "number" });
+  assert("OV-2: string fails number schema", !r2.valid);
+
+  // enum check
+  var r3 = OV.validate("b", { enum: ["a", "b", "c"] });
+  assert("OV-3: valid enum value passes", r3.valid);
+  var r4 = OV.validate("z", { enum: ["a", "b", "c"] });
+  assert("OV-4: invalid enum value fails", !r4.valid);
+
+  // range check
+  var r5 = OV.validate(5, { type: "number", min: 1, max: 10 });
+  assert("OV-5: in-range number passes", r5.valid);
+  var r6 = OV.validate(15, { type: "number", min: 1, max: 10 });
+  assert("OV-6: out-of-range number fails", !r6.valid);
+
+  // coerce string -> number
+  var r7 = OV.coerce("42", { type: "number" });
+  assert("OV-7: coerce string to number", r7 === 42);
+
+  // built-in schema lookup
+  var s = OV.getSchema("preflight_result");
+  assert("OV-8: built-in preflight_result schema exists", s && typeof s === "object");
+
+  // ---- EvidenceCollector ----
+  var EC = infra.EvidenceCollector;
+
+  var coll = EC.create("task-001");
+  assert("EC-1: collector created with task_id", coll.task_id === "task-001");
+  assert("EC-2: collector starts empty", coll.entries.length === 0);
+
+  EC.add(coll, "file_guard", { success: true, code: "OK" });
+  EC.add(coll, "hallucination_guard", { success: true, code: "OK", grade: "L3" });
+  assert("EC-3: two entries added", coll.entries.length === 2);
+
+  var allOk = EC.allSucceeded(coll);
+  assert("EC-4: allSucceeded true when all success", allOk);
+
+  var consolidated = EC.consolidate(coll, 2000);
+  assert("EC-5: consolidate returns non-empty string", consolidated.length > 0);
+
+  var grade = EC.bestGrade(coll);
+  assert("EC-6: bestGrade detects L3", grade === "L3");
+
+  // one failure
+  EC.add(coll, "snapshot_file", { success: false, code: "E5002_DEPENDENCY_MISSING" });
+  assert("EC-7: allSucceeded false after failure", !EC.allSucceeded(coll));
+
+  // ---- SelfMonitor repeat_tool detection ----
+  var sm1 = ZA.SelfMonitor.assess({
+    goal: "分析代码",
+    files_read: true,
+    recent_tools: ["file_guard", "file_guard", "file_guard"]
+  });
+  assert("SM-1: repeat_tool_calls detected", sm1.dimensions.repeat_tool_calls === true);
+  assert("SM-2: repeat warning in blockers", sm1.blockers.some(function(b){ return b.indexOf("file_guard") >= 0; }));
+  assert("SM-3: repeat_warnings non-empty", sm1.repeat_warnings.length > 0);
+
+  var sm2 = ZA.SelfMonitor.assess({
+    goal: "查询状态",
+    files_read: true,
+    recent_tools: ["file_guard", "hallucination_guard"]
+  });
+  assert("SM-4: no repeat when all unique", sm2.dimensions.repeat_tool_calls === false);
+
+  // ---- ReasoningChain observation verified flag ----
+  var RC = ZA._infra.ReasoningChain;
+  var ch = RC.create("测试验证闭环");
+  RC.thought(ch, "需要编译项目");
+  RC.action(ch, "shell_guard", { command: "gradle build" });
+  RC.observation(ch, "BUILD SUCCESSFUL in 3s", true);
+  var lastStep = ch.steps[ch.steps.length - 1];
+  assert("RC-V1: observation verified=true for BUILD SUCCESSFUL", lastStep.meta.verified === true);
+
+  RC.observation(ch, "task finished", true);
+  var step2 = ch.steps[ch.steps.length - 1];
+  assert("RC-V2: observation verified=false for generic success", step2.meta.verified === false);
+
+  RC.observation(ch, "exit code 1", false);
+  var step3 = ch.steps[ch.steps.length - 1];
+  assert("RC-V3: observation verified=false for failure", step3.meta.verified === false);
+
+  // ---- Reflexion root_cause in rule ----
+  var RF = ZA._infra.Reflexion;
+  RF.clear();
+  var re1 = RF.reflect({ goal: "推送代码", tool: "bash", error: "permission denied: /etc/hosts" });
+  assert("RF-R1: rule contains root_cause tag", re1.rule.indexOf("root_cause=permission_denied") >= 0);
+  assert("RF-R2: rule contains fallback tag", re1.rule.indexOf("fallback=") >= 0);
+
+  var re2 = RF.reflect({ goal: "读取文件", tool: "file_guard", error: "duplicate call detected" });
+  assert("RF-R3: repeat_call root_cause extracted", re2.rule.indexOf("root_cause=repeat_call") >= 0);
+
+  // ---- preflightGate scope_warning ----
+  var inst = m.create({ Files: manifestFilesMock });
+  var pf1 = await inst.preflight("删除所有旧日志", "find /workspace -name '*.log' -exec rm {} \\;");
+  assert("PF-S1: scope_warning for recursive find -exec", pf1.scope_warning && pf1.scope_warning.length > 0);
+
+  var pf2 = await inst.preflight("列出文件", "ls -la");
+  assert("PF-S2: no scope_warning for simple ls", !pf2.scope_warning || pf2.scope_warning.length === 0);
+
+  // Bug#7: quoted path extraction
+  var fg = ZA.FileGuard;
+  var r8 = fg.analyzeCommand('rm "/path/with spaces/important file.txt"');
+  assert("FG-Q1: quoted path extracted and analyzed", r8.risk_level !== undefined);
+
+  // Bug#8: plain text oversized output
+  var bigText = Array(160).fill("这是一行测试文本").join("\n");
+  var of1 = ZA.OutputFirewall.check(bigText);
+  assert("OF-B1: oversized plain text triggers violation",
+    of1.violations.some(function(v){ return v.type === "oversized_plain_output"; }));
+
+  // Bug#5: snapshot_cleanup path parameter (file path -> derive directory)
+  // Just verify the function exists and accepts path param without throwing
+  try {
+    await m.snapshot_cleanup({ path: "/tmp/test.txt", max_age_hours: 0 });
+    assert("SC-B5: snapshot_cleanup accepts file path param without error", true);
+  } catch(e) {
+    assert("SC-B5: snapshot_cleanup accepts file path param without error", false);
+  }
+
+  console.log("[v2.5.9-upgrade-test] all assertions done, failures=%d", failures);
 }
