@@ -77,7 +77,8 @@ async function testDestructiveCommandGate() {
 
   const r3 = fg.analyzeCommand("ls -la /sdcard");
   assert(!r3.is_delete, "ls not flagged as delete");
-  assert(r3.requires_confirmation, "ls /sdcard flagged for risky path");
+  // SE2: sdcard is writeOnly — read commands should not require confirmation
+  assert(!r3.requires_confirmation, "ls /sdcard: no confirmation needed for read-only");
 
   // Redirect to a normal file triggers overwrite soft risk
   const r4 = fg.analyzeCommand("echo x > /tmp/out.txt");

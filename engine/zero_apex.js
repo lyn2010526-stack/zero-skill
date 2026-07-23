@@ -149,20 +149,83 @@ const ZeroApex = (function () {
         GUARD_BLOCK: "E4001_GUARD_BLOCK",
         HALLUCINATION_BLOCK: "E4002_HALLUCINATION_BLOCK",
         EVIDENCE_INSUFFICIENT: "E4003_EVIDENCE_INSUFFICIENT",
+        TOOL_CURTAILED: "E4004_TOOL_CURTAILED",  // tool removed by manifest/env curtailment
         // 5xxx — internal
         INTERNAL_ERROR: "E5001_INTERNAL_ERROR",
         DEPENDENCY_MISSING: "E5002_DEPENDENCY_MISSING",
     });
+
+    // Human-readable Chinese message for each error code.
+    // Used in audit logs and user-facing error messages so users don't
+    // have to memorize E4001 etc.
+    var ErrorCodeMessages = Object.freeze({
+        OK: "成功",
+        E1001_INVALID_ARGUMENT: "参数无效",
+        E1002_MISSING_REQUIRED: "缺少必填参数",
+        E1003_INVALID_PATH: "路径无效",
+        E1004_INVALID_KIND: "类型参数无效",
+        E2001_FILE_NOT_FOUND: "文件不存在",
+        E2002_WRITE_FAILED: "文件写入失败",
+        E2003_READ_FAILED: "文件读取失败",
+        E2004_PATH_TRAVERSAL: "检测到路径穿越攻击",
+        E3001_NETWORK_ERROR: "网络错误",
+        E3002_RATE_LIMITED: "请求频率超限",
+        E3003_PARSE_ERROR: "数据解析失败",
+        E4001_GUARD_BLOCK: "守卫层拒绝执行",
+        E4002_HALLUCINATION_BLOCK: "幻觉检测拦截",
+        E4003_EVIDENCE_INSUFFICIENT: "证据不足以支撑声明",
+        E4004_TOOL_CURTAILED: "工具在当前环境权限下不可用（被 manifest 裁剪）",
+        E5001_INTERNAL_ERROR: "引擎内部错误",
+        E5002_DEPENDENCY_MISSING: "缺少运行依赖（被 manifest 裁剪）",
+    });
+
+    function errorMessage(code, fallbackDetail) {
+        var msg = ErrorCodeMessages[code];
+        if (msg) return fallbackDetail ? (msg + "：" + fallbackDetail) : msg;
+        return fallbackDetail || code || "未知错误";
+    }
+
+    // §0b META_TOOLS — the set of tool names that bypass permission/sandbox
+    // checks. Defined ONCE here so that adding a new meta tool only requires
+    // editing one place, not two parallel lists.
+    // Why these are meta: they evaluate other tools (the authority), not the
+    // subject. If they were subjected to permission/sandbox checks, they
+    // would self-block.
+    var META_TOOLS = Object.freeze({
+        preflight: 1,
+        evaluate_permission: 1,
+        check_sandbox: 1,
+        audit_log: 1,
+        config_get: 1,
+        config_set: 1,
+    });
+    function isMetaTool(name) { return META_TOOLS[name] === 1; }
 
     // ======================================================================
     // §2 ConfigRegistry — centralized config with validation
     // ======================================================================
     var ConfigRegistry = (function () {
         var store = {};
+        var immutableKeys = {};  // keys that cannot be overwritten after lock
+        var locked = false;
+
+        // Security keys that are frozen after bootstrap
+        var SECURITY_KEYS = [
+            "file_guard.dangerous_commands",
+            "file_guard.risky_paths",
+            "file_guard.indirect_patterns",
+            "file_guard.mass_delete_threshold",
+            "output_firewall.tool_leak",
+            "hallucination.fact_claims",
+            "hallucination.overconfident_words",
+        ];
 
         function register(key, value, validator) {
             if (typeof key !== "string" || !key) {
                 throw new Error("ConfigRegistry: key must be non-empty string");
+            }
+            if (immutableKeys[key]) {
+                throw new Error("ConfigRegistry: key '" + key + "' is immutable after lock");
             }
             if (validator) {
                 var v = validator(value);
@@ -183,6 +246,17 @@ const ZeroApex = (function () {
 
         function has(key) { return key in store; }
 
+        // Lock security-critical keys so runtime config_set cannot overwrite them
+        function lock() {
+            if (locked) return;
+            locked = true;
+            for (var i = 0; i < SECURITY_KEYS.length; i++) {
+                immutableKeys[SECURITY_KEYS[i]] = true;
+            }
+        }
+
+        function isLocked() { return locked; }
+
         function snapshot() {
             var out = {};
             for (var k in store) { if (store.hasOwnProperty(k)) out[k] = store[k]; }
@@ -191,7 +265,7 @@ const ZeroApex = (function () {
 
         function exportCfg() { return snapshot(); }
 
-        return { register: register, get: get, has: has, snapshot: snapshot, export: exportCfg };
+        return { register: register, get: get, has: has, snapshot: snapshot, export: exportCfg, lock: lock, isLocked: isLocked };
     })();
 
     // ======================================================================
@@ -530,9 +604,29 @@ const ZeroApex = (function () {
             return null;
         }
 
+        // Valid state transitions. Guards prevent:
+        // - complete() on pending (skipping running)
+        // - complete() on already-completed
+        // - next() running a done task
+        var TRANSITIONS = {
+            pending:   ["running", "cancelled"],
+            running:   ["done", "failed", "cancelled"],
+            done:      [],
+            failed:    [],
+            cancelled: [],
+        };
+
+        function canTransition(from, to) {
+            var allowed = TRANSITIONS[from];
+            if (!allowed) return false;
+            return allowed.indexOf(to) >= 0;
+        }
+
         function complete(id, result) {
             for (var i = 0; i < ledger.length; i++) {
                 if (ledger[i].id === id) {
+                    var cur = ledger[i].status;
+                    if (!canTransition(cur, "done")) return false;
                     ledger[i].status = "done";
                     ledger[i].completed_at = new Date().toISOString();
                     ledger[i].result = result;
@@ -736,9 +830,13 @@ const ZeroApex = (function () {
             var pathRisks = [];
             var pathMatches = text.match(/(\/[^\s"'|&;><]+)/g) || [];
             var rplist = riskyPaths();
+            // Detect write-class commands for writeOnly path entries
+            var isWriteCmd = isDelete || /^\s*(cp|mv|scp|rsync|tee|dd|install|touch|chmod|chown|ln|mkfifo|mknod|truncate|cat\s+>|echo\s+>)/i.test(text);
             for (var mi = 0; mi < pathMatches.length; mi++) {
                 for (var ri = 0; ri < rplist.length; ri++) {
                     if (rplist[ri].re.test(pathMatches[mi])) {
+                        // writeOnly entries only trigger on write/delete commands
+                        if (rplist[ri].writeOnly && !isWriteCmd && !requiresConfirmation) continue;
                         pathRisks.push({ path: pathMatches[mi], why: rplist[ri].why });
                         requiresConfirmation = true;
                     }
@@ -840,8 +938,10 @@ const ZeroApex = (function () {
             return buildRiskResult(isDelete, isDelete, hits, []);
         }
 
-        function pathRisk(path) {
+        function pathRisk(path, operation) {
             var p = safeString(path);
+            // operation: "read" | "write" | "delete" | undefined (unknown)
+            var isWrite = (operation === "write" || operation === "delete");
             if (PathUtils.hasTraversal(p)) {
                 return buildRiskResult(false, true, [], [{
                     path: p,
@@ -853,6 +953,8 @@ const ZeroApex = (function () {
             var rplist = riskyPaths();
             for (var i = 0; i < rplist.length; i++) {
                 if (rplist[i].re.test(p)) {
+                    // writeOnly entries skip read operations
+                    if (rplist[i].writeOnly && !isWrite) continue;
                     pathRisks.push({ path: p, why: rplist[i].why });
                     requiresConfirmation = true;
                 }
@@ -1521,11 +1623,16 @@ const ZeroApex = (function () {
             var causalMarkers = (goal.match(/因为|所以|导致|然后|接着|之后|再|才能/g) || []).length;
             var causalDepth = causalMarkers >= 3 ? "deep" : causalMarkers >= 1 ? "medium" : "shallow";
 
+            // Readiness is a 0-100 score. Each of the 4 dimensions is worth 25
+            // points, evenly weighted. The previous 30/30/30/10 split was
+            // confusing because the "no irreversible risk" dimension was
+            // under-weighted (10%) while being arguably the most safety-
+            // critical signal. Equal weights make the score predictable.
             var readiness = 0;
-            if (goalClear) readiness += 30;
-            if (filesRead) readiness += 30;
-            if (evidenceReady) readiness += 30;
-            if (!irreversibleRisk) readiness += 10;
+            if (goalClear) readiness += 25;
+            if (filesRead) readiness += 25;
+            if (evidenceReady) readiness += 25;
+            if (!irreversibleRisk) readiness += 25;
 
             var needsConfirmation = irreversibleRisk;
             var blockers = [];
@@ -1818,20 +1925,22 @@ const ZeroApex = (function () {
                 "," + project +
                 (techStack ? "," + techStack.split(/[,，]/).join(",") : "");
             try {
-                var id = await Tools.Memory.create({
+                var raw = await Tools.Memory.create({
                     title: title,
                     content: content,
                     source: "zero_apex_engine",
                     folderPath: folder,
                     tags: tags,
                 });
+                // Tools.Memory.create may return a string ID or {id, success}
+                var memId = (typeof raw === "string") ? raw : (raw && raw.id ? raw.id : null);
                 // Invalidate cache on write
                 cache.clear();
                 return {
-                    success: !!id,
-                    code: id ? ErrorCode.OK : ErrorCode.WRITE_FAILED,
+                    success: !!memId,
+                    code: memId ? ErrorCode.OK : ErrorCode.WRITE_FAILED,
                     message: "经验已写入真实记忆库",
-                    memory_id: id,
+                    memory_id: memId,
                     title: title,
                     folder: folder,
                 };
@@ -2129,10 +2238,18 @@ const ZeroApex = (function () {
         }
         GateRegistry.push({ name: name, fn: fn });
     }
-    async function runGates(ctx) {
+    async function runGates(ctx, bypassSet) {
+        // bypassSet is an optional {gateName: 1} map of gates to skip entirely
+        // for this call. When a gate is bypassed, it's reported as such in
+        // the result so callers can see what was disabled.
+        bypassSet = bypassSet || (ctx && ctx.bypass) || {};
         var results = [];
         for (var i = 0; i < GateRegistry.length; i++) {
             var g = GateRegistry[i];
+            if (bypassSet[g.name]) {
+                results.push({ gate: g.name, bypassed: true });
+                continue;
+            }
             try {
                 var r = g.fn(ctx);
                 if (r && typeof r.then === "function") r = await r;
@@ -2222,7 +2339,8 @@ const ZeroApex = (function () {
     // §20 PreflightGate — orchestrator with TaskLedger
     // Uses GateRegistry for extensibility.
     // ======================================================================
-    async function preflightGate(deps, goal, command, evidence, filesRead) {
+    async function preflightGate(deps, goal, command, evidence, filesRead, options) {
+        options = options || {};
         var ledger = deps && deps.ledger ? deps.ledger : new TaskLedger(deps);
         // Use very-high priority so this fresh task is what `next()` returns,
         // not a stale pending task with priority 0.
@@ -2243,6 +2361,20 @@ const ZeroApex = (function () {
             if (!task) task = { id: taskId, goal: goal };
         }
 
+        // Build set of bypassed gate names for this call.
+        // Common use: user is running a sandbox experiment and wants to
+        // skip file_guard to test destructive operations. They opt-in via
+        // preflight({ ..., bypass: ["file_guard"] }).
+        var bypassSet = {};
+        if (Array.isArray(options.bypass)) {
+            for (var bi = 0; bi < options.bypass.length; bi++) {
+                if (typeof options.bypass[bi] === "string") {
+                    bypassSet[options.bypass[bi]] = 1;
+                }
+            }
+        }
+        var bypassLog = Object.keys(bypassSet);
+
         var gates = [];
         var reasons = [];
         var allowed = true;
@@ -2257,9 +2389,10 @@ const ZeroApex = (function () {
             self: null,
             hallu: null,
             of: null,
+            bypass: bypassSet,
         };
 
-        var gateResults = await runGates(ctx);
+        var gateResults = await runGates(ctx, bypassSet);
 
         for (var i = 0; i < gateResults.length; i++) {
             var gr = gateResults[i];
@@ -2395,8 +2528,8 @@ const ZeroApex = (function () {
         ]);
         ConfigRegistry.register("file_guard.risky_paths", [
             { re: /^\/(bin|boot|dev|etc|lib|proc|root|sbin|sys|usr|var)(\/|$)/, why: "系统目录" },
-            { re: /(^|\/)sdcard(\/|$)/, why: "用户存储目录" },
-            { re: /\/storage\/emulated\//, why: "用户存储目录" },
+            { re: /(^|\/)sdcard(\/|$)/, why: "用户存储目录", writeOnly: true },
+            { re: /\/storage\/emulated\//, why: "用户存储目录", writeOnly: true },
             { re: /(^|\/)\.env($|\.)/, why: "环境变量/密钥文件" },
             { re: /(^|\/)(id_rsa|id_ed25519|\.pem|\.key|\.keystore|\.jks)($|\/)/, why: "私钥/签名文件" },
             { re: /(^|\/)credentials?(\.json)?($|\/)/, why: "凭据文件" },
@@ -2441,7 +2574,9 @@ const ZeroApex = (function () {
             "我打算", "让我想想", "在我看来", "我个人觉得", "我的理解是",
         ]);
         ConfigRegistry.register("output_firewall.tool_leak", [
-            /tool_name\s*[:=]/i, /tool_args/i, /api_key/i, /token\s*=/i,
+            /tool_name\s*[:=]/i, /tool_args/i,
+            /api_key\s*[:=]/i,        // key=value context only, not key names like api_key_description
+            /token\s*[:=]\s*['"\w]/i, // token= followed by value
             /secret\s*[:=]/i, /password\s*[:=]/i, /Authorization:\s*Bearer/i,
         ]);
         ConfigRegistry.register("output_firewall.filler", [
@@ -2472,8 +2607,9 @@ const ZeroApex = (function () {
         ConfigRegistry.register("audit.log_path", ".zero_apex/audit_log.jsonl");
     }
 
-    // Bootstrap config at module load
+    // Bootstrap config at module load, then lock security-critical keys
     bootstrapConfig();
+    ConfigRegistry.lock();
 
     // ======================================================================
     // §21b AuditLogger — append-only JSONL audit log
@@ -3441,8 +3577,8 @@ const ZeroApex = (function () {
         // closes the "regex says yes but evidence says no" bypass.
         setEvidenceForHallucination(Evidence);
 
-        async function preflight(goal, command, evidence, filesRead) {
-            var result = await preflightGate({ ledger: ledger, permissions: permissions }, goal, command, evidence, filesRead);
+        async function preflight(goal, command, evidence, filesRead, options) {
+            var result = await preflightGate({ ledger: ledger, permissions: permissions }, goal, command, evidence, filesRead, options);
             // #5: if preflight blocks, register hard block on task_id
             if (!result.allowed && result.task_id) {
                 enforcer.block(result.task_id, result.state + ": " + (result.reasons || []).join("; "));
@@ -3581,20 +3717,19 @@ const ZeroApex = (function () {
             if (toolName && defaultManifest && !defaultManifest.isToolAllowed(toolName, defaultDeps)) {
                 var curtResult = {
                     success: false,
-                    code: "E5002_DEPENDENCY_MISSING",
-                    error: "工具 " + toolName + " 在当前环境权限下不可用（被 manifest 裁剪）",
+                    code: ErrorCode.TOOL_CURTAILED,
+                    error: errorMessage(ErrorCode.TOOL_CURTAILED, toolName),
                 };
-                defaultAudit.append({ tool: toolName, task_id: taskId, trigger: "curtailed", duration_ms: Date.now() - startTs, result_code: "E5002_DEPENDENCY_MISSING", result_summary: "env curtail rejected" });
+                defaultAudit.append({ tool: toolName, task_id: taskId, trigger: "curtailed", duration_ms: Date.now() - startTs, result_code: ErrorCode.TOOL_CURTAILED, result_summary: "env curtail rejected" });
                 defaultAudit.flush();
                 complete(taskId, curtResult);
                 return curtResult;
             }
             if (defaultPermissions) {
                 // Meta-tools (the authority) bypass permission checks
-                // to avoid recursive self-blocking. MUST stay in sync with
-                // the sandbox META_TOOLS list below.
-                var META_TOOLS = { evaluate_permission: 1, check_sandbox: 1, preflight: 1, audit_log: 1, config_get: 1, config_set: 1 };
-                if (!META_TOOLS[toolName]) {
+                // to avoid recursive self-blocking. The set is defined
+                // ONCE in §0b and consumed here via isMetaTool().
+                if (!isMetaTool(toolName)) {
                     var perm = defaultPermissions.evaluate(toolName, p);
                     if (perm.verdict === "DENY") {
                         var permDenyResult = { success: false, code: "E4001_GUARD_BLOCK", error: "Permission 规则拒绝: " + perm.reason, blocked_by: "permission:deny" };
@@ -3617,9 +3752,8 @@ const ZeroApex = (function () {
                 // Meta-tools that evaluate other tools must not be sandboxed
                 // (they are the authority, not the subject). Otherwise asking
                 // "would this command be allowed?" triggers its own denial.
-                // MUST stay in sync with the permission META_TOOLS list above.
-                var META_TOOLS = { evaluate_permission: 1, check_sandbox: 1, preflight: 1, audit_log: 1, config_get: 1, config_set: 1 };
-                if (toolName && !META_TOOLS[toolName]) {
+                // Single source of truth: §0b META_TOOLS / isMetaTool().
+                if (toolName && !isMetaTool(toolName)) {
                     if (p.command) {
                         sandboxParams = { command: p.command };
                     } else if (p.path) {
@@ -3777,9 +3911,10 @@ const ZeroApex = (function () {
     async function preflight(params) {
         params = params || {};
         // Accept multiple input shapes for caller convenience:
-        //   { goal, command, evidence, files_read }   — primary
-        //   { action, command, files }                — backward-compat (action→goal, files→files_read)
-        //   { intent, ... }                           — alternate alias
+        //   { goal, command, evidence, files_read, bypass }   — primary
+        //   { action, command, files }                        — backward-compat (action→goal, files→files_read)
+        //   { intent, ... }                                   — alternate alias
+        //   { goals: [...] }                                  — batch mode (U3)
         var goal = params.goal || params.action || params.intent || null;
         // If a destructive string is in goal, treat it as the command too
         // so file_guard (which needs command) catches it.
@@ -3787,7 +3922,44 @@ const ZeroApex = (function () {
         var evidence = params.evidence || null;
         var filesRead = params.files_read;
         if (filesRead === undefined) filesRead = params.files || [];
-        return await ZeroApex.preflightGate(goal, command, evidence, filesRead);
+        var bypass = Array.isArray(params.bypass) ? params.bypass : [];
+
+        // U3: batch preflight — multiple goals at once, each gets its own
+        // task_id in the ledger. Return aggregate allowed + per-goal detail.
+        if (Array.isArray(params.goals) && params.goals.length > 0) {
+            var items = [];
+            var allAllowed = true;
+            for (var gi = 0; gi < params.goals.length; gi++) {
+                var g = params.goals[gi] || {};
+                var gGoal = g.goal || g.action || g.intent || null;
+                var gCommand = g.command || (typeof gGoal === "string" && /rm\s|chmod|kill|shutdown|reboot|drop|delete/i.test(gGoal) ? gGoal : null);
+                var gEv = g.evidence !== undefined ? g.evidence : evidence;
+                var gFiles = g.files_read !== undefined ? g.files_read : (g.files !== undefined ? g.files : filesRead);
+                var r = await ZeroApex.preflightGate(gGoal, gCommand, gEv, gFiles, { bypass: bypass });
+                if (!r.allowed) allAllowed = false;
+                items.push({
+                    index: gi,
+                    goal: gGoal,
+                    command: gCommand,
+                    task_id: r.task_id,
+                    allowed: r.allowed,
+                    state: r.state,
+                    reasons: r.reasons,
+                    gates: r.gates,
+                });
+            }
+            return {
+                success: true,
+                code: "OK",
+                batch: true,
+                total: items.length,
+                allowed: allAllowed,
+                items: items,
+                bypassed_gates: bypass,
+            };
+        }
+
+        return await ZeroApex.preflightGate(goal, command, evidence, filesRead, { bypass: bypass });
     }
 
 async function file_guard(params) {

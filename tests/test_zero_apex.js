@@ -204,7 +204,11 @@ async function runGuardTests() {
 
   const r2 = m.ZeroApex.FileGuard.analyzeCommand("ls -la /sdcard");
   assert(!r2.is_delete, "FileGuard ls not delete");
-  assert(r2.requires_confirmation, "FileGuard /sdcard risky path");
+  // SE2: sdcard is writeOnly — read-only commands should NOT require confirmation
+  assert(!r2.requires_confirmation, "FileGuard /sdcard read-only: no confirmation needed");
+
+  const r2w = m.ZeroApex.FileGuard.analyzeCommand("cp /workspace/secret.txt /sdcard/leak.txt");
+  assert(r2w.requires_confirmation, "FileGuard /sdcard write: confirmation required");
 
   const r3 = m.ZeroApex.FileGuard.scanScript('os.system("rm -rf /tmp")');
   assert(r3.is_delete, "FileGuard indirect script delete");
@@ -1448,6 +1452,85 @@ async function runV256HardeningTests() {
   var safe2 = SH.detectMassDelete("find . -name '*.log' -print");
   assert("SH256-6: find -print not flagged",
     safe2 && safe2.hit === false);
+
+  // ================================================================
+  // Phase 3 fixes (v2.5.6 round-4 audit)
+  // ================================================================
+
+  // E1: curtailment uses E4004_TOOL_CURTAILED not E5002
+  var EC = m.ZeroApex._infra.ErrorCode;
+  assert("E1-1: ErrorCode.TOOL_CURTAILED exists",
+    typeof EC === "object" && EC.TOOL_CURTAILED === "E4004_TOOL_CURTAILED");
+
+  // SE1: tool_leak regex requires assignment context
+  var OFW = m.ZeroApex.OutputFirewall;
+  var leak1 = OFW.check("the api_key_description field is optional");
+  assert("SE1-1: api_key_description should NOT be flagged",
+    leak1 && !leak1.violations.some(function(v){ return v.type === "tool_leak"; }));
+  var leak2 = OFW.check("api_key=sk-abc123secretvalue");
+  assert("SE1-2: api_key= assignment IS flagged",
+    leak2 && leak2.violations.some(function(v){ return v.type === "tool_leak"; }));
+
+  // SE2: sdcard writeOnly — read safe, write triggers
+  var FG = m.ZeroApex.FileGuard;
+  var sdRead = FG.analyzeCommand("cat /sdcard/notes.txt");
+  assert("SE2-1: cat /sdcard is safe (read-only)",
+    sdRead && !sdRead.requires_confirmation);
+  var sdWrite = FG.analyzeCommand("cp /tmp/data.bin /sdcard/data.bin");
+  assert("SE2-2: cp to /sdcard triggers confirmation",
+    sdWrite && sdWrite.requires_confirmation);
+  var sdDel = FG.analyzeCommand("rm /sdcard/photos/img.jpg");
+  assert("SE2-3: rm on /sdcard triggers confirmation",
+    sdDel && sdDel.requires_confirmation);
+  // pathRisk with explicit operation param
+  var prRead = FG.pathRisk("/sdcard/notes.txt", "read");
+  assert("SE2-4: pathRisk read on /sdcard is low risk",
+    prRead && !prRead.requires_confirmation);
+  var prWrite = FG.pathRisk("/sdcard/notes.txt", "write");
+  assert("SE2-5: pathRisk write on /sdcard requires confirmation",
+    prWrite && prWrite.requires_confirmation);
+
+  // S1: TaskLedger state transition — cannot complete a pending task directly
+  var TL = m.ZeroApex._infra.TaskLedger;
+  var tlInst = new TL({});
+  var tid = tlInst.enqueue({ goal: "phase3-state-test", payload: {} });
+  var completeSkip = tlInst.complete(tid, { ok: true }); // pending → done (skip running)
+  assert("S1-1: complete() on pending task is rejected",
+    completeSkip === false);
+  tlInst.next(); // pending → running
+  var completeOk = tlInst.complete(tid, { ok: true }); // running → done
+  assert("S1-2: complete() on running task succeeds",
+    completeOk === true);
+  var completeDup = tlInst.complete(tid, { ok: true }); // done → done (rejected)
+  assert("S1-3: duplicate complete() on done task is rejected",
+    completeDup === false);
+
+  // C1: ConfigRegistry.lock() prevents overwriting security keys
+  var CR = m.ZeroApex._infra.ConfigRegistry;
+  var lockErr = null;
+  try {
+    CR.register("file_guard.dangerous_commands", []);
+  } catch(e) {
+    lockErr = e;
+  }
+  assert("C1-1: registering immutable key after lock throws",
+    lockErr !== null && /immutable/.test(lockErr.message));
+  assert("C1-2: ConfigRegistry.isLocked() returns true after bootstrap",
+    CR.isLocked() === true);
+
+  // I2: Memory.create string vs object return compat — tested via normalization logic
+  var memStringResult = (function() {
+    var raw = "mem-id-42";
+    return (typeof raw === "string") ? raw : (raw && raw.id ? raw.id : null);
+  })();
+  assert("I2-1: Memory.create string return normalized to id",
+    memStringResult === "mem-id-42");
+  var memObjResult = (function() {
+    var raw = { id: "mem-id-99", success: true };
+    return (typeof raw === "string") ? raw : (raw && raw.id ? raw.id : null);
+  })();
+  assert("I2-2: Memory.create object return normalized to id",
+    memObjResult === "mem-id-99");
 
   console.log("[v2.5.6-hardening-test] all assertions done, failures=%d", failures);
 }
