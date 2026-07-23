@@ -123,21 +123,21 @@ async function testHallucinationGate() {
   console.log("[scenario 4] fact claim without evidence blocked");
   const h = m.ZeroApex.Hallucination;
 
-  const r1 = h.check("编译通过了", null);
+  const r1 = await h.check("编译通过了", null);
   assert(!r1.allowed, "fact claim without evidence blocked");
   assert(r1.suggested_label === "GUESSED", "suggested label GUESSED");
 
-  const r2 = h.check("编译通过了", "BUILD SUCCESSFUL");
+  const r2 = await h.check("编译通过了", "BUILD SUCCESSFUL");
   assert(r2.allowed, "fact claim with evidence allowed");
 
-  const r3 = h.check("显然这个能行", null);
+  const r3 = await h.check("显然这个能行", null);
   assert(!r3.allowed, "overconfident blocked");
   assert(r3.suggested_label === "INFERRED", "overconfident -> INFERRED");
 
-  const r4 = h.check("这个 API 已经废弃了", null);
+  const r4 = await h.check("这个 API 已经废弃了", null);
   assert(!r4.allowed, "unsourced tech assertion blocked");
 
-  const r5 = h.check("正在编译中", null);
+  const r5 = await h.check("正在编译中", null);
   assert(r5.allowed, "process description allowed without evidence");
 }
 
@@ -213,7 +213,7 @@ async function testPreflightIntegration() {
   const inst = m.create({});
 
   // Destructive command + fact claim without evidence + no file read
-  const r1 = inst.preflight(
+  const r1 = await inst.preflight(
     "修复 bug 并编译通过",
     "rm -rf build/",
     null,
@@ -224,7 +224,7 @@ async function testPreflightIntegration() {
   assert(r1.task_id, "preflight assigns task_id");
 
   // Clean task: read files, no destructive command, process description
-  const r2 = inst.preflight(
+  const r2 = await inst.preflight(
     "正在查询 API 用法",
     null,
     null,
@@ -367,7 +367,7 @@ async function testBlockEnforcer() {
   const inst = m.create({});
 
   // Trigger a BLOCK via preflight
-  const r1 = inst.preflight("修复 bug 并编译通过", "rm -rf build/", null, false);
+  const r1 = await inst.preflight("修复 bug 并编译通过", "rm -rf build/", null, false);
   assert(!r1.allowed, "preflight blocks destructive + no evidence");
   assert(r1.task_id, "preflight assigns task_id");
 
@@ -381,7 +381,7 @@ async function testBlockEnforcer() {
   assert(block.code === "E4001_GUARD_BLOCK", "checkBlock returns GUARD_BLOCK");
 
   // A clean task should not be blocked
-  const r2 = inst.preflight("正在查询 API 用法", null, null, true);
+  const r2 = await inst.preflight("正在查询 API 用法", null, null, true);
   assert(r2.allowed, "clean task allowed");
   assert(!inst.enforcer.isBlocked(r2.task_id), "clean task not blocked");
 

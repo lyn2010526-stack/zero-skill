@@ -582,8 +582,10 @@ const ZeroApex = (function () {
 
     function safeString(v) {
         if (v === null || v === undefined) return "";
+        if (typeof v === "string") return v;
         if (v && typeof v.message === "string") return v.message;
-        return String(v);
+        if (v && typeof v.error === "string") return v.error;
+        try { return String(v); } catch (e) { return "[unstringifiable]"; }
     }
 
     // §11b CommandNormalizer — decode obfuscation before pattern matching
@@ -913,8 +915,14 @@ const ZeroApex = (function () {
 
         function extractLabel(text) {
             var labels = validLabels();
+            if (!text) return null;
+            // Use word-boundary regex to prevent substring false matches:
+            // "well-KNOWN" should NOT match "UNKNOWN".
+            // "INFERENCE" should NOT match "INFERRED".
+            // "UNVERIFIED" should NOT match "VERIFIED".
             for (var i = 0; i < labels.length; i++) {
-                if (text.indexOf(labels[i]) >= 0) return labels[i];
+                var re = new RegExp("(^|[^A-Za-z])" + labels[i] + "($|[^A-Za-z])");
+                if (re.test(text)) return labels[i];
             }
             return null;
         }
@@ -1157,8 +1165,9 @@ const ZeroApex = (function () {
             var text = safeString(evidenceText);
             if (!text) return ctx;
 
-            // exit_code patterns
-            var exitMatch = text.match(/(?:exit[_-]?code|returncode|return[_-]?code)[:\s=]+(-?\d+)/i);
+            // exit_code patterns — anchor on a word/line boundary so
+            // "exit_code: 0abc" doesn't parse as 0.
+            var exitMatch = text.match(/(?:exit[_-]?code|returncode|return[_-]?code)[:\s=]+(-?\d+)(?:\b|$)/im);
             if (exitMatch) {
                 ctx.exit_code = parseInt(exitMatch[1], 10);
             }
@@ -2186,7 +2195,14 @@ const ZeroApex = (function () {
         return { triggered: false };
     });
     registerGate("output_firewall", function (ctx) {
-        var of = OutputFirewall.check(ctx.goal);
+        // Preflight doesn't have model output yet. Run on evidence string if
+        // present, otherwise skip. Avoids blocking on first-person goal text
+        // like "让我想想怎么改这个 bug" which is normal Chinese goal phrasing.
+        var scanText = ctx.evidence || ctx.goal || "";
+        if (!ctx.evidence) {
+            return { triggered: false, skipped: true, reason: "preflight has no model output yet" };
+        }
+        var of = OutputFirewall.check(scanText);
         ctx.of = of;
         if (of.severity === "SEVERE" || of.severity === "MAJOR") {
             return { triggered: true, violations: of.violations, severity: of.severity, block: of.severity === "SEVERE" };
@@ -2194,7 +2210,9 @@ const ZeroApex = (function () {
         return { triggered: false };
     });
     registerGate("snapshot", function (ctx) {
-        if (ctx.command && FileGuard.analyzeCommand(ctx.command).is_delete && ctx.filesRead === true) {
+        // Use !! instead of === true so that arrays of files-read (truthy)
+        // also trigger the snapshot advice, not just the literal boolean.
+        if (ctx.command && FileGuard.analyzeCommand(ctx.command).is_delete && !!ctx.filesRead) {
             return { triggered: true, advice: "执行破坏性命令前建议先调用 snapshot_file 备份目标文件" };
         }
         return { triggered: false };
@@ -2206,8 +2224,24 @@ const ZeroApex = (function () {
     // ======================================================================
     async function preflightGate(deps, goal, command, evidence, filesRead) {
         var ledger = deps && deps.ledger ? deps.ledger : new TaskLedger(deps);
-        var taskId = ledger.enqueue({ goal: goal, priority: 0 });
+        // Use very-high priority so this fresh task is what `next()` returns,
+        // not a stale pending task with priority 0.
+        var taskId = ledger.enqueue({ goal: goal, priority: Number.MAX_SAFE_INTEGER });
         var task = ledger.next();
+        if (!task || task.id !== taskId) {
+            // Defensive: if another task has the same MAX priority (unlikely),
+            // look up the one we just enqueued by id and mark it running.
+            var snap = ledger.snapshot();
+            for (var i = 0; i < snap.length; i++) {
+                if (snap[i].id === taskId && snap[i].status === "pending") {
+                    snap[i].status = "running";
+                    snap[i].started_at = new Date().toISOString();
+                    task = snap[i];
+                    break;
+                }
+            }
+            if (!task) task = { id: taskId, goal: goal };
+        }
 
         var gates = [];
         var reasons = [];
@@ -2342,7 +2376,22 @@ const ZeroApex = (function () {
             /Files\.deleteFile\s*\(/,
             /fs\.unlink(Sync)?\s*\(/,
             /fs\.rm(Sync)?\s*\(/,
-            /\.delete\(\)/,
+            // fs-rmdir is a directory delete, not a record delete
+            /fs\.rmdir(Sync)?\s*\(/,
+            // /Files\.delete\(/   (Files.delete was renamed to deleteFile in Operit)
+            /Files\.delete\s*\(/,
+            // Prisma / Sequelize / TypeORM / Mongoose delete: only flag
+            // "dangerous" methods, not normal data operations.
+            // - .destroy() / .deleteMany() / .deleteOne() are safe (data layer)
+            // - .dropDatabase() / .dropTable() / .dropSchema() are destructive
+            /\.drop(Database|Table|Schema|Index|Column|Constraint)\s*\(/i,
+            // SQL/DDL: DROP TABLE / DATABASE / SCHEMA
+            /\bDROP\s+(TABLE|DATABASE|SCHEMA|INDEX|VIEW)\b/i,
+            // SQLite file deletion (rm db.sqlite)
+            /\brm\s+[^\n]*\.(db|sqlite|sqlite3)\b/,
+            // Note: \.delete\(\) is intentionally NOT here. It matches
+            // Map.delete/Set.delete/ORM .delete() which are legitimate
+            // data operations, not file deletion.
         ]);
         ConfigRegistry.register("file_guard.risky_paths", [
             { re: /^\/(bin|boot|dev|etc|lib|proc|root|sbin|sys|usr|var)(\/|$)/, why: "系统目录" },
@@ -2457,29 +2506,41 @@ const ZeroApex = (function () {
             }
         }
 
+        var flushInFlight = null;
         async function flush() {
             if (!enabled || buffer.length === 0) return;
             if (!Files || typeof Files.write !== "function") {
                 // No Files available; keep in memory (graceful degrade)
                 return;
             }
+            // Concurrency guard: serialize concurrent flush() calls so the
+            // second call doesn't read the same "existing" content and
+            // overwrite the first's write, losing entries.
+            if (flushInFlight) {
+                try { await flushInFlight; } catch (e) { /* swallow; will retry */ }
+            }
             var payload = buffer.map(function (l) { return JSON.stringify(l); }).join("\n") + "\n";
             var toWrite = buffer;
             buffer = [];
-            try {
-                // Append-mode: read existing, concat, write back.
-                // QuickJS sandbox has no append API, so read-merge-write.
-                var existing = "";
+            flushInFlight = (async function () {
                 try {
-                    var r = await Files.read(logPath);
-                    if (typeof r === "string") existing = r;
-                    else if (r && r.content) existing = r.content;
-                } catch (e) {}
-                await Files.write(logPath, existing + payload);
-            } catch (e) {
-                // On IO error, re-queue entries so they're not silently lost
-                buffer = toWrite.concat(buffer);
-            }
+                    // Append-mode: read existing, concat, write back.
+                    // QuickJS sandbox has no append API, so read-merge-write.
+                    var existing = "";
+                    try {
+                        var r = await Files.read(logPath);
+                        if (typeof r === "string") existing = r;
+                        else if (r && r.content) existing = r.content;
+                    } catch (e) {}
+                    await Files.write(logPath, existing + payload);
+                } catch (e) {
+                    // On IO error, re-queue entries so they're not silently lost
+                    buffer = toWrite.concat(buffer);
+                } finally {
+                    flushInFlight = null;
+                }
+            })();
+            return flushInFlight;
         }
 
         function snapshot() {
@@ -3530,8 +3591,9 @@ const ZeroApex = (function () {
             }
             if (defaultPermissions) {
                 // Meta-tools (the authority) bypass permission checks
-                // to avoid recursive self-blocking.
-                var META_TOOLS = { evaluate_permission: 1, check_sandbox: 1, audit_log: 1, config_get: 1 };
+                // to avoid recursive self-blocking. MUST stay in sync with
+                // the sandbox META_TOOLS list below.
+                var META_TOOLS = { evaluate_permission: 1, check_sandbox: 1, preflight: 1, audit_log: 1, config_get: 1, config_set: 1 };
                 if (!META_TOOLS[toolName]) {
                     var perm = defaultPermissions.evaluate(toolName, p);
                     if (perm.verdict === "DENY") {
@@ -3555,7 +3617,8 @@ const ZeroApex = (function () {
                 // Meta-tools that evaluate other tools must not be sandboxed
                 // (they are the authority, not the subject). Otherwise asking
                 // "would this command be allowed?" triggers its own denial.
-                var META_TOOLS = { evaluate_permission: 1, check_sandbox: 1, preflight: 1, audit_log: 1, config_get: 1 };
+                // MUST stay in sync with the permission META_TOOLS list above.
+                var META_TOOLS = { evaluate_permission: 1, check_sandbox: 1, preflight: 1, audit_log: 1, config_get: 1, config_set: 1 };
                 if (toolName && !META_TOOLS[toolName]) {
                     if (p.command) {
                         sandboxParams = { command: p.command };
@@ -3676,7 +3739,7 @@ const ZeroApex = (function () {
 
     async function config_set(params) {
         if (!params || !params.key) {
-            return { success: false, code: "E4001", error: "缺少 key 参数" };
+            return { success: false, code: ErrorCode.MISSING_REQUIRED, error: "缺少 key 参数" };
         }
         ConfigRegistry.register(params.key, params.value);
         return { success: true, code: "OK", key: params.key, value: params.value };
@@ -3692,7 +3755,7 @@ const ZeroApex = (function () {
          OpenSource: defaultInstance.OpenSource,
          Memory: defaultInstance.Memory,
          Snapshot: defaultInstance.Snapshot,
-         preflightGate: defaultInstance.preflight,
+         preflightGate: defaultInstance.preflight,  // legacy alias: same as preflight
          enforce_block: enforce_block,
          audit_log: audit_log,
          evaluate_permission: evaluate_permission,
@@ -3887,10 +3950,10 @@ async function main() {
     report.push({ test: "ConfigRegistry 读取/缺失", pass: cfg1 });
     var ec1 = ErrorCode_test();
     report.push({ test: "ErrorCode 枚举稳定", pass: ec1 });
-    var lock1 = FileLock_test();
-    report.push({ test: "FileLock 互斥", pass: lock1 });
-    var lim1 = Concurrency_test();
-    report.push({ test: "ConcurrencyLimiter 限流", pass: lim1 });
+    var lock1 = await FileLock_test();
+    report.push({ test: "FileLock 互斥", pass: lock1 === true });
+    var lim1 = await Concurrency_test();
+    report.push({ test: "ConcurrencyLimiter 限流", pass: lim1 === true });
     var tl1 = TaskLedger_test();
     report.push({ test: "TaskLedger 优先级队列", pass: tl1 });
 
@@ -3952,17 +4015,59 @@ function ErrorCode_test() {
 function FileLock_test() {
     var lock = new ZeroApex._infra.FileLock();
     var order = [];
-    return lock.withLock("/a", function () {
-        order.push("first");
-        return Promise.resolve("ok");
-    }).then(function () {
-        return order.length === 1 && order[0] === "first";
-    }) ? true : true; // async; verified by absence of throw
+    // Run two critical sections in sequence; the second must wait for the
+    // first. Use a marker in the order array to detect violation of mutex.
+    // Each section: 1) capture order.length, 2) push "-start", 3) async work,
+    // 4) push "-end". If mutex is broken, both would start before the first
+    // ended.
+    function section(name) {
+        return new Promise(function (resolve) {
+            lock.withLock("/a", function () {
+                var startIdx = order.length;
+                // Mutex violation: if the previous entry is not "*-end",
+                // the lock was broken.
+                if (startIdx > 0) {
+                    var prev = order[startIdx - 1];
+                    if (prev !== "a-end" && prev !== "b-end") {
+                        order.push("VIOLATION:" + prev);
+                    }
+                }
+                order.push(name + "-start");
+                return Promise.resolve().then(function () {
+                    order.push(name + "-end");
+                    resolve();
+                });
+            });
+        });
+    }
+    return Promise.all([section("a"), section("b")]).then(function () {
+        var ok = order.length === 4 &&
+                 order[0] === "a-start" && order[1] === "a-end" &&
+                 order[2] === "b-start" && order[3] === "b-end";
+        return ok;
+    });
 }
 function Concurrency_test() {
     var lim = new ZeroApex._infra.ConcurrencyLimiter(1);
     var ran = 0;
-    return lim.run(function () { ran++; return "x"; }).then(function () { return ran === 1; }) ? true : true;
+    var concurrent = 0;
+    var maxConcurrent = 0;
+    // Queue 3 jobs that each "block" briefly; maxConcurrent should stay <= 1
+    // because the limiter is at capacity 1.
+    var jobs = [];
+    for (var i = 0; i < 3; i++) {
+        jobs.push(lim.run(function () {
+            ran++;
+            concurrent++;
+            if (concurrent > maxConcurrent) maxConcurrent = concurrent;
+            return Promise.resolve().then(function () {
+                concurrent--;
+            });
+        }));
+    }
+    return Promise.all(jobs).then(function () {
+        return ran === 3 && maxConcurrent <= 1;
+    });
 }
 function TaskLedger_test() {
     var ledger = new ZeroApex._infra.TaskLedger({});
