@@ -3873,6 +3873,397 @@ const ZeroApex = (function () {
         return { create: create, add: add, consolidate: consolidate, allSucceeded: allSucceeded, bestGrade: bestGrade, snapshot: snapshot, clear: clear };
     })();
 
+    // ======================================================================
+    // §22 ExecutionSafetyNet — auto snapshot + execute + validate + rollback
+    // Philosophy: be a safety net, not a prison.
+    // ======================================================================
+    var ExecutionSafetyNet = (function () {
+        var BUILTIN_VALIDATORS = {
+            exit_code: function (result) {
+                if (!result) return { pass: false, reason: "空结果", suggestion: "检查命令是否正确执行" };
+                var s = JSON.stringify(result).toLowerCase();
+                if (/exit.*code.*[1-9]|exited with [1-9]|status [1-9]/.test(s))
+                    return { pass: false, reason: "非零退出码", suggestion: "检查命令参数或权限" };
+                return { pass: true };
+            },
+            build_success: function (result) {
+                var s = typeof result === "string" ? result : JSON.stringify(result || "");
+                var lower = s.toLowerCase();
+                if (/build failed|compilation error|syntaxerror/.test(lower))
+                    return { pass: false, reason: "编译失败", suggestion: "检查语法错误后重试" };
+                return { pass: true };
+            },
+            test_pass: function (result) {
+                var s = typeof result === "string" ? result : JSON.stringify(result || "");
+                var lower = s.toLowerCase();
+                if (/\d+ failed|\d+ error|assertion.*failed|tests? failed/.test(lower))
+                    return { pass: false, reason: "测试失败", suggestion: "修复失败的测试用例后重试" };
+                return { pass: true };
+            },
+            files_intact: function (result, meta) {
+                if (!meta || !meta.affected_files) return { pass: true };
+                var r = result || {};
+                if (r.missing && r.missing.length > 0)
+                    return { pass: false, reason: "关键文件丢失: " + r.missing.join(", "), suggestion: "操作意外删除了文件，已自动回滚" };
+                return { pass: true };
+            },
+        };
+
+        function getValidator(name) { return BUILTIN_VALIDATORS[name] || null; }
+
+        async function run(fn, options) {
+            options = options || {};
+            var snapPaths = Array.isArray(options.snapshot_paths) ? options.snapshot_paths : [];
+            var validatorNames = Array.isArray(options.validators) ? options.validators : ["exit_code"];
+            var meta = options.meta || {};
+            var label = options.label || "operation";
+            var startTs = Date.now();
+
+            // Phase 1: snapshot
+            var snapshots = [];
+            for (var si = 0; si < snapPaths.length; si++) {
+                var sp = snapPaths[si];
+                try {
+                    var snapResult = await ZeroApex.Snapshot.snapshot(sp);
+                    if (snapResult && snapResult.success)
+                        snapshots.push({ path: sp, snapshot_name: snapResult.snapshot_name });
+                    else
+                        snapshots.push({ path: sp, snapshot_name: null, snap_error: "snapshot failed" });
+                } catch (e) {
+                    snapshots.push({ path: sp, snapshot_name: null, snap_error: e.message });
+                }
+            }
+
+            // Phase 2: execute
+            var execResult, execError = null;
+            try { execResult = await fn(); }
+            catch (e) { execError = e.message || String(e); execResult = { success: false, error: execError }; }
+
+            var duration_ms = Date.now() - startTs;
+
+            // Phase 3: validate
+            var validationErrors = [];
+            for (var vi = 0; vi < validatorNames.length; vi++) {
+                var validator = getValidator(validatorNames[vi]);
+                if (!validator) continue;
+                var vr = validator(execResult, meta);
+                if (!vr.pass) validationErrors.push({ validator: validatorNames[vi], reason: vr.reason, suggestion: vr.suggestion || "" });
+            }
+
+            var passed = validationErrors.length === 0 && !execError;
+
+            // Phase 4: rollback if failed
+            var rolledBack = [], rollbackErrors = [];
+            if (!passed) {
+                for (var ri = 0; ri < snapshots.length; ri++) {
+                    var snap = snapshots[ri];
+                    if (!snap.snapshot_name) continue;
+                    try {
+                        var restoreResult = await ZeroApex.Snapshot.restore(snap.path, snap.snapshot_name);
+                        if (restoreResult && restoreResult.success) rolledBack.push(snap.path);
+                        else rollbackErrors.push(snap.path + ": " + (restoreResult ? restoreResult.error : "unknown"));
+                    } catch (e) { rollbackErrors.push(snap.path + ": " + e.message); }
+                }
+            }
+
+            // Phase 5: build AI feedback
+            var suggestions = validationErrors.map(function(ve){ return ve.suggestion; });
+            if (execError) suggestions.push("执行异常: " + execError);
+            if (rolledBack.length > 0) suggestions.push("已自动回滚: " + rolledBack.join(", ") + "。修复后可重新执行。");
+
+            return {
+                success: passed,
+                auto_rolled_back: rolledBack.length > 0,
+                rolled_back_files: rolledBack,
+                rollback_errors: rollbackErrors,
+                validation_errors: validationErrors,
+                exec_result: execResult,
+                exec_error: execError,
+                duration_ms: duration_ms,
+                label: label,
+                suggestions: suggestions,
+                ai_feedback: passed ? "执行成功，验证通过。" : "执行失败" + (rolledBack.length > 0 ? "，已自动回滚" : "") + "。\n" + suggestions.join("\n"),
+            };
+        }
+
+        function withBuildCheck(fn, snapPaths, label) {
+            return run(fn, { snapshot_paths: snapPaths || [], validators: ["build_success", "exit_code"], label: label || "build" });
+        }
+        function withTestCheck(fn, snapPaths, label) {
+            return run(fn, { snapshot_paths: snapPaths || [], validators: ["test_pass", "exit_code"], label: label || "test" });
+        }
+
+        return { run: run, withBuildCheck: withBuildCheck, withTestCheck: withTestCheck, getValidator: getValidator, BUILTIN_VALIDATORS: BUILTIN_VALIDATORS };
+    })();
+
+    // ======================================================================
+    // §23 ProjectMemory — structured persistent memory (3 categories)
+    // architecture_decision / gotcha / team_convention
+    // ======================================================================
+    var ProjectMemory = (function () {
+        var CATEGORIES = Object.freeze({
+            ARCHITECTURE: "architecture_decision",
+            GOTCHA:       "gotcha",
+            CONVENTION:   "team_convention",
+        });
+        var _store = [], _seq = 0;
+        function _now() { return new Date().toISOString(); }
+
+        function add(category, content, meta) {
+            var validCats = Object.keys(CATEGORIES).map(function(k){ return CATEGORIES[k]; });
+            if (validCats.indexOf(category) < 0) category = CATEGORIES.GOTCHA;
+            var entry = { id: "pm_" + (++_seq), category: category, content: String(content || ""), meta: meta || {}, created_at: _now(), access_count: 0 };
+            _store.push(entry);
+            return entry;
+        }
+
+        function recall(query, category, limit) {
+            limit = limit || 8;
+            query = String(query || "").toLowerCase();
+            var words = query.split(/\s+/).filter(function(w){ return w.length >= 2; });
+            var scored = [];
+            for (var i = 0; i < _store.length; i++) {
+                var e = _store[i];
+                var score = 1;
+                if (category && e.category === category) score += 10;
+                var text = (e.content + " " + JSON.stringify(e.meta)).toLowerCase();
+                for (var w = 0; w < words.length; w++) { if (text.indexOf(words[w]) >= 0) score += 2; }
+                scored.push({ entry: e, score: score });
+            }
+            scored.sort(function(a, b){ return b.score - a.score; });
+            var results = scored.slice(0, limit).map(function(s){ return s.entry; });
+            for (var r = 0; r < results.length; r++) results[r].access_count++;
+            return results;
+        }
+
+        function contextHint(query, maxEntries) {
+            var entries = recall(query, null, maxEntries || 5);
+            if (entries.length === 0) return "";
+            var lines = ["[ProjectMemory]"];
+            for (var i = 0; i < entries.length; i++) {
+                lines.push("  [" + entries[i].category + "] " + entries[i].content.slice(0, 120));
+            }
+            return lines.join("\n");
+        }
+
+        function snapshot() { return _store.slice(); }
+        function size() { return _store.length; }
+        function clear() { _store = []; _seq = 0; }
+
+        async function persist() {
+            var M = ZeroApex.Memory;
+            if (!M || typeof M.remember !== "function") return { success: false, reason: "Memory adapter unavailable" };
+            var ok = 0;
+            for (var i = 0; i < _store.length; i++) {
+                try { await M.remember("project_memory:" + _store[i].id, JSON.stringify(_store[i])); ok++; }
+                catch (e) { /* non-fatal */ }
+            }
+            return { success: true, persisted: ok };
+        }
+
+        return { add: add, recall: recall, contextHint: contextHint, snapshot: snapshot, size: size, clear: clear, persist: persist, CATEGORIES: CATEGORIES };
+    })();
+
+    // ======================================================================
+    // §24 CodeQualityAnalyzer — cyclomatic complexity + duplication + naming
+    // Pure static analysis, no external tools required.
+    // ======================================================================
+    var CodeQualityAnalyzer = (function () {
+        function cyclomaticComplexity(source) {
+            if (!source) return 1;
+            var branching = (source.match(/\b(if|else\s+if|for|while|case|catch)\b|\?\s*[^:]/g) || []).length;
+            var logical   = (source.match(/&&|\|\|/g) || []).length;
+            return 1 + branching + logical;
+        }
+
+        function duplicationScore(source, minLines) {
+            minLines = minLines || 4;
+            if (!source) return 0;
+            var lines = source.split("\n").map(function(l){ return l.trim(); }).filter(function(l){ return l.length > 0; });
+            var seen = {}, dupCount = 0;
+            for (var i = 0; i < lines.length; i++) {
+                var key = lines.slice(i, i + minLines).join("|");
+                if (seen[key]) dupCount += minLines;
+                else seen[key] = true;
+            }
+            return Math.round((dupCount / Math.max(lines.length, 1)) * 100);
+        }
+
+        function namingIssues(source) {
+            if (!source) return [];
+            var issues = [];
+            var singleLetter = (source.match(/\bvar\s+([a-z])\b/g) || []).length;
+            if (singleLetter > 3) issues.push({ type: "single_letter_vars", count: singleLetter, severity: "minor", suggestion: "使用有描述性的变量名替代单字母变量" });
+            var magicNums = (source.match(/[^a-zA-Z_'"]((?!0|1|2|-1|100)\d{2,})[^a-zA-Z_'"]/g) || []).length;
+            if (magicNums > 5) issues.push({ type: "magic_numbers", count: magicNums, severity: "minor", suggestion: "将魔法数字提取为命名常量" });
+            var longFuncs = (source.match(/function\s+\w+[^{]*\{[\s\S]{2000,}?\}/g) || []).length;
+            if (longFuncs > 0) issues.push({ type: "long_functions", count: longFuncs, severity: "moderate", suggestion: "函数过长（>60行），建议拆分" });
+            return issues;
+        }
+
+        function score(source, options) {
+            options = options || {};
+            var cc  = cyclomaticComplexity(source);
+            var dup = duplicationScore(source);
+            var ni  = namingIssues(source);
+            var ccPenalty   = Math.max(0, (cc - 10) * 2);
+            var dupPenalty  = dup * 0.5;
+            var namePenalty = ni.filter(function(i){ return i.severity === "moderate"; }).length * 5
+                            + ni.filter(function(i){ return i.severity === "minor"; }).length * 2;
+            var finalScore = Math.max(0, Math.min(100, Math.round(100 - ccPenalty - dupPenalty - namePenalty)));
+            var grade = finalScore >= 85 ? "A" : finalScore >= 70 ? "B" : finalScore >= 55 ? "C" : finalScore >= 40 ? "D" : "F";
+            var threshold = options.threshold || 55;
+            return {
+                score: finalScore, grade: grade, passed: finalScore >= threshold,
+                cyclomatic_complexity: cc, duplication_pct: dup, naming_issues: ni, threshold: threshold,
+                summary: "质量评分 " + finalScore + "/100 (" + grade + ")" + (finalScore < threshold ? "，低于阈值 " + threshold + "，建议重写" : "，通过"),
+            };
+        }
+
+        return { score: score, cyclomaticComplexity: cyclomaticComplexity, duplicationScore: duplicationScore, namingIssues: namingIssues };
+    })();
+
+    // ======================================================================
+    // §25 DependencyAdvisor — supply chain / CVE / freshness advisor
+    // Core logic is local; no external network required.
+    // ======================================================================
+    var DependencyAdvisor = (function () {
+        function riskyPatterns() {
+            return ConfigRegistry.get("dep_advisor.risky_patterns", [
+                { re: /^event-stream$/, risk: "HIGH", reason: "已知供应链攻击案例（2018）", suggestion: "使用 through2 替代" },
+                { re: /^colors@1\.4\./, risk: "MEDIUM", reason: "作者蓄意投毒版本", suggestion: "固定到 colors@1.4.0" },
+                { re: /^lodash@[1-3]\./, risk: "MEDIUM", reason: "原型链污染漏洞", suggestion: "升级到 4.x" },
+                { re: /^minimist@0\./, risk: "MEDIUM", reason: "原型链污染 CVE-2020-7598", suggestion: "升级到 1.2.6+" },
+                { re: /^xmldom@0\.[01]\./, risk: "HIGH", reason: "多个 XSS CVE", suggestion: "升级到 0.8+" },
+                { re: /^serialize-javascript@[12]\./, risk: "HIGH", reason: "CVE-2019-16769 任意代码执行", suggestion: "升级到 3.1.0+" },
+            ]);
+        }
+
+        function extractDeps(source, ecosystem) {
+            ecosystem = ecosystem || "node";
+            var deps = [], seen = {};
+            if (ecosystem === "node") {
+                var lines = source.match(/(?:require|from)\s*\(?['"]([^'"]+)['"]\)?/g) || [];
+                for (var i = 0; i < lines.length; i++) {
+                    var m = lines[i].match(/['"]([^'"]+)['"]/);
+                    if (m && !m[1].startsWith(".")) { var d = m[1]; if (!seen[d]) { seen[d] = true; deps.push(d); } }
+                }
+            } else if (ecosystem === "python") {
+                var imports = source.match(/(?:import|from)\s+([\w]+)/g) || [];
+                for (var j = 0; j < imports.length; j++) {
+                    var pm = imports[j].match(/(?:import|from)\s+([\w]+)/);
+                    if (pm && !seen[pm[1]]) { seen[pm[1]] = true; deps.push(pm[1]); }
+                }
+            }
+            return deps;
+        }
+
+        function analyze(packages) {
+            var warnings = [], patterns = riskyPatterns();
+            for (var i = 0; i < packages.length; i++) {
+                for (var j = 0; j < patterns.length; j++) {
+                    if (patterns[j].re.test(packages[i])) {
+                        warnings.push({ package: packages[i], risk: patterns[j].risk, reason: patterns[j].reason, suggestion: patterns[j].suggestion });
+                        break;
+                    }
+                }
+            }
+            var high = warnings.filter(function(w){ return w.risk === "HIGH"; });
+            var medium = warnings.filter(function(w){ return w.risk === "MEDIUM"; });
+            return {
+                packages_scanned: packages.length, warnings: warnings,
+                high_risk_count: high.length, medium_risk_count: medium.length,
+                passed: high.length === 0,
+                summary: high.length > 0 ? high.length + " 个高风险依赖，建议立即替换: " + high.map(function(h){ return h.package; }).join(", ")
+                    : medium.length > 0 ? medium.length + " 个中风险依赖，建议评估后升级" : "未发现已知风险依赖",
+            };
+        }
+
+        function analyzeSource(source, ecosystem) {
+            var deps = extractDeps(source, ecosystem);
+            var result = analyze(deps);
+            result.extracted_deps = deps;
+            return result;
+        }
+
+        return { analyze: analyze, analyzeSource: analyzeSource, extractDeps: extractDeps };
+    })();
+
+    // ======================================================================
+    // §26 TestScaffold — test skeleton generator + result feedback parser
+    // ======================================================================
+    var TestScaffold = (function () {
+        function extractFunctions(source) {
+            if (!source) return [];
+            var fns = [], m;
+            var re = /(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/g;
+            while ((m = re.exec(source)) !== null) {
+                fns.push({ name: m[1], params: m[2].split(",").map(function(p){ return p.trim(); }).filter(Boolean), isAsync: /^async/.test(m[0]) });
+            }
+            var arrowRe = /(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>/g;
+            while ((m = arrowRe.exec(source)) !== null) {
+                fns.push({ name: m[1], params: m[2].split(",").map(function(p){ return p.trim(); }).filter(Boolean), isAsync: /async/.test(m[0]) });
+            }
+            return fns;
+        }
+
+        function generateSkeleton(functions, options) {
+            options = options || {};
+            var framework = options.framework || "jest";
+            var lines = ["// Auto-generated test skeleton by TestScaffold", "// Fill in expected values and edge cases.", ""];
+            for (var i = 0; i < functions.length; i++) {
+                var fn = functions[i];
+                var aw = fn.isAsync ? "async " : "";
+                var awt = fn.isAsync ? "await " : "";
+                var nullArgs = fn.params.map(function(){ return "null"; }).join(", ");
+                var undefArgs = fn.params.map(function(){ return "undefined"; }).join(", ");
+                if (framework === "jest") {
+                    lines.push("describe('" + fn.name + "', () => {");
+                    lines.push("  test('happy path', " + aw + "() => {");
+                    lines.push("    const result = " + awt + fn.name + "(" + nullArgs + ");");
+                    lines.push("    expect(result).toBeDefined();");
+                    lines.push("  });");
+                    lines.push("  test('invalid input', " + aw + "() => {");
+                    lines.push("    const result = " + awt + fn.name + "(" + undefArgs + ");");
+                    lines.push("    expect(result).toBeDefined();");
+                    lines.push("  });");
+                    lines.push("});");
+                } else {
+                    lines.push("// assert('" + fn.name + ": TODO', false);");
+                }
+                lines.push("");
+            }
+            return lines.join("\n");
+        }
+
+        function parseResults(output) {
+            if (!output) return { passed: 0, failed: 0, total: 0, failures: [], all_passed: false, summary: "无输出", ai_feedback: "无输出，检查测试命令。" };
+            var lower = output.toLowerCase();
+            // Jest
+            var jm = output.match(/(\d+)\s+passed.*?(\d+)\s+failed/i) || output.match(/Tests?:\s+(\d+)\s+passed/i);
+            if (jm) {
+                var p = parseInt(jm[1], 10), f = parseInt(jm[2] || "0", 10);
+                var fails = []; var fr; var fre = /FAIL\s+(.+)|●\s+(.+)/g;
+                while ((fr = fre.exec(output)) !== null) fails.push((fr[1] || fr[2] || "").trim());
+                return { passed: p, failed: f, total: p + f, failures: fails, all_passed: f === 0,
+                    summary: p + " 通过，" + f + " 失败",
+                    ai_feedback: f > 0 ? "以下测试失败，请逐一修复:\n" + fails.map(function(x){ return "  - " + x; }).join("\n") : "所有测试通过。" };
+            }
+            var mp = parseInt((output.match(/(\d+)\s+passing/i) || [])[1] || "0", 10);
+            var mf = parseInt((output.match(/(\d+)\s+failing/i) || [])[1] || "0", 10);
+            if (mp > 0 || mf > 0) {
+                return { passed: mp, failed: mf, total: mp + mf, failures: [], all_passed: mf === 0,
+                    summary: mp + " 通过，" + mf + " 失败",
+                    ai_feedback: mf > 0 ? mf + " 个测试失败，检查输出后修复。" : "所有测试通过。" };
+            }
+            if (/all.*pass|0 fail|no fail/.test(lower)) return { passed: -1, failed: 0, total: -1, failures: [], all_passed: true, summary: "测试通过", ai_feedback: "所有测试通过。" };
+            if (/fail|error/.test(lower)) return { passed: 0, failed: -1, total: -1, failures: [], all_passed: false, summary: "检测到失败信号", ai_feedback: "测试输出包含失败信号，请检查完整日志。" };
+            return { passed: 0, failed: 0, total: 0, failures: [], all_passed: true, summary: "无法解析输出", ai_feedback: "无法解析测试输出，请人工检查。" };
+        }
+
+        return { extractFunctions: extractFunctions, generateSkeleton: generateSkeleton, parseResults: parseResults };
+    })();
+
 
     // Inspired by: Yao et al. "ReAct: Synergizing Reasoning and Acting" (2022)
     // Core idea: interleave reasoning traces with tool actions so each step
@@ -4363,6 +4754,11 @@ const ZeroApex = (function () {
             Reflexion: Reflexion,
             EvidenceCollector: EvidenceCollector,
             OutputValidator: OutputValidator,
+            ExecutionSafetyNet: ExecutionSafetyNet,
+            ProjectMemory: ProjectMemory,
+            CodeQualityAnalyzer: CodeQualityAnalyzer,
+            DependencyAdvisor: DependencyAdvisor,
+            TestScaffold: TestScaffold,
             preflight: preflight,
             ledger: ledger,
             audit: audit,
@@ -4395,6 +4791,11 @@ const ZeroApex = (function () {
                 Reflexion: Reflexion,
                 OutputValidator: OutputValidator,
                 EvidenceCollector: EvidenceCollector,
+                ExecutionSafetyNet: ExecutionSafetyNet,
+                ProjectMemory: ProjectMemory,
+                CodeQualityAnalyzer: CodeQualityAnalyzer,
+                DependencyAdvisor: DependencyAdvisor,
+                TestScaffold: TestScaffold,
                 GateRegistry: { register: registerGate, run: runGates, list: function () { var n = []; for (var i = 0; i < GateRegistry.length; i++) n.push(GateRegistry[i].name); return n; } },
             },
         };
@@ -4999,6 +5400,138 @@ async function evidence_collect(params) {
 }
 
 
+// §NEW execution_safety_net — auto snapshot + execute + validate + rollback
+async function execution_safety_net(params) {
+    params = params || {};
+    var ESN = ZeroApex._infra.ExecutionSafetyNet;
+    var action = params.action || "run";
+    if (action === "run") {
+        // params.fn must be a serialized tool call descriptor:
+        // { tool: "file_guard", params: {...} }
+        // We wrap it so it calls the corresponding ZeroApex tool.
+        var toolCall = params.tool_call;
+        if (!toolCall || !toolCall.tool) return { success: false, code: "E1002_MISSING_REQUIRED", error: "tool_call.tool 必填" };
+        var targetFn = ZeroApex[toolCall.tool];
+        if (typeof targetFn !== "function") return { success: false, code: "E1001_INVALID_PARAMS", error: "未知工具: " + toolCall.tool };
+        var result = await ESN.run(
+            function() { return targetFn(toolCall.params || {}); },
+            { snapshot_paths: params.snapshot_paths || [], validators: params.validators || ["exit_code"], label: toolCall.tool }
+        );
+        return { success: result.success, code: result.success ? "OK" : "E4001_GUARD_BLOCK", result: result };
+    }
+    if (action === "validate") {
+        var vname = params.validator || "exit_code";
+        var validator = ESN.getValidator(vname);
+        if (!validator) return { success: false, code: "E1001_INVALID_PARAMS", error: "未知 validator: " + vname };
+        var vr = validator(params.data, params.meta || {});
+        return { success: vr.pass, code: vr.pass ? "OK" : "E1001_INVALID_PARAMS", pass: vr.pass, reason: vr.reason || "", suggestion: vr.suggestion || "" };
+    }
+    return { success: false, code: "E1001_INVALID_PARAMS", error: "未知 action: " + action };
+}
+
+// §NEW project_memory — structured persistent memory (architecture/gotcha/convention)
+async function project_memory(params) {
+    params = params || {};
+    var PM = ZeroApex._infra.ProjectMemory;
+    var action = params.action || "add";
+    if (action === "add") {
+        if (!params.content) return { success: false, code: "E1002_MISSING_REQUIRED", error: "content 必填" };
+        var entry = PM.add(params.category || "gotcha", params.content, params.meta || {});
+        return { success: true, code: "OK", entry: entry };
+    }
+    if (action === "recall") {
+        var results = PM.recall(params.query || "", params.category || null, params.limit || 8);
+        return { success: true, code: "OK", results: results, count: results.length };
+    }
+    if (action === "context_hint") {
+        var hint = PM.contextHint(params.query || "", params.max_entries || 5);
+        return { success: true, code: "OK", hint: hint, has_hint: hint.length > 0 };
+    }
+    if (action === "snapshot") {
+        return { success: true, code: "OK", entries: PM.snapshot(), count: PM.size() };
+    }
+    if (action === "persist") {
+        var pResult = await PM.persist();
+        return { success: pResult.success, code: pResult.success ? "OK" : "E5002_DEPENDENCY_MISSING", result: pResult };
+    }
+    return { success: false, code: "E1001_INVALID_PARAMS", error: "未知 action: " + action };
+}
+
+// §NEW code_quality — cyclomatic complexity + duplication + naming analysis
+async function code_quality(params) {
+    params = params || {};
+    var CQA = ZeroApex._infra.CodeQualityAnalyzer;
+    var source = params.source || params.code || "";
+    if (!source) return { success: false, code: "E1002_MISSING_REQUIRED", error: "source 必填" };
+    var action = params.action || "score";
+    if (action === "score") {
+        var result = CQA.score(source, { threshold: params.threshold || 55 });
+        return { success: true, code: "OK", result: result, passed: result.passed };
+    }
+    if (action === "complexity") {
+        return { success: true, code: "OK", complexity: CQA.cyclomaticComplexity(source) };
+    }
+    if (action === "duplication") {
+        return { success: true, code: "OK", duplication_pct: CQA.duplicationScore(source, params.min_lines || 4) };
+    }
+    if (action === "naming") {
+        return { success: true, code: "OK", issues: CQA.namingIssues(source) };
+    }
+    return { success: false, code: "E1001_INVALID_PARAMS", error: "未知 action: " + action };
+}
+
+// §NEW dep_advisor — dependency risk analysis (supply chain / CVE / freshness)
+async function dep_advisor(params) {
+    params = params || {};
+    var DA = ZeroApex._infra.DependencyAdvisor;
+    var action = params.action || "analyze_source";
+    if (action === "analyze") {
+        var packages = Array.isArray(params.packages) ? params.packages : [];
+        if (packages.length === 0) return { success: false, code: "E1002_MISSING_REQUIRED", error: "packages[] 必填" };
+        var result = DA.analyze(packages);
+        return { success: true, code: "OK", result: result, passed: result.passed };
+    }
+    if (action === "analyze_source") {
+        var source = params.source || params.code || "";
+        if (!source) return { success: false, code: "E1002_MISSING_REQUIRED", error: "source 必填" };
+        var result = DA.analyzeSource(source, params.ecosystem || "node");
+        return { success: true, code: "OK", result: result, passed: result.passed };
+    }
+    if (action === "extract") {
+        var source = params.source || params.code || "";
+        if (!source) return { success: false, code: "E1002_MISSING_REQUIRED", error: "source 必填" };
+        return { success: true, code: "OK", deps: DA.extractDeps(source, params.ecosystem || "node") };
+    }
+    return { success: false, code: "E1001_INVALID_PARAMS", error: "未知 action: " + action };
+}
+
+// §NEW test_scaffold — test skeleton generator + test result feedback parser
+async function test_scaffold(params) {
+    params = params || {};
+    var TS = ZeroApex._infra.TestScaffold;
+    var action = params.action || "generate";
+    if (action === "extract_functions") {
+        var source = params.source || params.code || "";
+        if (!source) return { success: false, code: "E1002_MISSING_REQUIRED", error: "source 必填" };
+        return { success: true, code: "OK", functions: TS.extractFunctions(source) };
+    }
+    if (action === "generate") {
+        var source = params.source || params.code || "";
+        var functions = params.functions || (source ? TS.extractFunctions(source) : []);
+        if (functions.length === 0) return { success: false, code: "E1002_MISSING_REQUIRED", error: "source 或 functions[] 必填" };
+        var skeleton = TS.generateSkeleton(functions, { framework: params.framework || "jest" });
+        return { success: true, code: "OK", skeleton: skeleton, function_count: functions.length };
+    }
+    if (action === "parse_results") {
+        var output = params.output || "";
+        if (!output) return { success: false, code: "E1002_MISSING_REQUIRED", error: "output 必填" };
+        var result = TS.parseResults(output);
+        return { success: true, code: "OK", result: result, all_passed: result.all_passed };
+    }
+    return { success: false, code: "E1001_INVALID_PARAMS", error: "未知 action: " + action };
+}
+
+
 async function snapshot_file(params) {
     return await ZeroApex.Snapshot.snapshot(params.path);
 }
@@ -5225,6 +5758,11 @@ exports.task_plan = wrapExport(task_plan, "task_plan");
 exports.reflexion = wrapExport(reflexion, "reflexion");
 exports.validate_output = wrapExport(validate_output, "validate_output");
 exports.evidence_collect = wrapExport(evidence_collect, "evidence_collect");
+exports.execution_safety_net = wrapExport(execution_safety_net, "execution_safety_net");
+exports.project_memory = wrapExport(project_memory, "project_memory");
+exports.code_quality = wrapExport(code_quality, "code_quality");
+exports.dep_advisor = wrapExport(dep_advisor, "dep_advisor");
+exports.test_scaffold = wrapExport(test_scaffold, "test_scaffold");
 exports.snapshot_file = wrapExport(snapshot_file, "snapshot_file");
 exports.restore_file = wrapExport(restore_file, "restore_file");
 exports.snapshot_cleanup = wrapExport(snapshot_cleanup, "snapshot_cleanup");

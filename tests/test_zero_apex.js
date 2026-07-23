@@ -1279,6 +1279,7 @@ async function runFileGuardV2Tests() {
     await runV256HardeningTests();
     await runV258FeatureTests();
     await runV259UpgradeTests();
+    await runV2510UpgradeTests();
     if (failures === 0) {
       console.log("\nALL TESTS PASSED");
       process.exit(0);
@@ -1777,4 +1778,170 @@ async function runV259UpgradeTests() {
   }
 
   console.log("[v2.5.9-upgrade-test] all assertions done, failures=%d", failures);
+}
+// ============================================================================
+// v2.5.10 upgrade tests — ExecutionSafetyNet, ProjectMemory, CodeQualityAnalyzer,
+// DependencyAdvisor, TestScaffold
+// ============================================================================
+async function runV2510UpgradeTests() {
+  console.log("\n[v2.5.10-upgrade-test] running...");
+
+  var infra = m.ZeroApex._infra;
+
+  // ---- ExecutionSafetyNet ----
+  var ESN = infra.ExecutionSafetyNet;
+
+  // validator: exit_code pass
+  var v1 = ESN.getValidator("exit_code")({ success: true, output: "done" });
+  assert("ESN-1: exit_code passes clean result", v1.pass);
+
+  // validator: exit_code fail
+  var v2 = ESN.getValidator("exit_code")({ output: "exited with 1" });
+  assert("ESN-2: exit_code fails on non-zero exit", !v2.pass);
+
+  // validator: build_success fail
+  var v3 = ESN.getValidator("build_success")("BUILD FAILED: compilation error in Main.java");
+  assert("ESN-3: build_success fails on BUILD FAILED", !v3.pass);
+
+  // validator: build_success pass
+  var v4 = ESN.getValidator("build_success")("BUILD SUCCESSFUL in 3s");
+  assert("ESN-4: build_success passes on BUILD SUCCESSFUL", v4.pass);
+
+  // validator: test_pass fail
+  var v5 = ESN.getValidator("test_pass")("5 failed, 3 passed");
+  assert("ESN-5: test_pass fails on N failed", !v5.pass);
+
+  // run: success path (no snapshot paths, fn returns ok)
+  var r1 = await ESN.run(
+    async function() { return { success: true, output: "ok" }; },
+    { validators: ["exit_code"], label: "test-op" }
+  );
+  assert("ESN-6: run succeeds when fn returns ok", r1.success);
+  assert("ESN-7: run not rolled back on success", !r1.auto_rolled_back);
+  assert("ESN-8: ai_feedback is positive on success", r1.ai_feedback.indexOf("成功") >= 0);
+
+  // run: failure path (fn throws)
+  var r2 = await ESN.run(
+    async function() { throw new Error("compile error"); },
+    { validators: ["exit_code"], label: "fail-op" }
+  );
+  assert("ESN-9: run fails when fn throws", !r2.success);
+  assert("ESN-10: exec_error captured", r2.exec_error && r2.exec_error.indexOf("compile error") >= 0);
+  assert("ESN-11: suggestions non-empty on failure", r2.suggestions.length > 0);
+
+  // ---- ProjectMemory ----
+  var PM = infra.ProjectMemory;
+  PM.clear();
+
+  var e1 = PM.add("architecture_decision", "使用 Zustand 管理全局状态，禁止使用 Redux");
+  assert("PM-1: entry created", e1 && e1.id && e1.category === "architecture_decision");
+
+  var e2 = PM.add("gotcha", "该 API 有 rate limit，调用前需加 exponential backoff");
+  assert("PM-2: gotcha entry created", e2.category === "gotcha");
+
+  var e3 = PM.add("team_convention", "提交前必须跑 prettier --check");
+  assert("PM-3: convention entry created", e3.category === "team_convention");
+
+  assert("PM-4: size is 3", PM.size() === 3);
+
+  var recalled = PM.recall("状态管理", null, 5);
+  assert("PM-5: recall finds relevant entry", recalled.length > 0);
+  assert("PM-6: top result is architecture entry", recalled[0].category === "architecture_decision");
+
+  var byCategory = PM.recall("", "gotcha", 5);
+  assert("PM-7: category filter works", byCategory.some(function(e){ return e.category === "gotcha"; }));
+
+  var hint = PM.contextHint("API 调用");
+  assert("PM-8: contextHint non-empty", hint.length > 0 && hint.indexOf("[ProjectMemory]") >= 0);
+
+  var snap = PM.snapshot();
+  assert("PM-9: snapshot returns all entries", snap.length === 3);
+
+  // ---- CodeQualityAnalyzer ----
+  var CQA = infra.CodeQualityAnalyzer;
+
+  // Simple function — low complexity
+  var simpleCode = "function add(a, b) { return a + b; }";
+  var cc1 = CQA.cyclomaticComplexity(simpleCode);
+  assert("CQA-1: simple function has cc=1", cc1 === 1);
+
+  // Complex function
+  var complexCode = "function f(a,b,c) { if(a){for(var i=0;i<b;i++){if(c&&a||b){return i;}}} return 0; }";
+  var cc2 = CQA.cyclomaticComplexity(complexCode);
+  assert("CQA-2: complex function has cc>3", cc2 > 3);
+
+  // Duplication
+  var dupLines = Array(10).fill("var x = doSomething(a, b, c);").join("\n");
+  var dup = CQA.duplicationScore(dupLines, 3);
+  assert("CQA-3: duplicated lines get non-zero score", dup > 0);
+
+  // Naming issues: single letter vars
+  var badNaming = "var a = 1; var b = 2; var c = 3; var d = 4; var e = 5;";
+  var ni = CQA.namingIssues(badNaming);
+  assert("CQA-4: single letter vars detected", ni.some(function(i){ return i.type === "single_letter_vars"; }));
+
+  // Score: clean code
+  var s1 = CQA.score("function greet(name) { return 'Hello ' + name; }", { threshold: 55 });
+  assert("CQA-5: clean code passes threshold", s1.passed);
+  assert("CQA-6: score has grade field", "ABCDF".indexOf(s1.grade) >= 0);
+
+  // ---- DependencyAdvisor ----
+  var DA = infra.DependencyAdvisor;
+
+  // Known risky package
+  var r3 = DA.analyze(["event-stream", "express", "lodash"]);
+  assert("DA-1: event-stream flagged as HIGH", r3.high_risk_count >= 1);
+  assert("DA-2: passed=false with HIGH risk", !r3.passed);
+
+  // Clean packages
+  var r4 = DA.analyze(["express", "axios", "moment"]);
+  assert("DA-3: no warnings for clean packages", r4.high_risk_count === 0);
+  assert("DA-4: passed=true for clean packages", r4.passed);
+
+  // Source extraction
+  var srcNode = "const express = require('express');\nconst _ = require('lodash');\nimport axios from 'axios';";
+  var deps = DA.extractDeps(srcNode, "node");
+  assert("DA-5: extracts node deps from source", deps.indexOf("express") >= 0 || deps.indexOf("lodash") >= 0);
+
+  var r5 = DA.analyzeSource(srcNode, "node");
+  assert("DA-6: analyzeSource returns extracted_deps", Array.isArray(r5.extracted_deps));
+
+  // ---- TestScaffold ----
+  var TS = infra.TestScaffold;
+
+  // Extract functions
+  var src = "function add(a, b) { return a + b; }\nasync function fetchData(url) { return null; }";
+  var fns = TS.extractFunctions(src);
+  assert("TS-1: extracts 2 functions", fns.length === 2);
+  assert("TS-2: add is not async", !fns[0].isAsync);
+  assert("TS-3: fetchData is async", fns[1].isAsync);
+  assert("TS-4: fetchData has 1 param", fns[1].params.length === 1);
+
+  // Generate skeleton (jest)
+  var skeleton = TS.generateSkeleton(fns, { framework: "jest" });
+  assert("TS-5: skeleton contains describe", skeleton.indexOf("describe") >= 0);
+  assert("TS-6: skeleton contains happy path", skeleton.indexOf("happy path") >= 0);
+
+  // Generate skeleton (generic)
+  var skelGeneric = TS.generateSkeleton(fns, { framework: "assert" });
+  assert("TS-7: generic skeleton generated", skelGeneric.length > 0);
+
+  // Parse results: jest style
+  var jestOutput = "Tests: 10 passed, 2 failed\nFAIL src/utils.test.js\n● should handle null input";
+  var pr1 = TS.parseResults(jestOutput);
+  assert("TS-8: jest result parsed: passed=10", pr1.passed === 10);
+  assert("TS-9: jest result parsed: failed=2", pr1.failed === 2);
+  assert("TS-10: jest result all_passed=false", !pr1.all_passed);
+  assert("TS-11: ai_feedback non-empty on failure", pr1.ai_feedback.indexOf("修复") >= 0);
+
+  // Parse results: mocha style
+  var mochaOutput = "  15 passing\n  0 failing";
+  var pr2 = TS.parseResults(mochaOutput);
+  assert("TS-12: mocha result all_passed=true", pr2.all_passed);
+
+  // Parse results: generic pass
+  var pr3 = TS.parseResults("all tests pass, 0 failures");
+  assert("TS-13: generic pass signal detected", pr3.all_passed);
+
+  console.log("[v2.5.10-upgrade-test] all assertions done, failures=%d", failures);
 }
