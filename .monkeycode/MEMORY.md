@@ -44,34 +44,15 @@
   - 引擎文件: /workspace/engine/zero_apex.js
   - 测试文件: /workspace/tests/test_zero_apex.js
 
-### E3: 引擎架构约定
+### E3: 引擎架构约定（v3.0.0 精简版）
 - Date: 2026-07-23
-- Context: 开发引擎时的约束
+- Context: 用户指出过度工程化问题，要求精简到真正有用的功能
 - Category: 环境配置
 - Instructions:
   - 引擎必须保持单文件（QuickJS 沙箱不支持 require()）
-  - manifest.json 更新必须从 git HEAD 重建（保留 sandbox/permission 顶层字段）
-  - META_TOOLS 集中一处，用 isMetaTool() 消费
-  - flushSize=1 每条即时落盘
-  - ConfigRegistry.lock() bootstrap 后锁定 7 个安全 key
-
-### E4: 项目审计发现的 12 个问题修复
-- Date: 2026-07-23
-- Context: 外部审计指出项目存在 12 个缺陷，用户要求全部修复
-- Category: 工作流协作
-- Instructions:
-  - P0: 对抗性测试、Hallucination 语义升级
-  - P1: deps 接口规范化、CommandNormalizer 盲区补全
-  - P2: 置信度校准、输出防火墙边界清晰化、快照异地备份、进化闭环验证
-  - P3: 工具数量认知负担、上下文膨胀控制、英文国际化支持
-  - QuickJS 能力天花板属于架构约束，无法修复，需文档化
-
-### E5: 修复后的版本号规则
-- Date: 2026-07-23
-- Context: v2.5.10 之后修复 12 个审计问题
-- Category: 构建方法
-- Instructions:
-  - 新版本: v2.5.11（审计修复版）
-  - 测试组: runV2511AuditFixTests()
-  - 新模块编号: §27(AdversarialTest), §28(DepsContract), §29(FirewallBoundary), §30(Calibration)
+  - 只做三件事：命令安全解析 + 文件保护 + 执行审计
+  - 不造轮子：不写正则匹配的"AI 安全"层
+  - 不假装：不写自评分、不写幻觉检测、不写输出防火墙
+  - manifest.json 保留 sandbox/permission 顶层字段
+  - 精简后引擎约 536 行，6 个工具
 

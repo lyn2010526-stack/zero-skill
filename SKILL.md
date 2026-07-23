@@ -1,26 +1,17 @@
 ---
 name: zero_apex
-version: "2.5.6"
+version: "3.0.0"
 description: |
-  Engineering task guardian engine. Anti-delete / anti-hallucination / evidence
-  verification / output firewall / memory / snapshot — all as executable JS
-  running in the Operit QuickJS sandbox. 19 tools, 6-layer preflight gate.
-compatibility: Operit AI
+  Engineering task guardian engine — Lean Edition.
+  Command safety parsing + file protection + execution audit.
+  No fake AI safety, no self-scoring theatre.
+compatibility: Operit AI / QuickJS Sandbox
 type: skill
 engine: zero_apex
 entrypoint: engine/zero_apex.js
 references:
   - references/file_guard.md
-  - references/hallucination_guard.md
-  - references/evidence_verifier.md
-  - references/self_monitor.md
-  - references/output_firewall.md
-  - references/open_source.md
-  - references/memory.md
   - references/snapshot.md
-  - references/preflight.md
-  - references/operit_capabilities.md
-  - references/evolution.md
 triggers:
   - task_type: [engineering, debugging, refactoring, build, deploy, code_review]
   - keywords: [compile, build, fix, refactor, deploy, install, test, deliver, code_review, 编译, 构建, 修复, 重构, 部署, 安装, 测试, 交付, 代码审查]
@@ -29,88 +20,75 @@ deactivates_on:
   - task_type: [chat, greeting, weather, sentiment, quick_qa, browse_only]
   - signal: user_explicit_simple_answer
   - signal: no_code_or_command_involved
-gates:
-  pre_execution: preflight
-  post_output: output_firewall
-  claim_verification: evidence_check
 metadata:
   author: lyn2010526-stack
   display_name: 零 · Zero Apex
   license: Apache-2.0
   language: zh-CN
   min_operit_version: ">=1.0"
-  requires_tools: [Files, Network, Tools.Memory]
+  requires_tools: [Files]
   optional_tools: [Files.listFiles, Files.exists]
   package: zero_apex
 ---
 
-# 零 · Zero Apex
+# 零 · Zero Apex — Lean Edition
 
-> Operit sandbox-executable engineering guardian engine. Guardian layer is JS code, not prompt text.
+> 只做三件事：命令安全解析 + 文件保护 + 执行审计。
+> 不假装能防 AI 闯祸，不造轮子，不打分。
 
 ## Identity
 
-When activated, you are the **Lead Software Engineer**, responsible for delivering final results.
-Every conclusion must carry a confidence tag: `VERIFIED` / `INFERRED` / `GUESSED` / `UNKNOWN`.
+When activated, you are the **Software Engineer** delivering results.
+This engine protects your file operations and audits command execution.
+It does NOT score your confidence, filter your output, or pretend to detect hallucinations.
+
+## What It Does
+
+| Capability | What happens | Real? |
+|------------|-------------|-------|
+| Command parsing | Splits `cmd1 && cmd2 \| cmd3` into segments, checks each against blocklist | Yes |
+| Obfuscation decode | Decodes `\x72\x6d`, `\u0072`, octal escapes (up to 3 layers) | Yes |
+| File backup | Before delete/write, backs up to `.trash` with tombstone | Yes |
+| File restore | Restores from `.trash` using tombstone metadata | Yes |
+| Path traversal | Blocks `../../etc/passwd` patterns | Yes |
+| Audit log | Records every tool call with timestamp and result | Yes |
+
+## What It Does NOT Do
+
+- Does NOT detect hallucinations (keyword matching is not semantic understanding)
+- Does NOT score your confidence (self-scoring is meaningless)
+- Does NOT filter your output (false positives hurt more than help)
+- Does NOT prevent AI from ignoring suggestions (no enforcement power)
 
 ## Activation Triggers
 
 | Scenario | Signal | Load reference |
 |----------|--------|----------------|
 | About to run destructive command | `command_risk: destructive` | `references/file_guard.md` |
-| Output contains completion claim | text contains "compiled/fixed/done" | `references/evidence_verifier.md` |
-| Output contains technical assertion | text contains "deprecated/no longer supported" | `references/hallucination_guard.md` |
-| Pre-task assessment | `task_type: engineering` | `references/self_monitor.md` |
-| About to output to user | any output | `references/output_firewall.md` |
-| Need open-source search | keyword "search/compare/merge" | `references/open_source.md` |
-| Record/recall experience | keyword "remember/experience/last time" | `references/memory.md` |
-| About to delete or overwrite file | keyword "delete/overwrite/truncate" | `references/snapshot.md` |
-| Tool call failed | returns error/permission_denied | `references/operit_capabilities.md` |
-| Batch task complete, need persistence | `task_complete:batch` | `references/evolution.md` |
+| About to delete or overwrite file | keyword "delete/overwrite" | `references/snapshot.md` |
+| Command contains escape sequences | hex/unicode/octal patterns | `references/file_guard.md` |
 
-## Non-applicable Scenarios
+## Tools (6)
 
-- Chitchat / greeting / emotional support
-- Quick Q&A (user explicitly asks for short answer)
-- Read-only browsing
-
-When any of the above occurs, skip all gates.
-
-## Tools (19)
-
-Defined in `engine/zero_apex.js`, called on demand:
-
-`preflight` · `file_guard` · `hallucination_guard` · `evidence_check` · `self_monitor` · `output_firewall` · `search_opensource` · `remember` · `recall` · `snapshot_file` · `restore_file` · `snapshot_cleanup` · `tombstone_file` · `enforce_block` · `audit_log` · `evaluate_permission` · `check_sandbox` · `config_get` · `config_set`
+`file_guard` · `shell_guard` · `normalize_command` · `snapshot_backup` · `snapshot_restore` · `audit_log`
 
 ## Workflow
 
 ```
-requirement → preflight → modify → compile → evidence_check → fix → deliver
+requirement → file_guard(command) → [BLOCK/ASK/ALLOW] → execute → audit_log
+                                    ↓
+                              snapshot_backup(path) → delete/write → audit_log
 ```
-
-`preflight` chains 6 gate layers: self-check / anti-delete / permission / anti-hallucination / output firewall / snapshot hint.
 
 ## Install into Operit
 
-### Method 1: Package manager (recommended)
-Paste this URL into Operit's package manager "add link" UI:
+### Method 1: Package manager
 ```
-https://github.com/lyn2010526-stack/zero-skill/releases/download/v2.5.5/zero_apex-2.5.5.zip
+https://github.com/lyn2010526-stack/zero-skill/releases/latest/download/zero_apex-3.0.0.zip
 ```
-Operit extracts the zip and reads `skill.md` (this file) at the root.
 
 ### Method 2: Direct install
-Use Operit's developer command:
-```
-operit_editor:debug_install_js_package
-```
-Pass `engine/zero_apex.js` + `manifest.json`.
-
-## Progressive Loading
-
-1. **Metadata layer** (this file's frontmatter): always loaded, used for routing
-2. **Instruction layer** (this file's body): loaded after activation
-3. **Resource layer** (`references/*.md`): loaded on demand per scenario
+Use Operit's developer command with `engine/zero_apex.js` + `manifest.json`.
 
 ## License
 

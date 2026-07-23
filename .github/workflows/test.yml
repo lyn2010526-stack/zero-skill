@@ -16,57 +16,22 @@ jobs:
         with:
           node-version: "18"
 
-      - name: Engine self-test + DI + guards
+      - name: Lean engine tests
         run: |
-          OUTPUT=$(node tests/test_zero_apex.js 2>&1)
-          echo "$OUTPUT"
-          if echo "$OUTPUT" | grep -q "FAILED"; then
-            echo "::error::Engine self-test failed"
-            exit 1
-          fi
-
-      - name: Skill behavior + activation
-        run: |
-          OUTPUT=$(node tests/test_skill_activation.js 2>&1)
-          echo "$OUTPUT"
-          if echo "$OUTPUT" | grep -q "FAILED"; then
-            echo "::error::Skill activation tests failed"
-            exit 1
-          fi
-
-      - name: Adversarial red-team tests
-        run: |
-          OUTPUT=$(node -e "
-            const m = require('./engine/zero_apex.js');
-            m.adversarial_test({}).then(r => {
-              console.log('Pass rate:', r.pass_rate);
-              console.log('Failed:', r.failed);
-              if (r.verdict !== 'ALL_PASS') {
-                console.log('FAILURES:', JSON.stringify(r.failures.slice(0, 5), null, 2));
-                process.exit(1);
-              }
-              console.log('Adversarial test: ALL_PASS');
-            });
-          " 2>&1)
+          OUTPUT=$(node tests/test_zero_apex_lean.js 2>&1)
           echo "$OUTPUT"
           if echo "$OUTPUT" | grep -q "FAILURES"; then
-            echo "::error::Adversarial test detected bypasses"
+            echo "::error::Engine tests failed"
             exit 1
           fi
 
       - name: Coverage gate (minimum assertions)
         run: |
-          # Extract assertion counts from test output
-          SELFTEST=$(node tests/test_zero_apex.js 2>&1 | grep 'self-test' | grep -oP 'total=\K[0-9]+')
-          SKILL=$(node tests/test_skill_activation.js 2>&1 | grep -oP '[0-9]+ passed' | grep -oP '[0-9]+')
-          echo "Self-test: $SELFTEST assertions"
-          echo "Skill: $SKILL assertions"
-          if [ "$SELFTEST" -lt 19 ] 2>/dev/null; then
-            echo "::error::Self-test coverage below threshold (19)"
-            exit 1
-          fi
-          if [ "$SKILL" -lt 100 ] 2>/dev/null; then
-            echo "::error::Skill test coverage below threshold (100)"
+          # Count PASS lines in test output
+          PASS_COUNT=$(node tests/test_zero_apex_lean.js 2>&1 | grep -c "PASS:")
+          echo "Passed assertions: $PASS_COUNT"
+          if [ "$PASS_COUNT" -lt 30 ] 2>/dev/null; then
+            echo "::error::Test coverage below threshold (30)"
             exit 1
           fi
           echo "Coverage gate: PASSED"

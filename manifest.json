@@ -1,941 +1,106 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "name": "zero_apex",
-  "version": "2.6.0",
-  "description": "首席工程师执行引擎。守护层为可执行 JS，运行在 Operit QuickJS 沙箱。v2.6.0 真正推理核心：证据链验证、自动校准、上下文感知调度、ReAct 多步推理、工具沙箱隔离。",
-  "compatibility": "Operit AI",
+  "version": "3.0.0",
+  "description": "ZeroApex 精简版 — 只做三件事：命令安全解析 + 文件保护 + 执行审计。不假装能防 AI 闯祸。",
+  "compatibility": "Operit AI / QuickJS Sandbox",
   "license": "Apache-2.0",
   "language": "zh-CN",
   "entrypoint": "engine/zero_apex.js",
   "skill_file": "零.skill",
-  "min_operit_version": ">=1.0",
-  "requires_tools": [
-    "Files",
-    "Network",
-    "Tools.Memory"
-  ],
-  "optional_tools": [
-    "Files.listFiles",
-    "Files.exists"
-  ],
-  "env_requirements": {
-    "min_permission_level": "basic",
-    "permission_levels": {
-      "none": {
-        "description": "仅纯文本应答，无文件/网络/工具访问",
-        "tools_disabled": [
-          "Files",
-          "Network",
-          "Tools.Memory"
-        ],
-        "references_disabled": [
-          "file_guard",
-          "snapshot",
-          "open_source",
-          "memory"
-        ]
-      },
-      "basic": {
-        "description": "Files.read/write（沙箱目录内），无网络无记忆",
-        "tools_enabled": [
-          "Files.read",
-          "Files.write",
-          "Files.exists"
-        ],
-        "tools_disabled": [
-          "Network",
-          "Tools.Memory"
-        ],
-        "references_disabled": [
-          "open_source",
-          "memory"
-        ]
-      },
-      "network": {
-        "description": "L1 + 网络访问",
-        "tools_enabled": [
-          "Files",
-          "Network.httpGet"
-        ],
-        "tools_disabled": [
-          "Tools.Memory"
-        ],
-        "references_disabled": [
-          "memory"
-        ]
-      },
-      "shell": {
-        "description": "L2 + shell 命令执行（非 root）",
-        "tools_enabled": [
-          "Files",
-          "Network",
-          "Shell"
-        ]
-      },
-      "shizuku": {
-        "description": "L3 + Shizuku 提权",
-        "tools_enabled": [
-          "Files",
-          "Network",
-          "Shell",
-          "Shizuku"
-        ],
-        "flag": "android.shizuku_available"
-      },
-      "root": {
-        "description": "L4 + root 权限",
-        "tools_enabled": [
-          "Files",
-          "Network",
-          "Shell",
-          "Shizuku",
-          "Root"
-        ]
-      }
-    }
-  },
   "tools": [
     {
-      "name": "preflight",
-      "layer": "综合",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "task_type:engineering",
-        "command_risk:destructive"
-      ],
-      "blocking": true,
-      "description": "执行前四层门禁串联，返回 allowed/state/reasons"
-    },
-    {
       "name": "file_guard",
-      "layer": "防删",
+      "layer": "文件保护",
       "requires": [],
       "min_permission": "none",
-      "triggers": [
-        "command_risk:destructive",
-        "keywords:删除/覆盖/截断"
-      ],
+      "triggers": ["command_risk"],
       "blocking": true,
-      "description": "分析命令/脚本/路径的删除风险"
+      "description": "检测删除/覆盖命令和危险路径，返回风险等级和是否需要确认"
     },
     {
       "name": "shell_guard",
-      "added_in": "2.5.0"
-    },
-    {
-      "name": "hallucination_guard",
-      "layer": "防幻觉",
+      "layer": "命令解析",
       "requires": [],
       "min_permission": "none",
-      "triggers": [
-        "output:技术断言",
-        "output:完成声明"
-      ],
+      "triggers": ["command_exec"],
       "blocking": true,
-      "description": "检测幻觉违规，返回修正建议"
+      "description": "命令分段解析 + 读写白名单，BLOCK/ASK/ALLOW 三级判定"
     },
     {
-      "name": "evidence_verifier",
-      "added_in": "2.3.0"
-    },
-    {
-      "name": "output_firewall",
-      "layer": "防火墙",
+      "name": "normalize_command",
+      "layer": "命令解析",
       "requires": [],
       "min_permission": "none",
-      "triggers": [
-        "before_user_output"
-      ],
-      "blocking": true,
-      "description": "检测输出中的六类违规"
-    },
-    {
-      "name": "snapshot_file",
-      "layer": "快照",
-      "requires": [
-        "Files"
-      ],
-      "min_permission": "basic",
-      "triggers": [
-        "command_risk:destructive"
-      ],
+      "triggers": ["command_input"],
       "blocking": false,
-      "description": "备份文件到 .trash"
+      "description": "解码命令混淆（hex/unicode/octal 迭代解码，最多3层嵌套）"
     },
     {
-      "name": "restore_file",
-      "layer": "快照",
-      "requires": [
-        "Files"
-      ],
-      "min_permission": "basic",
-      "triggers": [
-        "keywords:恢复/误删"
-      ],
+      "name": "snapshot_backup",
+      "layer": "文件保护",
+      "requires": ["Files"],
+      "min_permission": "write",
+      "triggers": ["file_delete", "file_write"],
       "blocking": false,
-      "description": "从 .trash 恢复文件"
+      "description": "文件操作前自动备份到 .trash，支持墓碑机制"
     },
     {
-      "name": "snapshot_cleanup",
-      "layer": "快照",
-      "requires": [
-        "Files"
-      ],
-      "min_permission": "basic",
-      "triggers": [
-        "periodic",
-        "manual"
-      ],
+      "name": "snapshot_restore",
+      "layer": "文件保护",
+      "requires": ["Files"],
+      "min_permission": "write",
+      "triggers": ["file_restore"],
       "blocking": false,
-      "description": "清理过期快照：超过 max_age_hours（默认 24h）或超过 max_count（默认 50 个）时删除最旧快照",
-      "added_in": "2.4.0"
-    },
-    {
-      "name": "tombstone_file",
-      "layer": "快照",
-      "requires": [
-        "Files"
-      ],
-      "min_permission": "basic",
-      "triggers": [
-        "keywords:删除/逻辑删除"
-      ],
-      "blocking": false,
-      "description": "逻辑删除：Files.delete 不可用时先备份再覆盖为墓碑标记（含恢复指针），可调用 restore_file 恢复",
-      "added_in": "2.5.3"
-    },
-    {
-      "name": "evaluate_permission",
-      "layer": "权限",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "before_tool_exec"
-      ],
-      "blocking": true,
-      "description": "按 deny>ask>allow 规则评估工具调用，default 模式下未匹配走 preflight 现有逻辑",
-      "added_in": "2.3.0"
-    },
-    {
-      "name": "check_sandbox",
-      "layer": "沙箱",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "path_write",
-        "command_exec"
-      ],
-      "blocking": true,
-      "description": "按 sandbox profile（workspace/read-only/strict）校验可写路径与可执行命令",
-      "added_in": "2.3.0"
+      "description": "从 .trash 恢复文件到原始路径"
     },
     {
       "name": "audit_log",
-      "layer": "调试",
-      "requires": [
-        "Files"
-      ],
-      "min_permission": "basic",
-      "triggers": [
-        "every_tool_call"
-      ],
-      "blocking": false,
-      "description": "记录每次工具调用的触发原因/耗时/结果/task_id 到 audit_log.jsonl",
-      "added_in": "2.2.0"
-    },
-    {
-      "name": "config_get",
-      "layer": "配置",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "manual"
-      ],
-      "blocking": false,
-      "description": "读取运行时配置项（如 snapshot.cleanup TTL/容量），不传 key 返回全部配置",
-      "added_in": "2.5.0"
-    },
-    {
-      "name": "config_set",
-      "layer": "配置",
-      "requires": [],
-      "min_permission": "basic",
-      "triggers": [
-        "manual"
-      ],
-      "blocking": false,
-      "description": "运行时修改配置项（如 snapshot.cleanup.max_age_hours=720）",
-      "added_in": "2.5.0"
-    },
-    {
-      "name": "open_source_adapter",
-      "added_in": "2.0.0"
-    },
-    {
-      "name": "memory_adapter",
-      "added_in": "2.5.0"
-    },
-    {
-      "name": "reasoning_chain",
-      "layer": "推理",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "task_start",
-        "task_type:engineering"
-      ],
-      "blocking": false,
-      "description": "ReAct 风格推理链：记录 Thought/Action/Observation/Reflection 步骤，为 preflight 提供可验证的推理上下文",
-      "added_in": "2.5.8"
-    },
-    {
-      "name": "task_plan",
-      "layer": "规划",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "task_type:complex",
-        "keywords:分解/规划/子任务"
-      ],
-      "blocking": false,
-      "description": "层次化任务分解：将复杂 goal 拆解为带依赖关系的 DAG 子任务树，支持并行就绪节点检测和失败传播",
-      "added_in": "2.5.8"
-    },
-    {
-      "name": "reflexion",
-      "layer": "反思",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "task_failed",
-        "task_complete"
-      ],
-      "blocking": false,
-      "description": "Reflexion 反思引擎：失败后提取结构化经验规则，注入后续 preflight 上下文，防止重复犯同类错误",
-      "added_in": "2.5.8"
-    },
-    {
-      "name": "validate_output",
-      "added_in": "2.5.9"
-    },
-    {
-      "name": "evidence_collect",
-      "added_in": "2.5.9"
-    },
-    {
-      "name": "execution_safety_net",
-      "layer": "安全网",
-      "requires": [
-        "Snapshot"
-      ],
-      "min_permission": "basic",
-      "triggers": [
-        "before_tool_execution"
-      ],
-      "blocking": false,
-      "description": "自动 snapshot + 执行 + 验证 + 回滚。执行任意工具调用前自动备份，失败时自动回滚并向 AI 返回结构化修复建议，内置 exit_code/build_success/test_pass/files_intact 四种验证器",
-      "added_in": "2.5.10"
-    },
-    {
-      "name": "project_memory",
-      "layer": "记忆",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "task_complete",
-        "task_failed"
-      ],
-      "blocking": false,
-      "description": "结构化项目记忆库，三类存储：architecture_decision（架构决策）/ gotcha（踩坑记录）/ team_convention（团队规范），按关键词和类别加权检索，支持持久化到 Memory adapter",
-      "added_in": "2.5.10"
-    },
-    {
-      "name": "code_quality",
-      "layer": "质量",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "before_user_output"
-      ],
-      "blocking": false,
-      "description": "纯静态代码质量评分（0-100）：圈复杂度、重复代码比例、命名规范三维度综合评估，低于阈值时给出具体改进建议，评级 A/B/C/D/F",
-      "added_in": "2.5.10"
-    },
-    {
-      "name": "dep_advisor",
-      "layer": "依赖",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "code_written"
-      ],
-      "blocking": false,
-      "description": "依赖风险扫描：从源代码提取 import/require 依赖，对照已知供应链攻击、CVE、投毒版本数据库，返回 HIGH/MEDIUM 风险警告和替换建议，不拦截只提醒",
-      "added_in": "2.5.10"
-    },
-    {
-      "name": "test_scaffold",
-      "layer": "测试",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "code_written"
-      ],
-      "blocking": false,
-      "description": "测试骨架生成 + 测试结果反馈解析：从函数签名自动生成 Jest/assert 测试骨架，解析 Jest/Mocha/TAP 测试输出为结构化结果，向 AI 返回明确的修复指引",
-      "added_in": "2.5.10"
-    },
-    {
-      "name": "adversarial_test",
       "layer": "审计",
       "requires": [],
       "min_permission": "none",
-      "triggers": [
-        "manual",
-        "periodic"
-      ],
+      "triggers": ["manual"],
       "blocking": false,
-      "description": "红队对抗性测试：编码嵌套混淆(T1)、幻觉关键词变体(T2)、上下文危险命令(T3)、快照绕过(T4)、防火墙绕过(T5)、置信度欺骗(T6) 六维测试，返回 pass_rate 和失败详情",
-      "added_in": "2.5.11"
-    },
-    {
-      "name": "deps_validate",
-      "layer": "架构",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "manual"
-      ],
-      "blocking": false,
-      "description": "运行 deps 接口校验，检查 IFiles/IMemory/IEnv/ITools 四大接口契约是否满足，返回缺失方法和适配指南",
-      "added_in": "2.5.11"
-    },
-    {
-      "name": "firewall_boundary",
-      "layer": "防火墙",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "before_user_output"
-      ],
-      "blocking": true,
-      "description": "输出防火墙边界清晰化：三级边界(BLOCK/WARN/PASS)，区分内部实现细节(硬拦截) vs 模块名称提及(软提醒) vs 正常技术说明(放行)，支持 debug_mode 降级",
-      "added_in": "2.5.11"
-    },
-    {
-      "name": "calibration_track",
-      "layer": "校准",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "task_complete",
-        "manual"
-      ],
-      "blocking": false,
-      "description": "置信度校准追踪：记录 SelfMonitor 评分 vs 实际任务成功率，输出校准曲线和系统性偏差检测，确保评分与实际一致",
-      "added_in": "2.5.11"
-    },
-    {
-      "name": "snapshot_git_backup",
-      "layer": "快照",
-      "requires": [
-        "Files"
-      ],
-      "min_permission": "basic",
-      "triggers": [
-        "command_risk:destructive",
-        "manual"
-      ],
-      "blocking": false,
-      "description": "Git 本地 commit 异地备份：将当前改动创建为 git commit 作为异地备份机制，返回需执行的 git 命令序列（git add -A + git commit），不自动 push",
-      "added_in": "2.5.11"
-    },
-    {
-      "name": "verify_evolution_rule",
-      "layer": "进化",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "manual"
-      ],
-      "blocking": false,
-      "description": "进化规则验证：新规则合并前的自动化校验，检查 pattern 合法性、误杀合法命令、匹配应有的恶意命令，返回 errors/warnings",
-      "added_in": "2.5.11"
-    },
-    {
-      "name": "smart_dispatch",
-      "layer": "分发",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "task_start"
-      ],
-      "blocking": false,
-      "description": "智能工具分发：根据 goal/command 自动推断建议的工具链（如删除意图→preflight+file_guard+snapshot），降低工具数量认知负担",
-      "added_in": "2.5.11"
-    },
-    {
-      "name": "get_tool_info",
-      "layer": "上下文",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": [
-        "manual"
-      ],
-      "blocking": false,
-      "description": "按需工具信息获取：返回紧凑格式的工具定义（layer/description/params/blocking），减少上下文膨胀；支持查询单个工具或全部清单",
-      "added_in": "2.5.11"
-    },
-    {
-      "name": "evidence_verify",
-      "layer": "证据链",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": ["claim_made"],
-      "blocking": true,
-      "description": "证据链验证：声明必须关联工具执行 ID，引擎验证执行结果与声明一致，防止编造结果",
-      "added_in": "2.6.0"
-    },
-    {
-      "name": "evidence_link",
-      "layer": "证据链",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": ["tool_complete"],
-      "blocking": false,
-      "description": "证据链关联：工具执行完成后自动记录执行 ID 和结果摘要，供后续声明验证",
-      "added_in": "2.6.0"
-    },
-    {
-      "name": "auto_calibrate",
-      "layer": "校准",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": ["tool_complete"],
-      "blocking": false,
-      "description": "自动校准：工具执行完成后自动记录预测 vs 实际成功率，按工具分组统计偏差",
-      "added_in": "2.6.0"
-    },
-    {
-      "name": "context_dispatch",
-      "layer": "调度",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": ["goal_submitted"],
-      "blocking": false,
-      "description": "上下文感知调度：依赖拓扑排序 + 历史失败感知 + blocker 检查，智能推荐工具序列",
-      "added_in": "2.6.0"
-    },
-    {
-      "name": "react_create",
-      "layer": "推理",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": ["task_start"],
-      "blocking": false,
-      "description": "ReAct 循环创建：初始化多步推理状态（goal/steps/phase），支持最多 10 步推理",
-      "added_in": "2.6.0"
-    },
-    {
-      "name": "react_step",
-      "layer": "推理",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": ["step_advance"],
-      "blocking": false,
-      "description": "ReAct 单步推进：执行 reason/act/observe/reflect/backtrack/summary 阶段，带步骤记忆和回溯",
-      "added_in": "2.6.0"
-    },
-    {
-      "name": "tool_sandbox",
-      "layer": "沙箱",
-      "requires": [],
-      "min_permission": "none",
-      "triggers": ["tool_call"],
-      "blocking": false,
-      "description": "工具执行隔离：超时控制（默认30s）+ 输出截断（默认8KB）+ 异常捕获，防止恶意工具拖垮引擎",
-      "added_in": "2.6.0"
+      "description": "查看最近的执行审计日志"
     }
   ],
   "references": [
     {
       "name": "file_guard",
       "path": "references/file_guard.md",
-      "layer": "防删",
+      "layer": "文件保护",
       "priority": "critical",
       "min_permission": "none",
-      "triggers": [
-        "command_risk:destructive"
-      ],
-      "conflicts_with": []
+      "triggers": ["command_risk:destructive"]
     },
     {
-      "name": "hallucination_guard",
-      "path": "references/hallucination_guard.md",
-      "layer": "防幻觉",
+      "name": "shell_guard",
+      "path": "references/shell_guard.md",
+      "layer": "命令解析",
       "priority": "critical",
       "min_permission": "none",
-      "triggers": [
-        "output:技术断言",
-        "output:完成声明"
-      ],
-      "conflicts_with": []
-    },
-    {
-      "name": "evidence_verifier",
-      "path": "references/evidence_verifier.md",
-      "layer": "证据",
-      "priority": "critical",
-      "min_permission": "none",
-      "triggers": [
-        "claim:完成"
-      ],
-      "conflicts_with": []
-    },
-    {
-      "name": "self_monitor",
-      "path": "references/self_monitor.md",
-      "layer": "自检",
-      "priority": "high",
-      "min_permission": "none",
-      "triggers": [
-        "task_start"
-      ],
-      "conflicts_with": []
-    },
-    {
-      "name": "output_firewall",
-      "path": "references/output_firewall.md",
-      "layer": "防火墙",
-      "priority": "critical",
-      "min_permission": "none",
-      "triggers": [
-        "before_user_output"
-      ],
-      "conflicts_with": []
-    },
-    {
-      "name": "open_source",
-      "path": "references/open_source.md",
-      "layer": "开源",
-      "priority": "normal",
-      "min_permission": "network",
-      "triggers": [
-        "keywords:搜索/对比/融合"
-      ],
-      "conflicts_with": []
-    },
-    {
-      "name": "memory",
-      "path": "references/memory.md",
-      "layer": "记忆",
-      "priority": "high",
-      "min_permission": "basic",
-      "triggers": [
-        "task_complete",
-        "task_failed"
-      ],
-      "conflicts_with": []
+      "triggers": ["command_exec"]
     },
     {
       "name": "snapshot",
       "path": "references/snapshot.md",
-      "layer": "快照",
-      "priority": "critical",
-      "min_permission": "basic",
-      "triggers": [
-        "command_risk:destructive"
-      ],
-      "conflicts_with": []
-    },
-    {
-      "name": "preflight",
-      "path": "references/preflight.md",
-      "layer": "综合",
-      "priority": "critical",
-      "min_permission": "none",
-      "triggers": [
-        "task_type:engineering"
-      ],
-      "conflicts_with": []
-    },
-    {
-      "name": "operit_capabilities",
-      "path": "references/operit_capabilities.md",
-      "layer": "权限",
+      "layer": "文件保护",
       "priority": "high",
-      "min_permission": "none",
-      "triggers": [
-        "tool_error",
-        "permission_check"
-      ],
-      "conflicts_with": []
-    },
-    {
-      "name": "evolution",
-      "path": "references/evolution.md",
-      "layer": "进化",
-      "priority": "normal",
-      "min_permission": "basic",
-      "triggers": [
-        "task_complete:batch",
-        "manual:evolve"
-      ],
-      "conflicts_with": [],
-      "added_in": "2.2.0"
+      "min_permission": "write",
+      "triggers": ["file_delete", "file_write"]
     }
   ],
-  "deactivates_on": [
-    "task_type:chat",
-    "task_type:greeting",
-    "task_type:weather",
-    "task_type:sentiment",
-    "task_type:quick_qa",
-    "task_type:browse_only",
-    "signal:user_explicit_simple_answer",
-    "signal:no_code_or_command_involved"
-  ],
-  "evolution": {
-    "enabled": true,
-    "script": "scripts/evolve.js",
-    "log_path": ".zero_apex/evolution_log.jsonl",
-    "min_failures_to_trigger": 3,
-    "auto_merge": true,
-    "auto_test": true,
-    "backup_before_merge": true
-  },
-  "audit": {
-    "enabled": true,
-    "log_path": ".zero_apex/audit_log.jsonl",
-    "fields": [
-      "timestamp",
-      "tool",
-      "task_id",
-      "trigger",
-      "duration_ms",
-      "result_code",
-      "result_summary"
-    ]
-  },
   "sandbox": {
-    "default_profile": "workspace",
-    "profiles": {
-      "workspace": {
-        "description": "仅允许 .zero_apex/ 工作目录写文件，其他路径需显式 allow",
-        "writable_paths": [
-          ".zero_apex/**",
-          ".trash/**"
-        ],
-        "readable_paths": [
-          "*"
-        ],
-        "executable_commands": [
-          "*"
-        ],
-        "deny_paths": [
-          "/proc/**",
-          "/sys/**",
-          "/dev/**",
-          "/etc/shadow",
-          "/etc/passwd"
-        ]
-      },
-      "read-only": {
-        "description": "默认禁止一切写操作，所有写都需 manifest 显式 allow",
-        "writable_paths": [],
-        "readable_paths": [
-          "*"
-        ],
-        "executable_commands": [
-          "ls",
-          "cat",
-          "pwd",
-          "date",
-          "whoami",
-          "hostname",
-          "uptime",
-          "ps",
-          "head",
-          "tail",
-          "wc",
-          "sort",
-          "uniq",
-          "tr",
-          "cut",
-          "grep",
-          "rg",
-          "git status",
-          "git branch",
-          "git log",
-          "git diff",
-          "git show",
-          "git rev-parse",
-          "kubectl get",
-          "kubectl logs",
-          "kubectl describe",
-          "cargo check"
-        ],
-        "deny_paths": [
-          "**"
-        ]
-      },
-      "strict": {
-        "description": "最严格：所有写、执行、网络均需 manifest 显式 allow，read-only 命令集 + 路径白名单",
-        "writable_paths": [],
-        "readable_paths": [
-          ".zero_apex/**"
-        ],
-        "executable_commands": [
-          "ls",
-          "cat",
-          "pwd"
-        ],
-        "deny_paths": [
-          "**"
-        ]
-      }
-    },
-    "dangerous_commands": [
-      "rm",
-      "rmdir",
-      "unlink",
-      "shred",
-      "chmod",
-      "chown",
-      "chgrp",
-      "chattr",
-      "pkill",
-      "kill",
-      "killall",
-      "git push",
-      "shutdown",
-      "reboot",
-      "poweroff",
-      "init",
-      "mkfs",
-      "fdisk",
-      "parted",
-      "mount",
-      "umount",
-      "iptables",
-      "ip6tables",
-      "nft",
-      "ufw",
-      "firewall-cmd",
-      "useradd",
-      "userdel",
-      "usermod",
-      "passwd",
-      "visudo",
-      "chroot",
-      "sudo",
-      "su"
-    ]
+    "allowed_commands": ["ls", "cat", "head", "tail", "grep", "find", "wc", "file", "stat", "which", "echo", "pwd", "whoami", "date", "env", "printenv", "git status", "git log", "git diff"],
+    "blocked_commands": ["rm -rf /", "chmod 777", "mkfs", "fdisk", "dd if=/dev/zero"],
+    "protected_paths": ["/etc", "/usr", "/bin", "/sbin", "/boot", "/sys", "/proc", "/dev", "C:\\Windows"]
   },
   "permission": {
-    "default_mode": "default",
-    "modes": {
-      "default": "未匹配规则的调用走 preflight 现有逻辑",
-      "dontAsk": "未匹配 allow 的调用一律 deny",
-      "bypassPermissions": "自动批准（deny/hook 仍生效）"
-    },
+    "default": "allow",
     "rules": [
-      {
-        "action": "deny",
-        "tool": "*",
-        "pattern": "Bash(rm -rf *)"
-      },
-      {
-        "action": "deny",
-        "tool": "*",
-        "pattern": "Bash(chmod 777 *)"
-      },
-      {
-        "action": "deny",
-        "tool": "*",
-        "pattern": "Bash(:(){ :|:& };:)"
-      },
-      {
-        "action": "deny",
-        "tool": "read",
-        "pattern": "/etc/shadow"
-      },
-      {
-        "action": "deny",
-        "tool": "read",
-        "pattern": "/etc/passwd"
-      },
-      {
-        "action": "deny",
-        "tool": "edit",
-        "pattern": "/proc/**"
-      },
-      {
-        "action": "deny",
-        "tool": "edit",
-        "pattern": "/sys/**"
-      },
-      {
-        "action": "deny",
-        "tool": "edit",
-        "pattern": "/dev/**"
-      },
-      {
-        "action": "ask",
-        "tool": "edit",
-        "pattern": "**/.env"
-      },
-      {
-        "action": "ask",
-        "tool": "edit",
-        "pattern": "**/*.key"
-      },
-      {
-        "action": "ask",
-        "tool": "bash",
-        "pattern": "git push *"
-      },
-      {
-        "action": "ask",
-        "tool": "bash",
-        "pattern": "npm publish *"
-      },
-      {
-        "action": "allow",
-        "tool": "read",
-        "pattern": ".zero_apex/**"
-      },
-      {
-        "action": "allow",
-        "tool": "edit",
-        "pattern": ".zero_apex/**"
-      },
-      {
-        "action": "allow",
-        "tool": "bash",
-        "pattern": "Bash(ls *)"
-      },
-      {
-        "action": "allow",
-        "tool": "bash",
-        "pattern": "Bash(cat *)"
-      },
-      {
-        "action": "allow",
-        "tool": "bash",
-        "pattern": "Bash(git status)"
-      },
-      {
-        "action": "allow",
-        "tool": "bash",
-        "pattern": "Bash(git log *)"
-      },
-      {
-        "action": "allow",
-        "tool": "bash",
-        "pattern": "Bash(git diff *)"
-      }
+      { "match": "rm -rf /*", "verdict": "block", "reason": "危险删除命令" },
+      { "match": "chmod 777 /etc/*", "verdict": "block", "reason": "危险权限设置" },
+      { "match": "DROP TABLE", "verdict": "ask", "reason": "数据库破坏性操作" }
     ]
   }
 }
